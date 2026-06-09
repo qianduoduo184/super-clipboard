@@ -91,12 +91,14 @@ cargo test
 - 前端构建已验证通过。
 - Rust/Tauri 后端源码已实现核心模块，但仍需要在安装 Rust 工具链的 Windows 环境中执行 `cargo test` 和实机剪贴板验证。
 - 图片/文件写回剪贴板、托盘生命周期、全局快捷键生命周期、大数据量实测仍在 TODO 中跟踪。
+- 推送到 `main` 分支后会通过 GitHub Actions 自动生成 GitHub prerelease 并上传 Windows 成品。
 
 ## 文档
 
 - [架构说明](docs/architecture.md)
 - [隐私说明](docs/privacy.md)
 - [Windows 打包说明](docs/windows-packaging.md)
+- [Release 说明](docs/release.md)
 - [TODO](docs/TODO.md)
 
 ## 隐私说明摘要

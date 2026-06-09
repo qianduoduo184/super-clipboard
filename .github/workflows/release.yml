@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows:
+    name: Build and release Windows app
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run frontend tests
+        run: npm test
+
+      - name: Run TypeScript check
+        run: npx tsc --noEmit
+
+      - name: Build and upload Tauri release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: super-clipboard-v__VERSION__-${{ github.run_number }}
+          releaseName: super-clipboard v__VERSION__ build ${{ github.run_number }}
+          releaseBody: |
+            自动发版：本预发布版由 GitHub Actions 在 main 分支提交后生成。
+
+            验证内容：
+            - npm test
+            - npx tsc --noEmit
+            - Tauri Windows build
+
+            注意：当前项目仍处于早期版本，真实剪贴板监听、托盘、全局快捷键和大内容捕获需要在 Windows 实机继续验证。
+          releaseDraft: false
+          prerelease: true
