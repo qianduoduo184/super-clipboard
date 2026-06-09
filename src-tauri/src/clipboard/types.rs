@@ -1,0 +1,68 @@
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClipboardItemType {
+    Text,
+    Html,
+    Image,
+    Files,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipboardItemDraft {
+    pub item_type: ClipboardItemType,
+    pub content: Option<String>,
+    pub content_path: Option<String>,
+    pub preview: String,
+    pub source_app: Option<String>,
+    pub size_bytes: i64,
+}
+
+impl ClipboardItemDraft {
+    pub fn stable_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(format!("{:?}", self.item_type));
+        hasher.update(self.content.as_deref().unwrap_or_default());
+        hasher.update(self.content_path.as_deref().unwrap_or_default());
+        format!("{:x}", hasher.finalize())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stable_hash_is_same_for_same_content() {
+        let draft = ClipboardItemDraft {
+            item_type: ClipboardItemType::Text,
+            content: Some("hello".to_string()),
+            content_path: None,
+            preview: "hello".to_string(),
+            source_app: None,
+            size_bytes: 5,
+        };
+
+        assert_eq!(draft.stable_hash(), draft.stable_hash());
+    }
+
+    #[test]
+    fn stable_hash_differs_by_type() {
+        let text = ClipboardItemDraft {
+            item_type: ClipboardItemType::Text,
+            content: Some("hello".to_string()),
+            content_path: None,
+            preview: "hello".to_string(),
+            source_app: None,
+            size_bytes: 5,
+        };
+        let html = ClipboardItemDraft {
+            item_type: ClipboardItemType::Html,
+            ..text.clone()
+        };
+
+        assert_ne!(text.stable_hash(), html.stable_hash());
+    }
+}
