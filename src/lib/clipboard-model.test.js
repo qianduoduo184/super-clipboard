@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { performance } from 'node:perf_hooks';
 import {
   filterItems,
   getTypeLabel,
@@ -55,4 +56,21 @@ test('getTypeLabel returns Chinese labels for supported clipboard types', () => 
   assert.equal(getTypeLabel('html'), 'HTML');
   assert.equal(getTypeLabel('image'), '图片');
   assert.equal(getTypeLabel('files'), '文件');
+});
+
+test('filterItems handles 1,000 copied text records without obvious slowdown', () => {
+  const copiedTextItems = Array.from({ length: 1000 }, (_, index) => ({
+    id: `text-${index}`,
+    type: 'text',
+    preview: `clipboard copied text ${index}`,
+    favorite: index % 100 === 0,
+    updatedAt: index,
+  }));
+
+  const startedAt = performance.now();
+  const results = filterItems(copiedTextItems, { type: 'text', query: 'copied text 99' });
+  const duration = performance.now() - startedAt;
+
+  assert.equal(results.length, 11);
+  assert.ok(duration < 100, `expected 1,000 item filter under 100ms, got ${duration.toFixed(2)}ms`);
 });

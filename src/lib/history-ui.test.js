@@ -41,3 +41,20 @@ test('moveSelection moves within list bounds', () => {
 test('moveSelection selects first item when current id is missing', () => {
   assert.equal(moveSelection(['a', 'b', 'c'], 'missing', 'down'), 'a');
 });
+
+test('calculateVirtualWindow keeps 10,000 item history lists bounded', () => {
+  const window = calculateVirtualWindow({
+    itemCount: 10000,
+    scrollTop: 6600,
+    itemHeight: 66,
+    viewportHeight: 396,
+    overscan: 3,
+  });
+
+  assert.deepEqual(window, {
+    startIndex: 97,
+    endIndex: 109,
+    offsetTop: 6402,
+  });
+  assert.ok(window.endIndex - window.startIndex <= 12);
+});
