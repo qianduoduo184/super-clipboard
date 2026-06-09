@@ -31,4 +31,4 @@ Thumbs.db
 *.db
 *.db-wal
 *.db-shm
-blobs/
+/blobs/

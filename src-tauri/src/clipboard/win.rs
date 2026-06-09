@@ -1,29 +1,30 @@
 use std::ffi::c_void;
+use std::mem::size_of;
+use std::ptr::{null, null_mut};
 use std::path::Path;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 
-use anyhow::{anyhow, Context, Result};
-use windows::core::w;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::System::DataExchange::{
+use anyhow::{anyhow, Result};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, GetClipboardData, IsClipboardFormatAvailable,
-    EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData, CF_DIB, CF_HDROP,
-    CF_UNICODETEXT,
+    EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
-use windows::Win32::System::Memory::{
-    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, HGLOBAL, GMEM_MOVEABLE,
+use windows_sys::Win32::System::Memory::{
+    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{
+use windows_sys::Win32::System::Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
     VK_CONTROL, VK_V,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
+use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW, HWND_MESSAGE,
-    MSG, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLIPBOARDUPDATE, WM_DESTROY, WNDCLASSW,
+    MSG, WM_CLIPBOARDUPDATE, WM_DESTROY, WNDCLASSW,
 };
-use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+use windows_sys::Win32::UI::Shell::{DragQueryFileW, HDROP};
 
 use crate::blobs::build_blob_path;
 use crate::clipboard::types::{ClipboardItemDraft, ClipboardItemType};
@@ -130,12 +131,17 @@ pub fn read_current_clipboard(blob_dir: &Path) -> Result<Vec<ClipboardItemDraft>
 pub fn write_text_to_clipboard(text: &str) -> Result<()> {
     let _guard = ClipboardGuard::open()?;
     unsafe {
-        EmptyClipboard().context("empty clipboard")?;
+        if EmptyClipboard() == 0 {
+            return Err(anyhow!("empty clipboard"));
+        }
 
         let mut wide: Vec<u16> = text.encode_utf16().collect();
         wide.push(0);
         let byte_len = wide.len() * std::mem::size_of::<u16>();
-        let handle = GlobalAlloc(GMEM_MOVEABLE, byte_len)?;
+        let handle = GlobalAlloc(GMEM_MOVEABLE, byte_len);
+        if handle == Default::default() {
+            return Err(anyhow!("allocate clipboard memory"));
+        }
         let locked = GlobalLock(handle) as *mut u16;
         if locked.is_null() {
             return Err(anyhow!("lock clipboard allocation"));
@@ -143,7 +149,9 @@ pub fn write_text_to_clipboard(text: &str) -> Result<()> {
 
         std::ptr::copy_nonoverlapping(wide.as_ptr(), locked, wide.len());
         GlobalUnlock(handle);
-        SetClipboardData(CF_UNICODETEXT.0 as u32, handle).context("set unicode text")?;
+        if SetClipboardData(CF_UNICODETEXT as u32, handle) == Default::default() {
+            return Err(anyhow!("set unicode text"));
+        }
     }
 
     Ok(())
@@ -156,7 +164,7 @@ pub fn simulate_paste_shortcut() -> Result<()> {
         keyboard_input(VK_V, true),
         keyboard_input(VK_CONTROL, true),
     ];
-    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    let sent = unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32) };
     if sent != inputs.len() as u32 {
         return Err(anyhow!("send Ctrl+V input"));
     }
@@ -165,35 +173,41 @@ pub fn simulate_paste_shortcut() -> Result<()> {
 
 fn run_message_window() -> Result<()> {
     unsafe {
-        let class_name = w!("SuperClipboardListenerWindow");
+        let class_name = wide_null("SuperClipboardListenerWindow");
         let window_class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
-            lpszClassName: class_name,
+            lpszClassName: class_name.as_ptr(),
             ..Default::default()
         };
 
-        RegisterClassW(&window_class);
+        if RegisterClassW(&window_class) == 0 {
+            return Err(anyhow!("register clipboard listener window class"));
+        }
 
         let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            class_name,
-            w!(""),
-            WINDOW_STYLE::default(),
+            0,
+            class_name.as_ptr(),
+            wide_null("").as_ptr(),
+            0,
             0,
             0,
             0,
             0,
             HWND_MESSAGE,
-            None,
-            None,
-            None,
-        )
-        .context("create clipboard listener window")?;
+            0,
+            0,
+            null(),
+        );
+        if hwnd == Default::default() {
+            return Err(anyhow!("create clipboard listener window"));
+        }
 
-        AddClipboardFormatListener(hwnd).context("register clipboard listener")?;
+        if AddClipboardFormatListener(hwnd) == 0 {
+            return Err(anyhow!("register clipboard listener"));
+        }
 
         let mut message = MSG::default();
-        while GetMessageW(&mut message, None, 0, 0).into() {
+        while GetMessageW(&mut message, 0, 0, 0) > 0 {
             DispatchMessageW(&message);
         }
     }
@@ -211,9 +225,9 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
                     }
                 }
             }
-            LRESULT(0)
+            0
         }
-        WM_DESTROY => LRESULT(0),
+        WM_DESTROY => 0,
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
     }
 }
@@ -223,7 +237,9 @@ struct ClipboardGuard;
 impl ClipboardGuard {
     fn open() -> Result<Self> {
         unsafe {
-            OpenClipboard(None).context("open clipboard")?;
+            if OpenClipboard(0) == 0 {
+                return Err(anyhow!("open clipboard"));
+            }
         }
         Ok(Self)
     }
@@ -232,18 +248,21 @@ impl ClipboardGuard {
 impl Drop for ClipboardGuard {
     fn drop(&mut self) {
         unsafe {
-            let _ = CloseClipboard();
+            CloseClipboard();
         }
     }
 }
 
 fn read_unicode_text() -> Result<Option<String>> {
     unsafe {
-        if !IsClipboardFormatAvailable(CF_UNICODETEXT.0 as u32).as_bool() {
+        if IsClipboardFormatAvailable(CF_UNICODETEXT as u32) == 0 {
             return Ok(None);
         }
-        let handle = GetClipboardData(CF_UNICODETEXT.0 as u32).context("get unicode text")?;
-        let locked = GlobalLock(HGLOBAL(handle.0)) as *const u16;
+        let handle = GetClipboardData(CF_UNICODETEXT as u32);
+        if handle == Default::default() {
+            return Err(anyhow!("get unicode text"));
+        }
+        let locked = GlobalLock(handle) as *const u16;
         if locked.is_null() {
             return Ok(None);
         }
@@ -254,15 +273,15 @@ fn read_unicode_text() -> Result<Option<String>> {
         }
         let slice = std::slice::from_raw_parts(locked, len);
         let value = String::from_utf16_lossy(slice);
-        GlobalUnlock(HGLOBAL(handle.0));
+        GlobalUnlock(handle);
         Ok(Some(value))
     }
 }
 
 fn read_html() -> Result<Option<String>> {
     unsafe {
-        let html_format = RegisterClipboardFormatW(w!("HTML Format"));
-        if html_format == 0 || !IsClipboardFormatAvailable(html_format).as_bool() {
+        let html_format = RegisterClipboardFormatW(wide_null("HTML Format").as_ptr());
+        if html_format == 0 || IsClipboardFormatAvailable(html_format) == 0 {
             return Ok(None);
         }
 
@@ -278,36 +297,39 @@ fn read_html() -> Result<Option<String>> {
 
 fn read_dib_bytes() -> Result<Option<Vec<u8>>> {
     unsafe {
-        if !IsClipboardFormatAvailable(CF_DIB.0 as u32).as_bool() {
+        if IsClipboardFormatAvailable(CF_DIB as u32) == 0 {
             return Ok(None);
         }
 
-        read_global_bytes(CF_DIB.0 as u32)
+        read_global_bytes(CF_DIB as u32)
     }
 }
 
 fn read_file_list() -> Result<Option<Vec<String>>> {
     unsafe {
-        if !IsClipboardFormatAvailable(CF_HDROP.0 as u32).as_bool() {
+        if IsClipboardFormatAvailable(CF_HDROP as u32) == 0 {
             return Ok(None);
         }
 
-        let handle = GetClipboardData(CF_HDROP.0 as u32).context("get file list")?;
-        let hdrop = HDROP(handle.0);
-        let count = DragQueryFileW(hdrop, u32::MAX, None);
+        let handle = GetClipboardData(CF_HDROP as u32);
+        if handle == Default::default() {
+            return Err(anyhow!("get file list"));
+        }
+        let hdrop = handle as HDROP;
+        let count = DragQueryFileW(hdrop, u32::MAX, null_mut(), 0);
         if count == 0 {
             return Ok(None);
         }
 
         let mut files = Vec::with_capacity(count as usize);
         for index in 0..count {
-            let len = DragQueryFileW(hdrop, index, None);
+            let len = DragQueryFileW(hdrop, index, null_mut(), 0);
             if len == 0 {
                 continue;
             }
 
             let mut buffer = vec![0u16; len as usize + 1];
-            let written = DragQueryFileW(hdrop, index, Some(&mut buffer));
+            let written = DragQueryFileW(hdrop, index, buffer.as_mut_ptr(), buffer.len() as u32);
             if written == 0 {
                 continue;
             }
@@ -319,20 +341,23 @@ fn read_file_list() -> Result<Option<Vec<String>>> {
 }
 
 unsafe fn read_global_bytes(format: u32) -> Result<Option<Vec<u8>>> {
-    let handle = GetClipboardData(format).context("get clipboard data")?;
-    let size = GlobalSize(HGLOBAL(handle.0));
+    let handle = GetClipboardData(format);
+    if handle == Default::default() {
+        return Err(anyhow!("get clipboard data"));
+    }
+    let size = GlobalSize(handle);
     if size == 0 {
         return Ok(None);
     }
 
-    let locked = GlobalLock(HGLOBAL(handle.0)) as *const c_void;
+    let locked = GlobalLock(handle) as *const c_void;
     if locked.is_null() {
         return Ok(None);
     }
 
     let bytes = std::slice::from_raw_parts(locked as *const u8, size);
     let value = bytes.to_vec();
-    GlobalUnlock(HGLOBAL(handle.0));
+    GlobalUnlock(handle);
     Ok(Some(value))
 }
 
@@ -349,4 +374,8 @@ fn keyboard_input(key: VIRTUAL_KEY, key_up: bool) -> INPUT {
             },
         },
     }
+}
+
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
