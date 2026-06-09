@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use storage::repository::ClipboardRepository;
 use system::settings::AppSettings;
+use tauri::Manager;
 
 pub struct AppState {
     pub repository: Arc<Mutex<ClipboardRepository>>,
