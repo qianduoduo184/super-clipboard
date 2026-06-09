@@ -50,7 +50,7 @@ where
 
     thread::spawn(|| {
         if let Err(error) = run_message_window() {
-            eprintln!("clipboard listener failed: {error}");
+            crate::diagnostics::error(format!("clipboard listener failed: {error}"));
         }
     });
 
@@ -182,6 +182,7 @@ fn run_message_window() -> Result<()> {
         if RegisterClassW(&window_class) == 0 {
             return Err(anyhow!("register clipboard listener window class"));
         }
+        crate::diagnostics::info("clipboard: listener window class registered");
 
         let hwnd = CreateWindowExW(
             0,
@@ -200,10 +201,12 @@ fn run_message_window() -> Result<()> {
         if hwnd == Default::default() {
             return Err(anyhow!("create clipboard listener window"));
         }
+        crate::diagnostics::info("clipboard: listener message window created");
 
         if AddClipboardFormatListener(hwnd) == 0 {
             return Err(anyhow!("register clipboard listener"));
         }
+        crate::diagnostics::info("clipboard: format listener registered");
 
         let mut message = MSG::default();
         while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {

@@ -34,30 +34,39 @@ pub fn start_background_listener(
     blob_dir: PathBuf,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(&blob_dir)?;
+    crate::diagnostics::info(format!(
+        "clipboard: preparing listener with blob_dir={}",
+        blob_dir.display()
+    ));
 
     win::start_listener(move || {
+        crate::diagnostics::info("clipboard: change event received");
         let app_settings = settings
             .lock()
             .map(|settings| settings.clone())
             .unwrap_or_default();
 
         if !app_settings.recording_enabled {
+            crate::diagnostics::info("clipboard: recording disabled, event ignored");
             return;
         }
 
         let drafts = match win::read_current_clipboard(&blob_dir) {
             Ok(drafts) => drafts,
             Err(error) => {
-                eprintln!("failed to read clipboard: {error}");
+                crate::diagnostics::error(format!("clipboard: failed to read clipboard: {error}"));
                 return;
             }
         };
+        crate::diagnostics::info(format!("clipboard: decoded {} item draft(s)", drafts.len()));
 
         if let Ok(repository) = repository.lock() {
             let mut stored_any = false;
             for draft in drafts {
                 if let Err(error) = repository.insert_or_touch(draft) {
-                    eprintln!("failed to store clipboard item: {error}");
+                    crate::diagnostics::error(format!(
+                        "clipboard: failed to store clipboard item: {error}"
+                    ));
                 } else {
                     stored_any = true;
                 }
@@ -68,9 +77,13 @@ pub fn start_background_listener(
                     app_settings.max_history_items,
                     app_settings.retention_days,
                 ) {
-                    eprintln!("failed to prune clipboard history: {error}");
+                    crate::diagnostics::error(format!(
+                        "clipboard: failed to prune clipboard history: {error}"
+                    ));
                 }
             }
+        } else {
+            crate::diagnostics::error("clipboard: repository lock poisoned");
         }
     })
 }

@@ -29,6 +29,11 @@ export type AppSettings = {
   autostart_enabled: boolean;
 };
 
+export type DiagnosticsInfo = {
+  app_data_dir: string;
+  log_path: string;
+};
+
 export function toSearchFilters(filter: ClipboardFilter): SearchFilters {
   return {
     item_type: filter === 'all' || filter === 'favorites' ? null : filter,
@@ -79,4 +84,8 @@ export async function updateSettings(nextSettings: AppSettings) {
 
 export async function clearHistory() {
   return invoke<void>('clear_history');
+}
+
+export async function getDiagnostics() {
+  return invoke<DiagnosticsInfo>('get_diagnostics');
 }

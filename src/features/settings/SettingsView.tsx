@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { ArrowLeft, Database, Keyboard, Power, Shield, Trash2 } from 'lucide-react';
-import { clearHistory, getSettings, updateSettings } from '../history/api';
+import { ArrowLeft, Database, FileText, Keyboard, Power, Shield, Trash2 } from 'lucide-react';
+import { clearHistory, getDiagnostics, getSettings, updateSettings } from '../history/api';
 import {
   createDefaultSettings,
   mergeSettings,
@@ -28,6 +28,7 @@ export default function SettingsView({
     updateSettingValue(createDefaultSettings(), 'recording_enabled', recording),
   );
   const [status, setStatus] = useState('设置将在 Tauri 后端可用时自动同步');
+  const [diagnostics, setDiagnostics] = useState<{ app_data_dir: string; log_path: string } | null>(null);
 
   useEffect(() => {
     let ignore = false;
@@ -42,6 +43,16 @@ export default function SettingsView({
       .catch(() => {
         if (ignore) return;
         setStatus('未连接 Tauri 后端，当前为本地预览设置');
+      });
+
+    getDiagnostics()
+      .then((backendDiagnostics) => {
+        if (ignore) return;
+        setDiagnostics(backendDiagnostics);
+      })
+      .catch(() => {
+        if (ignore) return;
+        setDiagnostics(null);
       });
 
     return () => {
@@ -176,6 +187,22 @@ export default function SettingsView({
           <button className="danger-button" onClick={() => void handleClearHistory()}>
             清空
           </button>
+        </div>
+
+        <div className="setting-row">
+          <span className="setting-icon"><FileText size={18} /></span>
+          <span>
+            <strong>运行日志</strong>
+            <small>{diagnostics?.log_path ?? 'Tauri 后端可用后显示日志路径'}</small>
+          </span>
+        </div>
+
+        <div className="setting-row">
+          <span className="setting-icon"><Database size={18} /></span>
+          <span>
+            <strong>数据目录</strong>
+            <small>{diagnostics?.app_data_dir ?? 'Tauri 后端可用后显示数据目录'}</small>
+          </span>
         </div>
       </section>
     </main>

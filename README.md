@@ -93,6 +93,12 @@ cargo test
 - 图片/文件写回剪贴板、托盘生命周期、全局快捷键生命周期、大数据量实测仍在 TODO 中跟踪。
 - 推送到 `main` 分支后会通过 GitHub Actions 自动生成 GitHub prerelease 并上传 Windows 成品。
 
+## 故障排查
+
+安装版启动和运行日志会写入本机应用数据目录下的 `logs/super-clipboard.log`。也可以在应用“设置”页查看“运行日志”和“数据目录”的完整路径。
+
+如果双击后窗口闪退，优先查看日志末尾的 `ERROR` 或 `panic` 记录。托盘、剪贴板监听、全局快捷键等系统集成初始化失败会写入日志，并尽量不阻断主窗口启动。
+
 ## 文档
 
 - [架构说明](docs/architecture.md)
