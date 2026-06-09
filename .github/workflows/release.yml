@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   release-windows:
     name: Build and release Windows app
@@ -27,17 +31,17 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          cache-on-failure: true
+
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Run frontend tests
-        run: npm test
-
-      - name: Run TypeScript check
-        run: npx tsc --noEmit
-
-      - name: Check Rust backend
-        run: cargo check --manifest-path src-tauri/Cargo.toml
+      - name: Run frontend checks
+        run: npm run ci:frontend
 
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
@@ -54,7 +58,7 @@ jobs:
 
             验证内容：
             - npm test
-            - npx tsc --noEmit
+            - npm run typecheck
             - Tauri Windows build
 
             注意：当前项目仍处于早期版本，真实剪贴板监听、托盘、全局快捷键和大内容捕获需要在 Windows 实机继续验证。

@@ -5,9 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "npm run typecheck && npm run build:frontend",
+    "build:frontend": "vite build",
+    "ci:frontend": "npm test && npm run typecheck",
     "preview": "vite preview",
     "test": "node --test",
+    "typecheck": "tsc --noEmit",
     "tauri": "tauri"
   },
   "dependencies": {
