@@ -194,8 +194,8 @@ fn run_message_window() -> Result<()> {
             0,
             0,
             HWND_MESSAGE,
-            0,
-            0,
+            null_mut(),
+            null_mut(),
             null(),
         );
         if hwnd == Default::default() {
@@ -207,7 +207,7 @@ fn run_message_window() -> Result<()> {
         }
 
         let mut message = MSG::default();
-        while GetMessageW(&mut message, 0, 0, 0) > 0 {
+        while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
             DispatchMessageW(&message);
         }
     }
@@ -237,7 +237,7 @@ struct ClipboardGuard;
 impl ClipboardGuard {
     fn open() -> Result<Self> {
         unsafe {
-            if OpenClipboard(0) == 0 {
+            if OpenClipboard(null_mut()) == 0 {
                 return Err(anyhow!("open clipboard"));
             }
         }
