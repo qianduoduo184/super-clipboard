@@ -29,7 +29,7 @@ fn main() {
         .setup(|app| {
             let app_data = app.path().app_data_dir()?;
             let settings_path = app_data.join("settings.json");
-            let blob_dir = app_data.join("blobs");
+            let blob_dir = blobs::ensure_blob_dir(&app_data)?;
             let repository = ClipboardRepository::open(app_data.join("super-clipboard.sqlite3"))?;
             let repository = Arc::new(Mutex::new(repository));
             let settings = Arc::new(Mutex::new(AppSettings::load(&settings_path)?));

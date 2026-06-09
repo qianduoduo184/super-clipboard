@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use chrono::Utc;
-use rusqlite::{named_params, params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -184,31 +184,27 @@ impl ClipboardRepository {
         if filters.favorites_only {
             sql.push_str(" AND favorite = 1");
         }
+        let mut sql_params = Vec::new();
+
         if filters.item_type.is_some() {
             sql.push_str(" AND item_type = :item_type");
+            sql_params.push(Value::Text(filters.item_type.unwrap_or_default()));
         }
         if cursor.is_some() {
             sql.push_str(" AND updated_at < :cursor");
+            sql_params.push(Value::Integer(cursor.unwrap_or(i64::MAX)));
         }
         if !query.trim().is_empty() {
             sql.push_str(
                 " AND id IN (SELECT id FROM clipboard_items_fts WHERE clipboard_items_fts MATCH :query)",
             );
+            sql_params.push(Value::Text(query));
         }
         sql.push_str(" ORDER BY updated_at DESC LIMIT :limit");
+        sql_params.push(Value::Integer(limit));
 
-        let item_type = filters.item_type.unwrap_or_default();
-        let cursor = cursor.unwrap_or(i64::MAX);
         let mut statement = self.conn.prepare(&sql)?;
-        let rows = statement.query_map(
-            named_params! {
-                ":item_type": item_type,
-                ":cursor": cursor,
-                ":query": query,
-                ":limit": limit,
-            },
-            Self::map_item,
-        )?;
+        let rows = statement.query_map(params_from_iter(sql_params), Self::map_item)?;
 
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }

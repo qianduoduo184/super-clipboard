@@ -36,7 +36,7 @@ pub fn clear_blob_dir(blob_dir: &Path) -> anyhow::Result<()> {
         let entry = entry?;
         let path = entry.path();
         if path.is_file() {
-            fs::remove_file(path)?;
+            remove_blob_if_exists(&path)?;
         }
     }
 
@@ -61,6 +61,7 @@ pub fn create_thumbnail(blob_path: &Path) -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{ImageBuffer, Rgba};
 
     #[test]
     fn build_blob_path_keeps_requested_extension() {
@@ -72,5 +73,18 @@ mod tests {
     fn thumbnail_path_uses_png_extension() {
         let path = thumbnail_path_for(Path::new("root/item.jpg"));
         assert_eq!(path.file_name().and_then(|value| value.to_str()), Some("item.thumb.png"));
+    }
+
+    #[test]
+    fn create_thumbnail_writes_thumbnail_file() {
+        let dir = std::env::temp_dir().join(format!("super-clipboard-blob-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let image_path = dir.join("source.png");
+        let image = ImageBuffer::from_pixel(8, 8, Rgba([80u8, 120u8, 200u8, 255u8]));
+        image.save(&image_path).expect("source image");
+
+        let thumbnail_path = create_thumbnail(&image_path).expect("thumbnail");
+
+        assert!(thumbnail_path.exists());
     }
 }
