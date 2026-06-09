@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import {
   Clipboard,
   Copy,
@@ -14,12 +15,13 @@ import {
 } from 'lucide-react';
 import { filterItems, getTypeLabel, normalizePreview } from './lib/clipboard-model';
 import { calculateVirtualWindow, moveSelection } from './lib/history-ui';
-import { getErrorMessage } from './lib/settings-model';
+import { applyThemeMode, getErrorMessage } from './lib/settings-model';
 import SettingsView from './features/settings/SettingsView';
 import { mapBackendItemToViewItem } from './lib/clipboard-adapter';
 import {
   copyItem,
   deleteItem as deleteBackendItem,
+  getSettings,
   pasteItem,
   searchItems,
   setRecordingEnabled,
@@ -126,6 +128,41 @@ export default function App() {
   const [refreshVersion, setRefreshVersion] = useState(0);
   const historyListRef = useRef<HTMLDivElement | null>(null);
   const debouncedQuery = useDebouncedValue(query, 100);
+
+  useEffect(() => {
+    getSettings()
+      .then((settings) => {
+        applyThemeMode(settings.theme_mode);
+        setRecording(settings.recording_enabled);
+      })
+      .catch(() => {
+        applyThemeMode('light');
+      });
+  }, []);
+
+  useEffect(() => {
+    let ignore = false;
+    let unlisten: (() => void) | undefined;
+
+    listen('clipboard-changed', () => {
+      setRefreshVersion((current) => current + 1);
+    })
+      .then((nextUnlisten) => {
+        if (ignore) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {
+        setBackendAvailable(false);
+      });
+
+    return () => {
+      ignore = true;
+      unlisten?.();
+    };
+  }, []);
 
   useEffect(() => {
     let ignore = false;

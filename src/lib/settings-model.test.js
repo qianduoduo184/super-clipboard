@@ -2,10 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   createDefaultSettings,
+  formatShortcutFromEvent,
   getErrorMessage,
   mergeSettings,
   shouldClearHistory,
   updateSettingValue,
+  validateShortcut,
 } from './settings-model.js';
 
 test('createDefaultSettings returns product defaults', () => {
@@ -15,6 +17,7 @@ test('createDefaultSettings returns product defaults', () => {
     retention_days: 30,
     global_shortcut: 'Ctrl+Shift+V',
     autostart_enabled: false,
+    theme_mode: 'light',
   });
 });
 
@@ -25,6 +28,7 @@ test('mergeSettings keeps defaults for missing backend values', () => {
     retention_days: 30,
     global_shortcut: 'Ctrl+Shift+V',
     autostart_enabled: false,
+    theme_mode: 'light',
   });
 });
 
@@ -47,4 +51,31 @@ test('getErrorMessage uses fallback for unknown errors', () => {
 test('shouldClearHistory only allows explicit confirmation', () => {
   assert.equal(shouldClearHistory(true), true);
   assert.equal(shouldClearHistory(false), false);
+});
+
+test('formatShortcutFromEvent formats modifier combinations', () => {
+  assert.equal(
+    formatShortcutFromEvent({
+      key: 'v',
+      ctrlKey: true,
+      altKey: true,
+      shiftKey: false,
+      metaKey: false,
+    }),
+    'Ctrl+Alt+V',
+  );
+});
+
+test('validateShortcut requires a modifier and a main key', () => {
+  assert.equal(validateShortcut('Ctrl+Shift+V'), true);
+  assert.equal(validateShortcut('Ctrl+Shift'), false);
+  assert.equal(validateShortcut('V'), false);
+});
+
+test('updateSettingValue supports theme switching', () => {
+  const settings = createDefaultSettings();
+  const next = updateSettingValue(settings, 'theme_mode', 'dark');
+
+  assert.equal(settings.theme_mode, 'light');
+  assert.equal(next.theme_mode, 'dark');
 });

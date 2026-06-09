@@ -1,4 +1,4 @@
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use crate::storage::repository::{ClipboardItem, SearchFilters};
 use crate::system::settings::AppSettings;
@@ -102,6 +102,12 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
 #[tauri::command]
 pub fn update_settings(state: State<'_, AppState>, next_settings: AppSettings) -> Result<AppSettings, String> {
     crate::diagnostics::info("command: update_settings");
+    let current_shortcut = {
+        let settings = state.settings.lock().map_err(|error| error.to_string())?;
+        settings.global_shortcut.clone()
+    };
+    let mut next_settings = next_settings;
+    next_settings.global_shortcut = current_shortcut;
     next_settings
         .save(&state.settings_path)
         .map_err(|error| error.to_string())?;
@@ -115,6 +121,27 @@ pub fn update_settings(state: State<'_, AppState>, next_settings: AppSettings) -
             .prune_history(next_settings.max_history_items, next_settings.retention_days)
             .map_err(|error| error.to_string())?;
     }
+    Ok(next_settings)
+}
+
+#[tauri::command]
+pub fn set_global_shortcut(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    shortcut: String,
+) -> Result<AppSettings, String> {
+    crate::diagnostics::info(format!("command: set_global_shortcut shortcut={shortcut}"));
+    crate::system::shortcuts::replace_shortcut(&app, &shortcut, state.current_shortcut.clone())
+        .map_err(|error| error.to_string())?;
+
+    let next_settings = {
+        let mut settings = state.settings.lock().map_err(|error| error.to_string())?;
+        settings.global_shortcut = shortcut;
+        settings.clone()
+    };
+    next_settings
+        .save(&state.settings_path)
+        .map_err(|error| error.to_string())?;
     Ok(next_settings)
 }
 

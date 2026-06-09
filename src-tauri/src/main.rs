@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod blobs;
 mod clipboard;
 mod commands;
@@ -15,6 +17,7 @@ use tauri::Manager;
 pub struct AppState {
     pub repository: Arc<Mutex<ClipboardRepository>>,
     pub settings: Arc<Mutex<AppSettings>>,
+    pub current_shortcut: Arc<Mutex<Option<String>>>,
     pub app_data_dir: PathBuf,
     pub settings_path: PathBuf,
     pub blob_dir: PathBuf,
@@ -71,17 +74,21 @@ fn main() {
                 }
             };
             let settings = Arc::new(Mutex::new(loaded_settings));
+            let current_shortcut = Arc::new(Mutex::new(None));
             diagnostics::info("setup: settings loaded");
             app.manage(AppState {
                 repository: repository.clone(),
                 settings: settings.clone(),
+                current_shortcut: current_shortcut.clone(),
                 app_data_dir: app_data.clone(),
                 settings_path: settings_path.clone(),
                 blob_dir: blob_dir.clone(),
                 log_path,
             });
 
-            if let Err(error) = clipboard::start_background_listener(repository, settings, blob_dir) {
+            if let Err(error) =
+                clipboard::start_background_listener(app.handle().clone(), repository, settings, blob_dir)
+            {
                 diagnostics::error(format!("setup: clipboard listener failed: {error}"));
             } else {
                 diagnostics::info("setup: clipboard listener started");
@@ -93,7 +100,13 @@ fn main() {
                 diagnostics::info("setup: tray initialized");
             }
 
-            if let Err(error) = system::shortcuts::register_default_shortcuts(app) {
+            let startup_shortcut = settings
+                .lock()
+                .map(|settings| settings.global_shortcut.clone())
+                .unwrap_or_else(|_| AppSettings::default().global_shortcut);
+            if let Err(error) =
+                system::shortcuts::register_shortcut(app.handle(), &startup_shortcut, current_shortcut)
+            {
                 diagnostics::error(format!("setup: global shortcut registration failed: {error}"));
             } else {
                 diagnostics::info("setup: global shortcut registered");
@@ -112,6 +125,7 @@ fn main() {
             commands::set_recording_enabled,
             commands::get_settings,
             commands::update_settings,
+            commands::set_global_shortcut,
             commands::clear_history,
             commands::get_diagnostics
         ])

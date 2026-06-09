@@ -27,6 +27,7 @@ export type AppSettings = {
   retention_days: number;
   global_shortcut: string;
   autostart_enabled: boolean;
+  theme_mode: 'light' | 'dark';
 };
 
 export type DiagnosticsInfo = {
@@ -80,6 +81,10 @@ export async function getSettings() {
 
 export async function updateSettings(nextSettings: AppSettings) {
   return invoke<AppSettings>('update_settings', { nextSettings });
+}
+
+export async function setGlobalShortcut(shortcut: string) {
+  return invoke<AppSettings>('set_global_shortcut', { shortcut });
 }
 
 export async function clearHistory() {

@@ -24,11 +24,15 @@ pub mod win {
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use crate::storage::repository::ClipboardRepository;
 use crate::system::settings::AppSettings;
+use tauri::{AppHandle, Emitter};
 
 pub fn start_background_listener(
+    app_handle: AppHandle,
     repository: Arc<Mutex<ClipboardRepository>>,
     settings: Arc<Mutex<AppSettings>>,
     blob_dir: PathBuf,
@@ -51,12 +55,43 @@ pub fn start_background_listener(
             return;
         }
 
-        let drafts = match win::read_current_clipboard(&blob_dir) {
-            Ok(drafts) => drafts,
-            Err(error) => {
-                crate::diagnostics::error(format!("clipboard: failed to read clipboard: {error}"));
-                return;
+        let retry_delays = [
+            Duration::from_millis(40),
+            Duration::from_millis(80),
+            Duration::from_millis(120),
+            Duration::from_millis(200),
+            Duration::from_millis(300),
+        ];
+        let mut last_error = None;
+        let mut drafts = None;
+        for (attempt, delay) in retry_delays.iter().enumerate() {
+            thread::sleep(*delay);
+            match win::read_current_clipboard(&blob_dir) {
+                Ok(next_drafts) => {
+                    crate::diagnostics::info(format!(
+                        "clipboard: read succeeded on attempt {}",
+                        attempt + 1
+                    ));
+                    drafts = Some(next_drafts);
+                    break;
+                }
+                Err(error) => {
+                    crate::diagnostics::warn(format!(
+                        "clipboard: read attempt {} failed: {error}",
+                        attempt + 1
+                    ));
+                    last_error = Some(error);
+                }
             }
+        };
+        let Some(drafts) = drafts else {
+            crate::diagnostics::error(format!(
+                "clipboard: failed to read clipboard after retries: {}",
+                last_error
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "unknown error".to_string())
+            ));
+            return;
         };
         crate::diagnostics::info(format!("clipboard: decoded {} item draft(s)", drafts.len()));
 
@@ -79,6 +114,11 @@ pub fn start_background_listener(
                 ) {
                     crate::diagnostics::error(format!(
                         "clipboard: failed to prune clipboard history: {error}"
+                    ));
+                }
+                if let Err(error) = app_handle.emit("clipboard-changed", ()) {
+                    crate::diagnostics::warn(format!(
+                        "clipboard: failed to emit change event: {error}"
                     ));
                 }
             }

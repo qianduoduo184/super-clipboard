@@ -8,6 +8,21 @@ pub struct AppSettings {
     pub retention_days: i64,
     pub global_shortcut: String,
     pub autostart_enabled: bool,
+    #[serde(default)]
+    pub theme_mode: ThemeMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeMode {
+    Light,
+    Dark,
+}
+
+impl Default for ThemeMode {
+    fn default() -> Self {
+        Self::Light
+    }
 }
 
 impl Default for AppSettings {
@@ -18,6 +33,7 @@ impl Default for AppSettings {
             retention_days: 30,
             global_shortcut: "Ctrl+Shift+V".to_string(),
             autostart_enabled: false,
+            theme_mode: ThemeMode::Light,
         }
     }
 }
