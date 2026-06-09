@@ -86,9 +86,12 @@ fn main() {
                 log_path,
             });
 
-            if let Err(error) =
-                clipboard::start_background_listener(app.handle().clone(), repository, settings, blob_dir)
-            {
+            if let Err(error) = clipboard::start_background_listener(
+                app.handle().clone(),
+                repository,
+                settings.clone(),
+                blob_dir,
+            ) {
                 diagnostics::error(format!("setup: clipboard listener failed: {error}"));
             } else {
                 diagnostics::info("setup: clipboard listener started");
