@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
@@ -75,6 +75,40 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].preview, "sqlite clipboard history");
+    }
+
+    #[test]
+    fn search_handles_fts_special_characters_without_error() {
+        let repository = open_test_repository();
+        repository
+            .insert_or_touch(text_draft("open http://example.com/path and keep \"quoted\" text"))
+            .expect("insert");
+
+        let url_results = repository
+            .search(
+                "http://example.com/path".to_string(),
+                SearchFilters {
+                    item_type: Some("text".to_string()),
+                    favorites_only: false,
+                },
+                10,
+                None,
+            )
+            .expect("url search");
+        let punctuation_results = repository
+            .search(
+                "\"unterminated (AND OR NOT *)".to_string(),
+                SearchFilters {
+                    item_type: Some("text".to_string()),
+                    favorites_only: false,
+                },
+                10,
+                None,
+            )
+            .expect("punctuation search");
+
+        assert_eq!(url_results.len(), 1);
+        assert!(punctuation_results.is_empty());
     }
 
     #[test]
@@ -186,21 +220,21 @@ impl ClipboardRepository {
         }
         let mut sql_params = Vec::new();
 
-        if filters.item_type.is_some() {
-            sql.push_str(" AND item_type = :item_type");
-            sql_params.push(Value::Text(filters.item_type.unwrap_or_default()));
+        if let Some(item_type) = filters.item_type {
+            sql.push_str(" AND item_type = ?");
+            sql_params.push(Value::Text(item_type));
         }
-        if cursor.is_some() {
-            sql.push_str(" AND updated_at < :cursor");
-            sql_params.push(Value::Integer(cursor.unwrap_or(i64::MAX)));
+        if let Some(cursor) = cursor {
+            sql.push_str(" AND updated_at < ?");
+            sql_params.push(Value::Integer(cursor));
         }
         if !query.trim().is_empty() {
             sql.push_str(
-                " AND id IN (SELECT id FROM clipboard_items_fts WHERE clipboard_items_fts MATCH :query)",
+                " AND id IN (SELECT id FROM clipboard_items_fts WHERE clipboard_items_fts MATCH ?)",
             );
-            sql_params.push(Value::Text(query));
+            sql_params.push(Value::Text(to_fts_query(&query)));
         }
-        sql.push_str(" ORDER BY updated_at DESC LIMIT :limit");
+        sql.push_str(" ORDER BY updated_at DESC LIMIT ?");
         sql_params.push(Value::Integer(limit));
 
         let mut statement = self.conn.prepare(&sql)?;
@@ -231,11 +265,13 @@ impl ClipboardRepository {
     }
 
     pub fn soft_delete(&self, id: &str) -> anyhow::Result<()> {
+        let blob_paths = self.content_paths_for_ids(&[id.to_string()])?;
         self.conn.execute(
             "UPDATE clipboard_items SET deleted_at = ?1 WHERE id = ?2",
             params![Utc::now().timestamp_millis(), id],
         )?;
         self.remove_deleted_from_fts()?;
+        remove_blob_paths(&blob_paths)?;
         Ok(())
     }
 
@@ -244,6 +280,7 @@ impl ClipboardRepository {
 
         if retention_days > 0 {
             let cutoff = now - retention_days.saturating_mul(24 * 60 * 60 * 1000);
+            let blob_paths = self.content_paths_for_retention_cutoff(cutoff)?;
             self.conn.execute(
                 "UPDATE clipboard_items
                  SET deleted_at = ?1
@@ -252,9 +289,11 @@ impl ClipboardRepository {
                    AND updated_at < ?2",
                 params![now, cutoff],
             )?;
+            remove_blob_paths(&blob_paths)?;
         }
 
         if max_history_items > 0 {
+            let blob_paths = self.content_paths_over_limit(max_history_items)?;
             self.conn.execute(
                 "UPDATE clipboard_items
                  SET deleted_at = ?1
@@ -271,6 +310,7 @@ impl ClipboardRepository {
                    )",
                 params![now, max_history_items],
             )?;
+            remove_blob_paths(&blob_paths)?;
         }
 
         self.remove_deleted_from_fts()?;
@@ -302,6 +342,63 @@ impl ClipboardRepository {
         Ok(())
     }
 
+    fn content_paths_for_ids(&self, ids: &[String]) -> anyhow::Result<Vec<PathBuf>> {
+        let mut paths = Vec::new();
+        for id in ids {
+            if let Some(path) = self
+                .conn
+                .query_row(
+                    "SELECT content_path FROM clipboard_items WHERE id = ?1 AND deleted_at IS NULL",
+                    params![id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()
+            {
+                paths.push(PathBuf::from(path));
+            }
+        }
+        Ok(paths)
+    }
+
+    fn content_paths_for_retention_cutoff(&self, cutoff: i64) -> anyhow::Result<Vec<PathBuf>> {
+        let mut statement = self.conn.prepare(
+            "SELECT content_path
+             FROM clipboard_items
+             WHERE deleted_at IS NULL
+               AND favorite = 0
+               AND updated_at < ?1
+               AND content_path IS NOT NULL",
+        )?;
+        let rows = statement.query_map(params![cutoff], |row| row.get::<_, String>(0))?;
+        rows.map(|row| row.map(PathBuf::from))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn content_paths_over_limit(&self, max_history_items: i64) -> anyhow::Result<Vec<PathBuf>> {
+        let mut statement = self.conn.prepare(
+            "SELECT content_path
+             FROM clipboard_items
+             WHERE deleted_at IS NULL
+               AND favorite = 0
+               AND content_path IS NOT NULL
+               AND id IN (
+                 SELECT id FROM (
+                   SELECT id
+                   FROM clipboard_items
+                   WHERE deleted_at IS NULL AND favorite = 0
+                   ORDER BY updated_at DESC
+                   LIMIT -1 OFFSET ?1
+                 )
+               )",
+        )?;
+        let rows = statement.query_map(params![max_history_items], |row| row.get::<_, String>(0))?;
+        rows.map(|row| row.map(PathBuf::from))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     fn map_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClipboardItem> {
         Ok(ClipboardItem {
             id: row.get(0)?,
@@ -317,4 +414,20 @@ impl ClipboardRepository {
             updated_at: row.get(10)?,
         })
     }
+}
+
+fn to_fts_query(raw: &str) -> String {
+    raw.split_whitespace()
+        .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn remove_blob_paths(paths: &[PathBuf]) -> anyhow::Result<()> {
+    for path in paths {
+        crate::blobs::remove_blob_if_exists(path)?;
+        let thumbnail_path = crate::blobs::thumbnail_path_for(Path::new(path));
+        crate::blobs::remove_blob_if_exists(&thumbnail_path)?;
+    }
+    Ok(())
 }

@@ -1,4 +1,5 @@
 use tauri::{AppHandle, State};
+use tauri_plugin_autostart::ManagerExt;
 
 use crate::storage::repository::{ClipboardItem, SearchFilters};
 use crate::system::settings::AppSettings;
@@ -100,7 +101,11 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
 }
 
 #[tauri::command]
-pub fn update_settings(state: State<'_, AppState>, next_settings: AppSettings) -> Result<AppSettings, String> {
+pub fn update_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    next_settings: AppSettings,
+) -> Result<AppSettings, String> {
     crate::diagnostics::info("command: update_settings");
     let current_shortcut = {
         let settings = state.settings.lock().map_err(|error| error.to_string())?;
@@ -108,6 +113,8 @@ pub fn update_settings(state: State<'_, AppState>, next_settings: AppSettings) -
     };
     let mut next_settings = next_settings;
     next_settings.global_shortcut = current_shortcut;
+    apply_autostart_setting(&app, next_settings.autostart_enabled)
+        .map_err(|error| error.to_string())?;
     next_settings
         .save(&state.settings_path)
         .map_err(|error| error.to_string())?;
@@ -161,4 +168,15 @@ pub fn get_diagnostics(state: State<'_, AppState>) -> Result<DiagnosticsInfo, St
         app_data_dir: state.app_data_dir.to_string_lossy().to_string(),
         log_path: log_path.to_string_lossy().to_string(),
     })
+}
+
+fn apply_autostart_setting(app: &AppHandle, enabled: bool) -> anyhow::Result<()> {
+    if enabled {
+        app.autolaunch().enable()?;
+        crate::diagnostics::info("autostart: enabled");
+    } else {
+        app.autolaunch().disable()?;
+        crate::diagnostics::info("autostart: disabled");
+    }
+    Ok(())
 }

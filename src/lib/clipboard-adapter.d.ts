@@ -16,6 +16,7 @@ export type ViewClipboardItem = {
   id: string;
   type: 'text' | 'html' | 'image' | 'files';
   preview: string;
+  contentPath: string | null;
   favorite: boolean;
   updatedAt: number;
   size: string;

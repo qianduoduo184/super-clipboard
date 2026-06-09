@@ -5,6 +5,7 @@ export function createDefaultSettings() {
     retention_days: 30,
     global_shortcut: 'Ctrl+Shift+V',
     autostart_enabled: false,
+    preview_enabled: true,
     theme_mode: 'light',
   };
 }

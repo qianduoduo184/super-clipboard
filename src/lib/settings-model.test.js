@@ -17,6 +17,7 @@ test('createDefaultSettings returns product defaults', () => {
     retention_days: 30,
     global_shortcut: 'Ctrl+Shift+V',
     autostart_enabled: false,
+    preview_enabled: true,
     theme_mode: 'light',
   });
 });
@@ -28,6 +29,7 @@ test('mergeSettings keeps defaults for missing backend values', () => {
     retention_days: 30,
     global_shortcut: 'Ctrl+Shift+V',
     autostart_enabled: false,
+    preview_enabled: true,
     theme_mode: 'light',
   });
 });

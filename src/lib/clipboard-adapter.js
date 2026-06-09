@@ -17,9 +17,10 @@ export function mapBackendItemToViewItem(item) {
     id: item.id,
     type,
     preview: item.preview || '(空内容)',
+    contentPath: item.content_path ?? null,
     favorite: item.favorite,
     updatedAt: item.updated_at,
-    size: formatBytes(item.size_bytes),
+    size: type === 'files' ? `${item.size_bytes} 个文件` : formatBytes(item.size_bytes),
     source: item.source_app || '未知来源',
   };
 }

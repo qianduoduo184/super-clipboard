@@ -1,10 +1,11 @@
 use std::ffi::c_void;
 use std::mem::size_of;
-use std::ptr::{null, null_mut};
 use std::path::Path;
+use std::ptr::{null, null_mut};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -22,7 +23,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW, HWND_MESSAGE,
-    MSG, WM_CLIPBOARDUPDATE, WM_DESTROY, WNDCLASSW,
+    MSG, PostQuitMessage, WM_CLIPBOARDUPDATE, WM_DESTROY, WNDCLASSW,
 };
 use windows_sys::Win32::UI::Shell::{DragQueryFileW, HDROP};
 
@@ -59,47 +60,6 @@ where
 
 pub fn read_current_clipboard(blob_dir: &Path) -> Result<Vec<ClipboardItemDraft>> {
     let _guard = ClipboardGuard::open()?;
-    let mut drafts = Vec::new();
-
-    if let Some(text) = read_unicode_text()? {
-        if !text.trim().is_empty() {
-            drafts.push(ClipboardItemDraft {
-                item_type: ClipboardItemType::Text,
-                size_bytes: text.len() as i64,
-                preview: text.lines().next().unwrap_or_default().to_string(),
-                content: Some(text),
-                content_path: None,
-                source_app: None,
-            });
-        }
-    }
-
-    if let Some(html) = read_html()? {
-        drafts.push(ClipboardItemDraft {
-            item_type: ClipboardItemType::Html,
-            size_bytes: html.len() as i64,
-            preview: html.lines().next().unwrap_or("<html>").to_string(),
-            content: Some(html),
-            content_path: None,
-            source_app: None,
-        });
-    }
-
-    if let Some(dib_bytes) = read_dib_bytes()? {
-        let path = write_dib_as_bmp(blob_dir, &dib_bytes)?;
-        drafts.push(ClipboardItemDraft {
-            item_type: ClipboardItemType::Image,
-            size_bytes: dib_bytes.len() as i64,
-            preview: path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or("clipboard-image.bmp")
-                .to_string(),
-            content: None,
-            content_path: Some(path.to_string_lossy().to_string()),
-            source_app: None,
-        });
-    }
 
     if let Some(files) = read_file_list()? {
         let preview = files
@@ -114,17 +74,57 @@ pub fn read_current_clipboard(blob_dir: &Path) -> Result<Vec<ClipboardItemDraft>
             })
             .collect::<Vec<_>>()
             .join(", ");
-        drafts.push(ClipboardItemDraft {
+        return Ok(vec![ClipboardItemDraft {
             item_type: ClipboardItemType::Files,
             size_bytes: files.len() as i64,
             preview,
             content: Some(serde_json::to_string(&files)?),
             content_path: None,
             source_app: None,
-        });
+        }]);
     }
 
-    Ok(drafts)
+    if let Some(dib_bytes) = read_dib_bytes()? {
+        let path = write_dib_as_bmp(blob_dir, &dib_bytes)?;
+        return Ok(vec![ClipboardItemDraft {
+            item_type: ClipboardItemType::Image,
+            size_bytes: dib_bytes.len() as i64,
+            preview: path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("clipboard-image.bmp")
+                .to_string(),
+            content: None,
+            content_path: Some(path.to_string_lossy().to_string()),
+            source_app: None,
+        }]);
+    }
+
+    if let Some(html) = read_html()? {
+        return Ok(vec![ClipboardItemDraft {
+            item_type: ClipboardItemType::Html,
+            size_bytes: html.len() as i64,
+            preview: html.lines().next().unwrap_or("<html>").to_string(),
+            content: Some(html),
+            content_path: None,
+            source_app: None,
+        }]);
+    }
+
+    if let Some(text) = read_unicode_text()? {
+        if !text.trim().is_empty() {
+            return Ok(vec![ClipboardItemDraft {
+                item_type: ClipboardItemType::Text,
+                size_bytes: text.len() as i64,
+                preview: text.lines().next().unwrap_or_default().to_string(),
+                content: Some(text),
+                content_path: None,
+                source_app: None,
+            }]);
+        }
+    }
+
+    Ok(Vec::new())
 }
 
 pub fn write_text_to_clipboard(text: &str) -> Result<()> {
@@ -229,7 +229,12 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             }
             0
         }
-        WM_DESTROY => 0,
+        WM_DESTROY => {
+            unsafe {
+                PostQuitMessage(0);
+            }
+            0
+        }
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
     }
 }
@@ -238,6 +243,22 @@ struct ClipboardGuard;
 
 impl ClipboardGuard {
     fn open() -> Result<Self> {
+        let retry_delays = [
+            Duration::from_millis(20),
+            Duration::from_millis(40),
+            Duration::from_millis(80),
+            Duration::from_millis(120),
+        ];
+
+        for delay in retry_delays {
+            unsafe {
+                if OpenClipboard(null_mut()) != 0 {
+                    return Ok(Self);
+                }
+            }
+            thread::sleep(delay);
+        }
+
         unsafe {
             if OpenClipboard(null_mut()) == 0 {
                 return Err(anyhow!("open clipboard"));

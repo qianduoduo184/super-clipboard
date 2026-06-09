@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use storage::repository::ClipboardRepository;
 use system::settings::AppSettings;
-use tauri::Manager;
+use tauri::{Manager, WindowEvent};
 
 pub struct AppState {
     pub repository: Arc<Mutex<ClipboardRepository>>,
@@ -76,6 +76,16 @@ fn main() {
             let settings = Arc::new(Mutex::new(loaded_settings));
             let current_shortcut = Arc::new(Mutex::new(None));
             diagnostics::info("setup: settings loaded");
+            if let Some(window) = app.get_webview_window("main") {
+                let window_for_close = window.clone();
+                window.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        diagnostics::info("window: close requested, hiding to tray");
+                        api.prevent_close();
+                        let _ = window_for_close.hide();
+                    }
+                });
+            }
             app.manage(AppState {
                 repository: repository.clone(),
                 settings: settings.clone(),

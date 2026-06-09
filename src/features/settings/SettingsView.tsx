@@ -1,5 +1,5 @@
 import { useEffect, useState, type KeyboardEvent } from 'react';
-import { ArrowLeft, Database, FileText, Keyboard, Moon, Power, Shield, Sun, Trash2 } from 'lucide-react';
+import { ArrowLeft, Database, Eye, FileText, Keyboard, Moon, Power, Shield, Sun, Trash2 } from 'lucide-react';
 import { clearHistory, getDiagnostics, getSettings, setGlobalShortcut, updateSettings } from '../history/api';
 import {
   applyThemeMode,
@@ -16,6 +16,7 @@ type SettingsViewProps = {
   recording: boolean;
   onRecordingChange: (value: boolean) => void;
   onRecordingLoaded: (value: boolean) => void;
+  onSettingsChanged: (settings: AppSettings) => void;
   onHistoryCleared: () => void;
   onBack: () => void;
 };
@@ -24,6 +25,7 @@ export default function SettingsView({
   recording,
   onRecordingChange,
   onRecordingLoaded,
+  onSettingsChanged,
   onHistoryCleared,
   onBack,
 }: SettingsViewProps) {
@@ -45,6 +47,7 @@ export default function SettingsView({
         setSettings(nextSettings);
         applyThemeMode(nextSettings.theme_mode);
         onRecordingLoaded(nextSettings.recording_enabled);
+        onSettingsChanged(nextSettings);
         setStatus('设置已从本地配置载入');
       })
       .catch(() => {
@@ -71,11 +74,13 @@ export default function SettingsView({
     setSettings(nextSettings);
     applyThemeMode(nextSettings.theme_mode);
     onRecordingChange(nextSettings.recording_enabled);
+    onSettingsChanged(nextSettings);
     try {
       const savedSettings = await updateSettings(nextSettings);
       const mergedSettings = mergeSettings(savedSettings);
       setSettings(mergedSettings);
       applyThemeMode(mergedSettings.theme_mode);
+      onSettingsChanged(mergedSettings);
       setStatus('设置已保存');
     } catch {
       setStatus('后端不可用，设置仅在当前界面生效');
@@ -94,6 +99,7 @@ export default function SettingsView({
       const mergedSettings = mergeSettings(savedSettings);
       setSettings(mergedSettings);
       applyThemeMode(mergedSettings.theme_mode);
+      onSettingsChanged(mergedSettings);
       setCapturingShortcut(false);
       setShortcutDraft('');
       setStatus('快捷键已更新');
@@ -191,6 +197,21 @@ export default function SettingsView({
             checked={settings.recording_enabled}
             onChange={(event) =>
               void saveSettings(updateSettingValue(settings, 'recording_enabled', event.target.checked))
+            }
+          />
+        </label>
+
+        <label className="setting-row">
+          <span className="setting-icon"><Eye size={18} /></span>
+          <span>
+            <strong>详情预览</strong>
+            <small>关闭后主界面只显示历史列表</small>
+          </span>
+          <input
+            type="checkbox"
+            checked={settings.preview_enabled}
+            onChange={(event) =>
+              void saveSettings(updateSettingValue(settings, 'preview_enabled', event.target.checked))
             }
           />
         </label>

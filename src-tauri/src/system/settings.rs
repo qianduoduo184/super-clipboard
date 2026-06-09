@@ -8,6 +8,8 @@ pub struct AppSettings {
     pub retention_days: i64,
     pub global_shortcut: String,
     pub autostart_enabled: bool,
+    #[serde(default = "default_preview_enabled")]
+    pub preview_enabled: bool,
     #[serde(default)]
     pub theme_mode: ThemeMode,
 }
@@ -33,9 +35,14 @@ impl Default for AppSettings {
             retention_days: 30,
             global_shortcut: "Ctrl+Shift+V".to_string(),
             autostart_enabled: false,
+            preview_enabled: true,
             theme_mode: ThemeMode::Light,
         }
     }
+}
+
+fn default_preview_enabled() -> bool {
+    true
 }
 
 impl AppSettings {

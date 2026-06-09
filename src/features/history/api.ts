@@ -27,6 +27,7 @@ export type AppSettings = {
   retention_days: number;
   global_shortcut: string;
   autostart_enabled: boolean;
+  preview_enabled: boolean;
   theme_mode: 'light' | 'dark';
 };
 

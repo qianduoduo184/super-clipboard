@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import {
   Clipboard,
@@ -35,6 +36,7 @@ type ClipboardItem = {
   id: string;
   type: ClipboardType;
   preview: string;
+  contentPath: string | null;
   favorite: boolean;
   updatedAt: number;
   size: string;
@@ -46,6 +48,7 @@ const seedItems: ClipboardItem[] = [
     id: '1',
     type: 'text',
     preview: 'SQLite WAL 模式 + FTS5 搜索，保证大量历史记录下仍能快速返回首屏。',
+    contentPath: null,
     favorite: true,
     updatedAt: Date.now() - 1000 * 60 * 2,
     size: '112 B',
@@ -55,6 +58,7 @@ const seedItems: ClipboardItem[] = [
     id: '2',
     type: 'image',
     preview: 'screenshot-2026-06-08.png',
+    contentPath: null,
     favorite: false,
     updatedAt: Date.now() - 1000 * 60 * 18,
     size: '1.8 MB',
@@ -64,15 +68,17 @@ const seedItems: ClipboardItem[] = [
     id: '3',
     type: 'files',
     preview: '需求说明.docx, 架构草图.png',
+    contentPath: null,
     favorite: false,
     updatedAt: Date.now() - 1000 * 60 * 42,
-    size: '2 files',
+    size: '2 个文件',
     source: 'Explorer',
   },
   {
     id: '4',
     type: 'html',
     preview: '<table><tr><td>CopyQ / Ditto / PasteBar 功能对比</td></tr></table>',
+    contentPath: null,
     favorite: false,
     updatedAt: Date.now() - 1000 * 60 * 85,
     size: '624 B',
@@ -119,6 +125,7 @@ export default function App() {
   const [query, setQuery] = useState('');
   const [activeFilter, setActiveFilter] = useState<FilterType>('all');
   const [recording, setRecording] = useState(true);
+  const [previewEnabled, setPreviewEnabled] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [items, setItems] = useState(seedItems);
   const [selectedId, setSelectedId] = useState<string | undefined>(seedItems[0]?.id);
@@ -134,6 +141,7 @@ export default function App() {
       .then((settings) => {
         applyThemeMode(settings.theme_mode);
         setRecording(settings.recording_enabled);
+        setPreviewEnabled(settings.preview_enabled);
       })
       .catch(() => {
         applyThemeMode('light');
@@ -142,7 +150,8 @@ export default function App() {
 
   useEffect(() => {
     let ignore = false;
-    let unlisten: (() => void) | undefined;
+    let unlistenClipboard: (() => void) | undefined;
+    let unlistenSettings: (() => void) | undefined;
 
     listen('clipboard-changed', () => {
       setRefreshVersion((current) => current + 1);
@@ -152,15 +161,28 @@ export default function App() {
           nextUnlisten();
           return;
         }
-        unlisten = nextUnlisten;
+        unlistenClipboard = nextUnlisten;
       })
       .catch(() => {
         setBackendAvailable(false);
       });
 
+    listen('open-settings', () => {
+      setSettingsOpen(true);
+    })
+      .then((nextUnlisten) => {
+        if (ignore) {
+          nextUnlisten();
+          return;
+        }
+        unlistenSettings = nextUnlisten;
+      })
+      .catch(() => {});
+
     return () => {
       ignore = true;
-      unlisten?.();
+      unlistenClipboard?.();
+      unlistenSettings?.();
     };
   }, []);
 
@@ -250,6 +272,20 @@ export default function App() {
     await copySelectedItem();
   }
 
+  async function pasteListItem(item: ClipboardItem) {
+    setSelectedId(item.id);
+    if (backendAvailable) {
+      try {
+        await pasteItem(item.id);
+        setStatusMessage('已粘贴当前记录');
+      } catch (error) {
+        setStatusMessage(getErrorMessage(error, '粘贴失败'));
+      }
+      return;
+    }
+    await navigator.clipboard?.writeText(item.preview);
+  }
+
   function handleKeyboard(event: React.KeyboardEvent<HTMLElement>) {
     if (settingsOpen || visibleItems.length === 0) return;
     const ids = visibleItems.map((item) => item.id);
@@ -290,6 +326,10 @@ export default function App() {
         recording={recording}
         onRecordingChange={(value) => void handleRecordingChange(value)}
         onRecordingLoaded={setRecording}
+        onSettingsChanged={(settings) => {
+          setRecording(settings.recording_enabled);
+          setPreviewEnabled(settings.preview_enabled);
+        }}
         onHistoryCleared={() => {
           setItems([]);
           setSelectedId(undefined);
@@ -346,7 +386,7 @@ export default function App() {
         ))}
       </section>
 
-      <section className="content-grid">
+      <section className={previewEnabled ? 'content-grid' : 'content-grid no-preview'}>
         <div
           ref={historyListRef}
           className="history-list"
@@ -358,9 +398,15 @@ export default function App() {
             <button
               key={item.id}
               className={selectedItem?.id === item.id ? 'history-item selected' : 'history-item'}
-              onClick={() => setSelectedId(item.id)}
+              onClick={() => void pasteListItem(item)}
             >
-              <span className="type-icon">{iconForType(item.type)}</span>
+              <span className={item.type === 'image' && item.contentPath ? 'type-icon image-thumb' : 'type-icon'}>
+                {item.type === 'image' && item.contentPath ? (
+                  <img src={convertFileSrc(item.contentPath)} alt="" />
+                ) : (
+                  iconForType(item.type)
+                )}
+              </span>
               <span className="item-main">
                 <span className="item-preview">{normalizePreview(item.preview, 88)}</span>
                 <span className="item-meta">
@@ -375,37 +421,45 @@ export default function App() {
           {visibleItems.length === 0 ? <div className="empty-state">没有匹配的剪贴板记录</div> : null}
         </div>
 
-        <aside className="detail-pane">
-          {selectedItem ? (
-            <>
-              <div className="detail-header">
-                <span className="detail-type">{getTypeLabel(selectedItem.type)}</span>
-                <span>{selectedItem.size}</span>
-              </div>
-              <pre>{selectedItem.preview}</pre>
-              <div className="detail-actions">
-                <button onClick={() => void copySelectedItem()}>
-                  <Copy size={16} />
-                  复制
-                </button>
-                <button onClick={() => void pasteSelectedItem()}>
-                  <Pin size={16} />
-                  粘贴
-                </button>
-                <button onClick={() => void toggleFavorite(selectedItem.id)}>
-                  <Heart size={16} />
-                  {selectedItem.favorite ? '取消收藏' : '收藏'}
-                </button>
-                <button className="danger" onClick={() => void deleteItem(selectedItem.id)}>
-                  <Trash2 size={16} />
-                  删除
-                </button>
-              </div>
-            </>
-          ) : (
-            <div className="empty-state">选择一条记录查看详情</div>
-          )}
-        </aside>
+        {previewEnabled ? (
+          <aside className="detail-pane">
+            {selectedItem ? (
+              <>
+                <div className="detail-header">
+                  <span className="detail-type">{getTypeLabel(selectedItem.type)}</span>
+                  <span>{selectedItem.size}</span>
+                </div>
+                {selectedItem.type === 'image' && selectedItem.contentPath ? (
+                  <div className="image-preview">
+                    <img src={convertFileSrc(selectedItem.contentPath)} alt={selectedItem.preview} />
+                  </div>
+                ) : (
+                  <pre>{selectedItem.preview}</pre>
+                )}
+                <div className="detail-actions">
+                  <button onClick={() => void copySelectedItem()}>
+                    <Copy size={16} />
+                    复制
+                  </button>
+                  <button onClick={() => void pasteSelectedItem()}>
+                    <Pin size={16} />
+                    粘贴
+                  </button>
+                  <button onClick={() => void toggleFavorite(selectedItem.id)}>
+                    <Heart size={16} />
+                    {selectedItem.favorite ? '取消收藏' : '收藏'}
+                  </button>
+                  <button className="danger" onClick={() => void deleteItem(selectedItem.id)}>
+                    <Trash2 size={16} />
+                    删除
+                  </button>
+                </div>
+              </>
+            ) : (
+              <div className="empty-state">选择一条记录查看详情</div>
+            )}
+          </aside>
+        ) : null}
       </section>
     </main>
   );
