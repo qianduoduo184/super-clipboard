@@ -12,7 +12,7 @@ super-clipboard 使用 GitHub Actions 自动构建 Windows 成品并上传到 Gi
 4. 执行 `npm ci`。
 5. 执行 `npm test`。
 6. 执行 `npx tsc --noEmit`。
-7. 使用 `tauri-apps/tauri-action` 构建 Tauri Windows 应用。
+7. 使用 `tauri-apps/tauri-action@v0` 构建 Tauri Windows 应用。
 8. 创建 GitHub prerelease，并上传 Tauri 生成的安装包。
 
 自动发版 tag 格式：
@@ -69,6 +69,8 @@ src-tauri/target/release/bundle/
 - `npx tsc --noEmit` 失败：先修复 TypeScript 类型错误。
 - Tauri 构建失败：优先检查 Rust 依赖、Windows API 调用、`tauri.conf.json` 和图标/打包配置。
 - Release 上传失败：检查 GitHub Actions `permissions.contents: write` 是否存在。
+- Action 解析失败：确认 `.github/workflows/release.yml` 使用的是存在的 `tauri-apps/tauri-action` tag，例如 `v0`。当前不要使用 `v1`，因为上游仓库没有对应 tag。
+- Cargo 入口失败：当前应用使用 `src-tauri/src/main.rs` 作为二进制入口，不声明额外 `[lib]` crate。
 
 ## 当前约定
 
