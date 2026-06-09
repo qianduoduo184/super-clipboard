@@ -43,6 +43,14 @@ pub fn clear_blob_dir(blob_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn write_dib_as_bmp(blob_dir: &Path, dib_bytes: &[u8]) -> anyhow::Result<PathBuf> {
+    let path = build_blob_path(blob_dir, "bmp");
+    let bmp_bytes = bmp_file_from_dib(dib_bytes)?;
+    fs::write(&path, bmp_bytes)?;
+    let _ = create_thumbnail(&path);
+    Ok(path)
+}
+
 pub fn thumbnail_path_for(blob_path: &Path) -> PathBuf {
     let stem = blob_path
         .file_stem()
@@ -56,6 +64,96 @@ pub fn create_thumbnail(blob_path: &Path) -> anyhow::Result<PathBuf> {
     let image = ImageReader::open(blob_path)?.with_guessed_format()?.decode()?;
     image.thumbnail(320, 320).save(&thumbnail_path)?;
     Ok(thumbnail_path)
+}
+
+fn bmp_file_from_dib(dib_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let dib_pixel_offset = dib_pixel_offset(dib_bytes)?;
+    if dib_pixel_offset > dib_bytes.len() {
+        return Err(anyhow::anyhow!("DIB pixel offset is out of bounds"));
+    }
+
+    let pixel_offset = 14usize
+        .checked_add(dib_pixel_offset)
+        .ok_or_else(|| anyhow::anyhow!("bitmap pixel offset overflow"))?;
+    let file_size = 14usize
+        .checked_add(dib_bytes.len())
+        .ok_or_else(|| anyhow::anyhow!("bitmap file size overflow"))?;
+    if pixel_offset > u32::MAX as usize || file_size > u32::MAX as usize {
+        return Err(anyhow::anyhow!("bitmap file is too large"));
+    }
+
+    let mut bmp = Vec::with_capacity(file_size);
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&(file_size as u32).to_le_bytes());
+    bmp.extend_from_slice(&0u16.to_le_bytes());
+    bmp.extend_from_slice(&0u16.to_le_bytes());
+    bmp.extend_from_slice(&(pixel_offset as u32).to_le_bytes());
+    bmp.extend_from_slice(dib_bytes);
+    Ok(bmp)
+}
+
+fn dib_pixel_offset(dib_bytes: &[u8]) -> anyhow::Result<usize> {
+    if dib_bytes.len() < 16 {
+        return Err(anyhow::anyhow!("DIB payload is too small"));
+    }
+
+    let header_size = read_u32_le(dib_bytes, 0)? as usize;
+    if header_size < 12 || header_size > dib_bytes.len() {
+        return Err(anyhow::anyhow!("unsupported DIB header size"));
+    }
+
+    if header_size == 12 {
+        let bit_count = read_u16_le(dib_bytes, 10)?;
+        let palette_entries = palette_entries_for_bit_count(bit_count);
+        return header_size
+            .checked_add(palette_entries.saturating_mul(3))
+            .ok_or_else(|| anyhow::anyhow!("DIB pixel offset overflow"));
+    }
+
+    let bit_count = read_u16_le(dib_bytes, 14)?;
+    let compression = read_u32_le(dib_bytes, 16)?;
+    let colors_used = if dib_bytes.len() >= 36 {
+        read_u32_le(dib_bytes, 32)? as usize
+    } else {
+        0
+    };
+    let palette_entries = if colors_used > 0 {
+        colors_used
+    } else {
+        palette_entries_for_bit_count(bit_count)
+    };
+    let mask_bytes = match (header_size, compression) {
+        (40, 3) => 12,
+        (40, 6) => 16,
+        _ => 0,
+    };
+
+    header_size
+        .checked_add(mask_bytes)
+        .and_then(|value| value.checked_add(palette_entries.saturating_mul(4)))
+        .ok_or_else(|| anyhow::anyhow!("DIB pixel offset overflow"))
+}
+
+fn palette_entries_for_bit_count(bit_count: u16) -> usize {
+    if bit_count <= 8 {
+        1usize << usize::from(bit_count)
+    } else {
+        0
+    }
+}
+
+fn read_u16_le(bytes: &[u8], offset: usize) -> anyhow::Result<u16> {
+    let slice = bytes
+        .get(offset..offset + 2)
+        .ok_or_else(|| anyhow::anyhow!("DIB u16 field is out of bounds"))?;
+    Ok(u16::from_le_bytes([slice[0], slice[1]]))
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> anyhow::Result<u32> {
+    let slice = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| anyhow::anyhow!("DIB u32 field is out of bounds"))?;
+    Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
 #[cfg(test)]
@@ -86,5 +184,32 @@ mod tests {
         let thumbnail_path = create_thumbnail(&image_path).expect("thumbnail");
 
         assert!(thumbnail_path.exists());
+    }
+
+    #[test]
+    fn write_dib_as_bmp_wraps_dib_and_creates_thumbnail() {
+        let dir = std::env::temp_dir().join(format!("super-clipboard-blob-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir");
+
+        let mut dib = Vec::new();
+        dib.extend_from_slice(&40u32.to_le_bytes());
+        dib.extend_from_slice(&1i32.to_le_bytes());
+        dib.extend_from_slice(&(-1i32).to_le_bytes());
+        dib.extend_from_slice(&1u16.to_le_bytes());
+        dib.extend_from_slice(&32u16.to_le_bytes());
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        dib.extend_from_slice(&4u32.to_le_bytes());
+        dib.extend_from_slice(&0i32.to_le_bytes());
+        dib.extend_from_slice(&0i32.to_le_bytes());
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        dib.extend_from_slice(&[0, 0, 255, 255]);
+
+        let path = write_dib_as_bmp(&dir, &dib).expect("bmp blob");
+        let bytes = fs::read(&path).expect("bmp file");
+
+        assert_eq!(path.extension().and_then(|value| value.to_str()), Some("bmp"));
+        assert_eq!(&bytes[..2], b"BM");
+        assert!(thumbnail_path_for(&path).exists());
     }
 }

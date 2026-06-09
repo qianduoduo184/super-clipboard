@@ -26,7 +26,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 use windows_sys::Win32::UI::Shell::{DragQueryFileW, HDROP};
 
-use crate::blobs::build_blob_path;
+use crate::blobs::write_dib_as_bmp;
 use crate::clipboard::types::{ClipboardItemDraft, ClipboardItemType};
 
 static CLIPBOARD_EVENT_TX: OnceLock<Mutex<Option<Sender<()>>>> = OnceLock::new();
@@ -86,15 +86,14 @@ pub fn read_current_clipboard(blob_dir: &Path) -> Result<Vec<ClipboardItemDraft>
     }
 
     if let Some(dib_bytes) = read_dib_bytes()? {
-        let path = build_blob_path(blob_dir, "dib");
-        std::fs::write(&path, &dib_bytes)?;
+        let path = write_dib_as_bmp(blob_dir, &dib_bytes)?;
         drafts.push(ClipboardItemDraft {
             item_type: ClipboardItemType::Image,
             size_bytes: dib_bytes.len() as i64,
             preview: path
                 .file_name()
                 .and_then(|value| value.to_str())
-                .unwrap_or("clipboard-image.dib")
+                .unwrap_or("clipboard-image.bmp")
                 .to_string(),
             content: None,
             content_path: Some(path.to_string_lossy().to_string()),
