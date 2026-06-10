@@ -114,8 +114,32 @@ jobs:
           releaseDraft: false
           prerelease: false
 
-      - name: Skip release build without signing secrets
+      - name: Disable updater artifacts without signing secrets
         if: steps.signing-secrets.outputs.available != 'true'
         shell: pwsh
         run: |
-          Write-Warning "Release build was skipped because TAURI_SIGNING_PRIVATE_KEY is not configured. Configure repository Actions secrets to enable signed updater artifacts."
+          Write-Warning "TAURI_SIGNING_PRIVATE_KEY is not configured. Building the NSIS installer without updater artifacts."
+          $configPath = "src-tauri\tauri.conf.json"
+          $config = Get-Content $configPath -Raw | ConvertFrom-Json
+          $config.bundle.createUpdaterArtifacts = $false
+          $config | ConvertTo-Json -Depth 100 | Set-Content $configPath -Encoding utf8
+
+      - name: Build and upload Tauri installer
+        if: steps.signing-secrets.outputs.available != 'true'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: super-clipboard-v__VERSION__-${{ github.run_number }}
+          releaseName: super-clipboard v__VERSION__ build ${{ github.run_number }}
+          releaseBody: |
+            自动发版：本版本由 GitHub Actions 在 main 分支提交后生成。
+
+            验证内容：
+            - npm test
+            - npm run typecheck
+            - Tauri Windows release build
+
+            注意：仓库未配置 TAURI_SIGNING_PRIVATE_KEY，本次 Release 只上传 Windows 安装包，不生成 updater artifacts。配置 updater signing Secret 后，后续 Release 会恢复自动更新产物。
+          releaseDraft: false
+          prerelease: false
