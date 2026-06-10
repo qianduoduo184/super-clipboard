@@ -4,7 +4,9 @@ super-clipboard 使用 GitHub Actions 自动构建 Windows 成品并上传到 Gi
 
 ## 自动发版策略
 
-每次推送到 `main` 分支后会触发 `.github/workflows/release.yml`：
+每次推送到 `main` 分支后会触发 `.github/workflows/release.yml`。如果仓库还没有配置 updater signing Secret，workflow 只执行前端检查并跳过签名发布构建；配置好 Secret 后才会构建并上传正式 Release。
+
+完整发布流程：
 
 1. 检出仓库。
 2. 安装 Node.js 22。
@@ -12,8 +14,10 @@ super-clipboard 使用 GitHub Actions 自动构建 Windows 成品并上传到 Gi
 4. 执行 `npm ci`。
 5. 执行 `npm test`。
 6. 执行 `npx tsc --noEmit`。
-7. 使用 `tauri-apps/tauri-action@v0` 构建 Tauri Windows 应用。
-8. 创建 GitHub prerelease，并上传 Tauri 生成的安装包。
+7. 检查 updater signing Secret 是否存在。
+8. Secret 存在时，预检 updater 私钥格式和密码。
+9. 使用 `tauri-apps/tauri-action@v0` 构建 Tauri Windows 应用。
+10. 创建 GitHub Release，并上传 Tauri 生成的安装包。
 
 自动发版 tag 格式：
 
@@ -68,6 +72,7 @@ src-tauri/target/release/bundle/
 - `npm test` 失败：先修复前端单元测试。
 - `npx tsc --noEmit` 失败：先修复 TypeScript 类型错误。
 - Tauri 构建失败：优先检查 Rust 依赖、Windows API 调用、`tauri.conf.json` 和图标/打包配置。
+- Release 构建被跳过：配置 GitHub Actions Secrets `TAURI_SIGNING_PRIVATE_KEY` 后重新运行 workflow。
 - Release 上传失败：检查 GitHub Actions `permissions.contents: write` 是否存在。
 - Action 解析失败：确认 `.github/workflows/release.yml` 使用的是存在的 `tauri-apps/tauri-action` tag，例如 `v0`。当前不要使用 `v1`，因为上游仓库没有对应 tag。
 - Cargo 入口失败：当前应用使用 `src-tauri/src/main.rs` 作为二进制入口，不声明额外 `[lib]` crate。

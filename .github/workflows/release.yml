@@ -49,7 +49,21 @@ jobs:
       - name: Run frontend checks
         run: npm run ci:frontend
 
+      - name: Check updater signing secrets
+        id: signing-secrets
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            "available=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Warning "TAURI_SIGNING_PRIVATE_KEY is not configured. Skipping the signed Tauri release build."
+          } else {
+            "available=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
       - name: Validate updater signing secrets
+        if: steps.signing-secrets.outputs.available == 'true'
         shell: pwsh
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -79,6 +93,7 @@ jobs:
           npx tauri signer sign .tmp\updater-signing-preflight.txt
 
       - name: Build and upload Tauri release
+        if: steps.signing-secrets.outputs.available == 'true'
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -98,3 +113,9 @@ jobs:
             注意：当前项目仍处于早期版本，真实剪贴板监听、托盘、全局快捷键和大内容捕获需要在 Windows 实机继续验证。
           releaseDraft: false
           prerelease: false
+
+      - name: Skip release build without signing secrets
+        if: steps.signing-secrets.outputs.available != 'true'
+        shell: pwsh
+        run: |
+          Write-Warning "Release build was skipped because TAURI_SIGNING_PRIVATE_KEY is not configured. Configure repository Actions secrets to enable signed updater artifacts."
