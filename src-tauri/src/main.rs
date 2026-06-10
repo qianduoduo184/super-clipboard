@@ -34,6 +34,7 @@ fn main() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let app_data = app.path().app_data_dir()?;
             let fallback_log_path = app_data.join("logs").join("super-clipboard.log");
@@ -135,12 +136,15 @@ fn main() {
             commands::paste_item,
             commands::toggle_favorite,
             commands::delete_item,
+            commands::reorder_items,
             commands::set_recording_enabled,
             commands::get_settings,
             commands::update_settings,
             commands::set_global_shortcut,
             commands::clear_history,
-            commands::get_diagnostics
+            commands::get_diagnostics,
+            commands::check_update,
+            commands::install_update
         ])
         .run(tauri::generate_context!())
         .expect("failed to run super-clipboard");

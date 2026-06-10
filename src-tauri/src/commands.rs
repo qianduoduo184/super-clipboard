@@ -1,5 +1,8 @@
 use tauri::{AppHandle, State};
 use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_updater::UpdaterExt;
+
+use std::path::Path;
 
 use crate::storage::repository::{ClipboardItem, SearchFilters};
 use crate::system::settings::AppSettings;
@@ -9,6 +12,13 @@ use crate::AppState;
 pub struct DiagnosticsInfo {
     pub app_data_dir: String,
     pub log_path: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UpdateInfo {
+    pub available: bool,
+    pub version: Option<String>,
+    pub body: Option<String>,
 }
 
 #[tauri::command]
@@ -47,10 +57,26 @@ pub fn copy_item(state: State<'_, AppState>, id: String) -> Result<(), String> {
         .ok_or_else(|| "clipboard item not found".to_string())?;
     if item.item_type == "text" || item.item_type == "html" {
         if let Some(content) = item.content {
+            let content = if item.item_type == "html" {
+                html_to_plain_text(&content)
+            } else {
+                content
+            };
             #[cfg(target_os = "windows")]
             crate::clipboard::win::write_text_to_clipboard(&content)
                 .map_err(|error| error.to_string())?;
         }
+        return Ok(());
+    }
+    if item.item_type == "image" {
+        let content_path = item
+            .content_path
+            .ok_or_else(|| "image item has no blob path".to_string())?;
+        let dib_bytes = crate::blobs::read_dib_from_bmp_file(Path::new(&content_path))
+            .map_err(|error| error.to_string())?;
+        #[cfg(target_os = "windows")]
+        crate::clipboard::win::write_dib_to_clipboard(&dib_bytes)
+            .map_err(|error| error.to_string())?;
         return Ok(());
     }
 
@@ -83,6 +109,13 @@ pub fn delete_item(state: State<'_, AppState>, id: String) -> Result<(), String>
 }
 
 #[tauri::command]
+pub fn reorder_items(state: State<'_, AppState>, ids: Vec<String>) -> Result<(), String> {
+    crate::diagnostics::info(format!("command: reorder_items count={}", ids.len()));
+    let repository = state.repository.lock().map_err(|error| error.to_string())?;
+    repository.reorder_items(&ids).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub fn set_recording_enabled(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
     crate::diagnostics::info(format!("command: set_recording_enabled enabled={enabled}"));
     let mut settings = state.settings.lock().map_err(|error| error.to_string())?;
@@ -107,12 +140,13 @@ pub fn update_settings(
     next_settings: AppSettings,
 ) -> Result<AppSettings, String> {
     crate::diagnostics::info("command: update_settings");
-    let current_shortcut = {
+    let (current_shortcut, current_update_check_date) = {
         let settings = state.settings.lock().map_err(|error| error.to_string())?;
-        settings.global_shortcut.clone()
+        (settings.global_shortcut.clone(), settings.last_update_check_date.clone())
     };
     let mut next_settings = next_settings;
     next_settings.global_shortcut = current_shortcut;
+    next_settings.last_update_check_date = current_update_check_date;
     apply_autostart_setting(&app, next_settings.autostart_enabled)
         .map_err(|error| error.to_string())?;
     next_settings
@@ -129,6 +163,59 @@ pub fn update_settings(
             .map_err(|error| error.to_string())?;
     }
     Ok(next_settings)
+}
+
+#[tauri::command]
+pub async fn check_update(app: AppHandle, state: State<'_, AppState>) -> Result<UpdateInfo, String> {
+    crate::diagnostics::info("command: check_update");
+    let today = chrono::Local::now().date_naive().to_string();
+    let update = app
+        .updater()
+        .map_err(|error| error.to_string())?
+        .check()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    {
+        let mut settings = state.settings.lock().map_err(|error| error.to_string())?;
+        settings.last_update_check_date = Some(today);
+        settings
+            .save(&state.settings_path)
+            .map_err(|error| error.to_string())?;
+    }
+
+    Ok(match update {
+        Some(update) => UpdateInfo {
+            available: true,
+            version: Some(update.version.to_string()),
+            body: update.body,
+        },
+        None => UpdateInfo {
+            available: false,
+            version: None,
+            body: None,
+        },
+    })
+}
+
+#[tauri::command]
+pub async fn install_update(app: AppHandle) -> Result<(), String> {
+    crate::diagnostics::info("command: install_update");
+    let Some(update) = app
+        .updater()
+        .map_err(|error| error.to_string())?
+        .check()
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Err("当前没有可用更新".to_string());
+    };
+
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|error| error.to_string())?;
+    app.restart();
 }
 
 #[tauri::command]
@@ -179,4 +266,76 @@ fn apply_autostart_setting(app: &AppHandle, enabled: bool) -> anyhow::Result<()>
         crate::diagnostics::info("autostart: disabled");
     }
     Ok(())
+}
+
+fn html_to_plain_text(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut in_tag = false;
+    let mut entity = String::new();
+
+    for character in value.chars() {
+        match character {
+            '<' => {
+                in_tag = true;
+                push_spacing(&mut output);
+            }
+            '>' => {
+                in_tag = false;
+            }
+            '&' if !in_tag => {
+                if entity.starts_with('&') {
+                    output.push_str(&entity);
+                }
+                entity.clear();
+                entity.push(character);
+            }
+            ';' if !in_tag && entity.starts_with('&') => {
+                entity.push(character);
+                output.push_str(match entity.as_str() {
+                    "&amp;" => "&",
+                    "&lt;" => "<",
+                    "&gt;" => ">",
+                    "&quot;" => "\"",
+                    "&#39;" | "&apos;" => "'",
+                    "&nbsp;" => " ",
+                    _ => entity.as_str(),
+                });
+                entity.clear();
+            }
+            _ if in_tag => {}
+            _ if entity.starts_with('&') => {
+                entity.push(character);
+            }
+            _ => output.push(character),
+        }
+    }
+
+    if entity.starts_with('&') {
+        output.push_str(&entity);
+    }
+    output.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn push_spacing(output: &mut String) {
+    if !output.chars().last().map(char::is_whitespace).unwrap_or(false) {
+        output.push(' ');
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::html_to_plain_text;
+
+    #[test]
+    fn html_to_plain_text_removes_tags_and_decodes_common_entities() {
+        assert_eq!(
+            html_to_plain_text("<p>Hello&nbsp;<strong>world</strong> &amp; clipboard</p>"),
+            "Hello world & clipboard"
+        );
+    }
+
+    #[test]
+    fn html_to_plain_text_keeps_text_between_bare_ampersands() {
+        assert_eq!(html_to_plain_text("A & B & C"), "A & B & C");
+    }
 }

@@ -5,7 +5,9 @@ import {
   formatShortcutFromEvent,
   getErrorMessage,
   mergeSettings,
+  shouldCheckForUpdatesToday,
   shouldClearHistory,
+  toLocalDateString,
   updateSettingValue,
   validateShortcut,
 } from './settings-model.js';
@@ -19,6 +21,8 @@ test('createDefaultSettings returns product defaults', () => {
     autostart_enabled: false,
     preview_enabled: true,
     theme_mode: 'light',
+    auto_update_enabled: false,
+    last_update_check_date: null,
   });
 });
 
@@ -31,6 +35,8 @@ test('mergeSettings keeps defaults for missing backend values', () => {
     autostart_enabled: false,
     preview_enabled: true,
     theme_mode: 'light',
+    auto_update_enabled: false,
+    last_update_check_date: null,
   });
 });
 
@@ -80,4 +86,33 @@ test('updateSettingValue supports theme switching', () => {
 
   assert.equal(settings.theme_mode, 'light');
   assert.equal(next.theme_mode, 'dark');
+});
+
+test('mergeSettings preserves auto update values from backend', () => {
+  assert.deepEqual(mergeSettings({
+    auto_update_enabled: true,
+    last_update_check_date: '2026-06-10',
+  }), {
+    recording_enabled: true,
+    max_history_items: 10000,
+    retention_days: 30,
+    global_shortcut: 'Ctrl+Shift+V',
+    autostart_enabled: false,
+    preview_enabled: true,
+    theme_mode: 'light',
+    auto_update_enabled: true,
+    last_update_check_date: '2026-06-10',
+  });
+});
+
+test('shouldCheckForUpdatesToday only runs once per enabled day', () => {
+  assert.equal(shouldCheckForUpdatesToday(false, null, '2026-06-10'), false);
+  assert.equal(shouldCheckForUpdatesToday(true, '2026-06-10', '2026-06-10'), false);
+  assert.equal(shouldCheckForUpdatesToday(true, '2026-06-09', '2026-06-10'), true);
+  assert.equal(shouldCheckForUpdatesToday(true, null, '2026-06-10'), true);
+});
+
+test('toLocalDateString formats local date with zero padding', () => {
+  assert.equal(toLocalDateString(new Date(2026, 5, 9)), '2026-06-09');
+  assert.equal(toLocalDateString(new Date(2026, 0, 5)), '2026-01-05');
 });

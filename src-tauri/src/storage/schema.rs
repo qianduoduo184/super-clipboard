@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS clipboard_items (
   source_app TEXT,
   favorite INTEGER NOT NULL DEFAULT 0,
   size_bytes INTEGER NOT NULL DEFAULT 0,
+  sort_rank INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   deleted_at INTEGER

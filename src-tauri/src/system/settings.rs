@@ -12,6 +12,10 @@ pub struct AppSettings {
     pub preview_enabled: bool,
     #[serde(default)]
     pub theme_mode: ThemeMode,
+    #[serde(default)]
+    pub auto_update_enabled: bool,
+    #[serde(default)]
+    pub last_update_check_date: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +41,8 @@ impl Default for AppSettings {
             autostart_enabled: false,
             preview_enabled: true,
             theme_mode: ThemeMode::Light,
+            auto_update_enabled: false,
+            last_update_check_date: None,
         }
     }
 }

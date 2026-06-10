@@ -20,6 +20,18 @@ pub mod win {
     pub fn read_current_clipboard(_blob_dir: &Path) -> Result<Vec<ClipboardItemDraft>> {
         Ok(Vec::new())
     }
+
+    pub fn write_text_to_clipboard(_text: &str) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn write_dib_to_clipboard(_dib_bytes: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn simulate_paste_shortcut() -> Result<()> {
+        Ok(())
+    }
 }
 
 use std::path::PathBuf;

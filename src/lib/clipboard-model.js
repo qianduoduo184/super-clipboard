@@ -31,6 +31,38 @@ export function normalizePreview(value, maxLength = 120) {
   return `${singleLine.slice(0, maxLength - 1)}...`;
 }
 
+export function getVisibleFilters() {
+  return [
+    { key: 'all', label: '全部' },
+    { key: 'favorites', label: '收藏' },
+    { key: 'text', label: '文本' },
+    { key: 'image', label: '图片' },
+    { key: 'files', label: '文件' },
+  ];
+}
+
+export function getVisualPreview(item) {
+  if (item.type === 'image') {
+    return '图片内容';
+  }
+  return normalizePreview(item.preview, 88);
+}
+
+export function reorderItemsByDrag(ids, draggedId, targetId) {
+  if (!draggedId || !targetId || draggedId === targetId) {
+    return ids;
+  }
+
+  const nextIds = ids.filter((id) => id !== draggedId);
+  const targetIndex = nextIds.indexOf(targetId);
+  if (targetIndex === -1 || ids.indexOf(draggedId) === -1) {
+    return ids;
+  }
+
+  nextIds.splice(targetIndex, 0, draggedId);
+  return nextIds;
+}
+
 export function getTypeLabel(type) {
   const labels = {
     text: '文本',

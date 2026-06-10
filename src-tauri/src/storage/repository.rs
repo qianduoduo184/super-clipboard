@@ -137,6 +137,60 @@ mod tests {
         assert_ne!(first_active, second_active);
         assert!(repository.get_item(&favorite.id).expect("favorite").is_some());
     }
+
+    #[test]
+    fn reorder_items_persists_custom_history_order() {
+        let repository = open_test_repository();
+        let first = repository.insert_or_touch(text_draft("first")).expect("first insert");
+        let second = repository.insert_or_touch(text_draft("second")).expect("second insert");
+        let third = repository.insert_or_touch(text_draft("third")).expect("third insert");
+
+        repository
+            .reorder_items(&[third.id.clone(), first.id.clone(), second.id.clone()])
+            .expect("reorder");
+
+        let results = repository
+            .search(
+                String::new(),
+                SearchFilters {
+                    item_type: None,
+                    favorites_only: false,
+                },
+                10,
+                None,
+            )
+            .expect("search");
+
+        assert_eq!(
+            results.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+            vec![third.id.as_str(), first.id.as_str(), second.id.as_str()]
+        );
+    }
+
+    #[test]
+    fn insert_or_touch_places_new_items_before_custom_order() {
+        let repository = open_test_repository();
+        let first = repository.insert_or_touch(text_draft("first")).expect("first insert");
+        let second = repository.insert_or_touch(text_draft("second")).expect("second insert");
+        repository
+            .reorder_items(&[first.id.clone(), second.id.clone()])
+            .expect("reorder");
+
+        let third = repository.insert_or_touch(text_draft("third")).expect("third insert");
+        let results = repository
+            .search(
+                String::new(),
+                SearchFilters {
+                    item_type: None,
+                    favorites_only: false,
+                },
+                10,
+                None,
+            )
+            .expect("search");
+
+        assert_eq!(results[0].id, third.id);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,6 +210,7 @@ impl ClipboardRepository {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(INIT_SQL)?;
+        migrate_sort_rank(&conn)?;
         Ok(Self { conn })
     }
 
@@ -173,7 +228,7 @@ impl ClipboardRepository {
             .optional()?
         {
             self.conn.execute(
-                "UPDATE clipboard_items SET updated_at = ?1 WHERE id = ?2",
+                "UPDATE clipboard_items SET updated_at = ?1, sort_rank = ?1 WHERE id = ?2",
                 params![now, existing_id],
             )?;
             return self.get_item(&existing_id)?.ok_or_else(|| anyhow::anyhow!("item missing"));
@@ -183,8 +238,8 @@ impl ClipboardRepository {
         let item_type = format!("{:?}", draft.item_type).to_lowercase();
         self.conn.execute(
             "INSERT INTO clipboard_items
-            (id, hash, item_type, content, content_path, preview, source_app, favorite, size_bytes, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10)",
+            (id, hash, item_type, content, content_path, preview, source_app, favorite, size_bytes, sort_rank, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?9, ?10)",
             params![
                 id,
                 hash,
@@ -200,6 +255,18 @@ impl ClipboardRepository {
         )?;
         self.rebuild_fts_for_item(&id)?;
         self.get_item(&id)?.ok_or_else(|| anyhow::anyhow!("inserted item missing"))
+    }
+
+    pub fn reorder_items(&self, ids: &[String]) -> anyhow::Result<()> {
+        let now = Utc::now().timestamp_millis();
+        for (index, id) in ids.iter().enumerate() {
+            let rank = now.saturating_sub(index as i64);
+            self.conn.execute(
+                "UPDATE clipboard_items SET sort_rank = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+                params![rank, id],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn search(
@@ -234,7 +301,7 @@ impl ClipboardRepository {
             );
             sql_params.push(Value::Text(to_fts_query(&query)));
         }
-        sql.push_str(" ORDER BY updated_at DESC LIMIT ?");
+        sql.push_str(" ORDER BY COALESCE(sort_rank, updated_at) DESC, updated_at DESC LIMIT ?");
         sql_params.push(Value::Integer(limit));
 
         let mut statement = self.conn.prepare(&sql)?;
@@ -421,6 +488,29 @@ fn to_fts_query(raw: &str) -> String {
         .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn migrate_sort_rank(conn: &Connection) -> anyhow::Result<()> {
+    let has_sort_rank = conn
+        .prepare("PRAGMA table_info(clipboard_items)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == "sort_rank");
+
+    if !has_sort_rank {
+        conn.execute("ALTER TABLE clipboard_items ADD COLUMN sort_rank INTEGER", [])?;
+    }
+
+    conn.execute(
+        "UPDATE clipboard_items SET sort_rank = updated_at WHERE sort_rank IS NULL",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_clipboard_items_sort_rank ON clipboard_items(sort_rank DESC, updated_at DESC)",
+        [],
+    )?;
+    Ok(())
 }
 
 fn remove_blob_paths(paths: &[PathBuf]) -> anyhow::Result<()> {

@@ -32,6 +32,15 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "createUpdaterArtifacts": true,
     "icon": ["icons/icon.ico"]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk3MTY1MkJEMDc5OTZEOTEKUldTUmJaa0h2VklXbDRsMW1hV09lQkxvRG5Yc29Ja2NxMm9JMVFSLzN2QVpwU0RxdWR3Qm12ZFoK",
+      "endpoints": [
+        "https://github.com/qianduoduo184/super-clipboard/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

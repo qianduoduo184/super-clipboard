@@ -20,6 +20,7 @@ tauri = { version = "2.0.0", features = ["protocol-asset", "tray-icon"] }
 tauri-plugin-autostart = "2.0.0"
 tauri-plugin-global-shortcut = "2.0.0"
 tauri-plugin-opener = "2.0.0"
+tauri-plugin-updater = "2.0.0"
 thiserror = "1.0"
 uuid = { version = "1.10", features = ["v4", "serde"] }
 windows-sys = { version = ">=0.59, <=0.61", features = [
@@ -33,3 +34,7 @@ windows-sys = { version = ">=0.59, <=0.61", features = [
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging"
 ] }
+
+[profile.release]
+# Trade a little runtime perf for faster, more parallel compiles in CI.
+codegen-units = 256

@@ -1,6 +1,14 @@
 import { useEffect, useState, type KeyboardEvent } from 'react';
-import { ArrowLeft, Database, Eye, FileText, Keyboard, Moon, Power, Shield, Sun, Trash2 } from 'lucide-react';
-import { clearHistory, getDiagnostics, getSettings, setGlobalShortcut, updateSettings } from '../history/api';
+import { ArrowLeft, Database, Download, Eye, FileText, Keyboard, Moon, Power, Shield, Sun, Trash2 } from 'lucide-react';
+import {
+  checkForUpdates,
+  clearHistory,
+  getDiagnostics,
+  getSettings,
+  installUpdate,
+  setGlobalShortcut,
+  updateSettings,
+} from '../history/api';
 import {
   applyThemeMode,
   createDefaultSettings,
@@ -144,6 +152,26 @@ export default function SettingsView({
       setStatus('历史记录已清空');
     } catch {
       setStatus('后端不可用，无法清空真实历史记录');
+    }
+  }
+
+  async function handleManualUpdateCheck() {
+    try {
+      setStatus('正在检查更新');
+      const update = await checkForUpdates();
+      if (!update.available) {
+        setStatus('当前已是最新版本');
+        return;
+      }
+      const confirmed = window.confirm(`发现新版本 ${update.version ?? ''}，是否现在更新？`);
+      if (confirmed) {
+        setStatus('正在下载并安装更新');
+        await installUpdate();
+      } else {
+        setStatus('已取消更新');
+      }
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -299,6 +327,32 @@ export default function SettingsView({
             }
           />
         </label>
+
+        <label className="setting-row">
+          <span className="setting-icon"><Download size={18} /></span>
+          <span>
+            <strong>自动检查更新</strong>
+            <small>每天第一次启动时检查 GitHub Release 更新</small>
+          </span>
+          <input
+            type="checkbox"
+            checked={settings.auto_update_enabled}
+            onChange={(event) =>
+              void saveSettings(updateSettingValue(settings, 'auto_update_enabled', event.target.checked))
+            }
+          />
+        </label>
+
+        <div className="setting-row">
+          <span className="setting-icon"><Download size={18} /></span>
+          <span>
+            <strong>手动检查更新</strong>
+            <small>发现新版本后确认再下载并安装</small>
+          </span>
+          <button onClick={() => void handleManualUpdateCheck()}>
+            检查
+          </button>
+        </div>
 
         <div className="setting-row">
           <span className="setting-icon"><Trash2 size={18} /></span>

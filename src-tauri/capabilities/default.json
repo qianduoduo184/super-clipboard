@@ -5,8 +5,10 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "core:window:allow-hide",
     "opener:default",
     "global-shortcut:default",
-    "autostart:default"
+    "autostart:default",
+    "updater:default"
   ]
 }

@@ -15,4 +15,10 @@ export function filterItems<T extends ClipboardItemLike>(
 
 export function normalizePreview(value: string, maxLength?: number): string;
 
+export function getVisibleFilters(): Array<{ key: string; label: string }>;
+
+export function getVisualPreview(item: Pick<ClipboardItemLike, 'type' | 'preview'>): string;
+
+export function reorderItemsByDrag(ids: string[], draggedId: string, targetId: string): string[];
+
 export function getTypeLabel(type: string): string;

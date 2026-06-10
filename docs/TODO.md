@@ -90,3 +90,26 @@
 - [x] 编写本地数据路径文档。
 - [x] 编写快捷键文档。
 - [x] 编写 Windows 打包文档。
+
+## 阶段 7：代码审查发现（2026-06-10，分支 codex-clipboard-behavior-ui-updates）
+
+> 来源：对「自动更新 / 图片复制 / 移除 HTML 捕获 / 拖拽排序 / 粘贴后隐藏窗口」五块改动的代码审查。
+>
+> 修复状态（2026-06-10）：🔴+🟡 五项已修复。前端经 `npm run ci:frontend`（31 测试 + typecheck）通过；后端改动（capabilities/`commands.rs`）本地无 Rust 工具链，待装链后跑 `cargo test` 验证（含新增 `html_to_plain_text_keeps_text_between_bare_ampersands`）。🟢 三项为设计权衡，暂不处理。
+
+### 🔴 必须修复
+
+- [x] **窗口隐藏缺权限**（`src/App.tsx:290`，`src-tauri/capabilities/default.json`）：前端 `getCurrentWindow().hide()` 缺 `core:window:allow-hide`，会抛权限错误；因调用在 `pasteItem` 之后的同一 try 内，错误被 catch 误报「粘贴失败」且窗口不隐藏（粘贴其实成功）。修复：capabilities 加 `"core:window:allow-hide"` 并实机验证。
+
+### 🟡 应当修复
+
+- [x] **拖拽后吞掉一次点击**（`src/App.tsx:303-323` `handleDropItem` / `:455` `onClick`）：drop 时无条件置 `suppressNextItemClick=true`，但 HTML5 拖放结束不触发 click，该标志挂起到下次真实点击才被消费，导致拖拽后第一次粘贴点击失效。修复：去掉该标志，或在 `onDragEnd` 用微任务重置。
+- [x] **html_to_plain_text 丢字**（`src-tauri/src/commands.rs:270`）：多个裸 `&` 之间的正文丢失（如 `"A & B & C"` → `"A & C"`），因第二个 `&` 清空了 entity 缓冲。仅影响复制遗留 HTML 条目。修复：遇到非 `;` 结尾的 `&` 串时把缓冲原样 flush 回输出。
+- [x] **last_update_check_date 被前端旧值覆盖**（`src-tauri/src/commands.rs:136` `update_settings` ↔ `:170` `check_update`）：`check_update` 写入今日值但不回传前端；用户改任意设置时 `update_settings` 用旧值覆盖，破坏「每天一次」。修复：`update_settings` 保留现有 `last_update_check_date`（仿 `global_shortcut`），或 `check_update` 回传新日期供前端同步。
+- [x] **每日检查日期 UTC/本地不一致**（`src/App.tsx:146` 用 `toISOString()`(UTC) ↔ `src-tauri/src/commands.rs:170` 用 `chrono::Local`）：跨午夜边界可能误判是否已检查。修复：两侧统一日期来源。
+
+### 🟢 可选
+
+- [ ] `capabilities/default.json:11` `updater:default` 可能多余（更新经 Rust 侧 `app.updater()` 调用，不走 JS→插件 IPC），确认后可移除。
+- [ ] `src/App.tsx:93-95` `getVisibleFilters()` 结果用 `as Array<{ key: FilterType; ... }>` 强转，丢失类型安全；可让 `.d.ts` 直接返回 `FilterType`。
+- [ ] 筛选/搜索激活时拖拽排序会把可见子集的 `sort_rank` 抬到全局最前，清空筛选后顺序可能与预期不符（设计权衡，留意即可）。

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import {
   Clipboard,
   Copy,
@@ -14,16 +15,19 @@ import {
   Settings,
   Trash2,
 } from 'lucide-react';
-import { filterItems, getTypeLabel, normalizePreview } from './lib/clipboard-model';
+import { filterItems, getTypeLabel, getVisibleFilters, getVisualPreview, reorderItemsByDrag } from './lib/clipboard-model';
 import { calculateVirtualWindow, moveSelection } from './lib/history-ui';
-import { applyThemeMode, getErrorMessage } from './lib/settings-model';
+import { applyThemeMode, getErrorMessage, shouldCheckForUpdatesToday, toLocalDateString } from './lib/settings-model';
 import SettingsView from './features/settings/SettingsView';
 import { mapBackendItemToViewItem } from './lib/clipboard-adapter';
 import {
   copyItem,
+  checkForUpdates,
   deleteItem as deleteBackendItem,
   getSettings,
+  installUpdate,
   pasteItem,
+  reorderItems,
   searchItems,
   setRecordingEnabled,
   toggleFavorite as toggleBackendFavorite,
@@ -87,13 +91,8 @@ const seedItems: ClipboardItem[] = [
 ];
 
 const filters: Array<{ key: FilterType; label: string }> = [
-  { key: 'all', label: '全部' },
-  { key: 'favorites', label: '收藏' },
-  { key: 'text', label: '文本' },
-  { key: 'html', label: 'HTML' },
-  { key: 'image', label: '图片' },
-  { key: 'files', label: '文件' },
-];
+  ...getVisibleFilters(),
+] as Array<{ key: FilterType; label: string }>;
 
 const HISTORY_ITEM_HEIGHT = 66;
 const HISTORY_VIEWPORT_HEIGHT = 380;
@@ -133,6 +132,7 @@ export default function App() {
   const [backendAvailable, setBackendAvailable] = useState(true);
   const [statusMessage, setStatusMessage] = useState('正在连接本地剪贴板服务');
   const [refreshVersion, setRefreshVersion] = useState(0);
+  const [draggingId, setDraggingId] = useState<string | null>(null);
   const historyListRef = useRef<HTMLDivElement | null>(null);
   const debouncedQuery = useDebouncedValue(query, 100);
 
@@ -142,6 +142,23 @@ export default function App() {
         applyThemeMode(settings.theme_mode);
         setRecording(settings.recording_enabled);
         setPreviewEnabled(settings.preview_enabled);
+        const today = toLocalDateString(new Date());
+        if (shouldCheckForUpdatesToday(settings.auto_update_enabled, settings.last_update_check_date, today)) {
+          void checkForUpdates()
+            .then((update) => {
+              if (!update.available) {
+                setStatusMessage('当前已是最新版本');
+                return;
+              }
+              const confirmed = window.confirm(`发现新版本 ${update.version ?? ''}，是否现在更新？`);
+              if (confirmed) {
+                void installUpdate();
+              }
+            })
+            .catch((error) => {
+              setStatusMessage(getErrorMessage(error, '检查更新失败'));
+            });
+        }
       })
       .catch(() => {
         applyThemeMode('light');
@@ -260,30 +277,53 @@ export default function App() {
 
   async function pasteSelectedItem() {
     if (!selectedItem) return;
-    if (backendAvailable) {
-      try {
-        await pasteItem(selectedItem.id);
-        setStatusMessage('已粘贴当前记录');
-      } catch (error) {
-        setStatusMessage(getErrorMessage(error, '粘贴失败'));
-      }
-      return;
-    }
-    await copySelectedItem();
+    await pasteAndHideItem(selectedItem);
   }
 
-  async function pasteListItem(item: ClipboardItem) {
+  async function pasteAndHideItem(item: ClipboardItem) {
     setSelectedId(item.id);
     if (backendAvailable) {
       try {
         await pasteItem(item.id);
         setStatusMessage('已粘贴当前记录');
+        await getCurrentWindow().hide();
       } catch (error) {
         setStatusMessage(getErrorMessage(error, '粘贴失败'));
       }
       return;
     }
     await navigator.clipboard?.writeText(item.preview);
+  }
+
+  async function pasteListItem(item: ClipboardItem) {
+    await pasteAndHideItem(item);
+  }
+
+  async function handleDropItem(targetId: string) {
+    if (!draggingId) return;
+    const currentIds = visibleItems.map((item) => item.id);
+    const nextIds = reorderItemsByDrag(currentIds, draggingId, targetId);
+    setDraggingId(null);
+    if (nextIds.join('\0') === currentIds.join('\0')) return;
+
+    setItems((current) => {
+      const itemById = new Map(current.map((item) => [item.id, item]));
+      const visibleIdSet = new Set(currentIds);
+      const reorderedVisibleItems = nextIds
+        .map((id) => itemById.get(id))
+        .filter((item): item is ClipboardItem => Boolean(item));
+      const remainingItems = current.filter((item) => !visibleIdSet.has(item.id));
+      return [...reorderedVisibleItems, ...remainingItems];
+    });
+    if (backendAvailable) {
+      try {
+        await reorderItems(nextIds);
+        setStatusMessage('排序已保存');
+      } catch (error) {
+        setStatusMessage(getErrorMessage(error, '排序保存失败'));
+        setRefreshVersion((current) => current + 1);
+      }
+    }
   }
 
   function handleKeyboard(event: React.KeyboardEvent<HTMLElement>) {
@@ -397,7 +437,18 @@ export default function App() {
           {virtualItems.map((item) => (
             <button
               key={item.id}
-              className={selectedItem?.id === item.id ? 'history-item selected' : 'history-item'}
+              className={[
+                selectedItem?.id === item.id ? 'history-item selected' : 'history-item',
+                draggingId === item.id ? 'dragging' : '',
+              ].join(' ')}
+              draggable
+              onDragStart={() => setDraggingId(item.id)}
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={(event) => {
+                event.preventDefault();
+                void handleDropItem(item.id);
+              }}
+              onDragEnd={() => setDraggingId(null)}
               onClick={() => void pasteListItem(item)}
             >
               <span className={item.type === 'image' && item.contentPath ? 'type-icon image-thumb' : 'type-icon'}>
@@ -408,7 +459,7 @@ export default function App() {
                 )}
               </span>
               <span className="item-main">
-                <span className="item-preview">{normalizePreview(item.preview, 88)}</span>
+                <span className="item-preview">{getVisualPreview(item)}</span>
                 <span className="item-meta">
                   {getTypeLabel(item.type)} · {item.source} · {formatTime(item.updatedAt)}
                 </span>
@@ -431,19 +482,19 @@ export default function App() {
                 </div>
                 {selectedItem.type === 'image' && selectedItem.contentPath ? (
                   <div className="image-preview">
-                    <img src={convertFileSrc(selectedItem.contentPath)} alt={selectedItem.preview} />
+                    <img src={convertFileSrc(selectedItem.contentPath)} alt="剪贴板图片预览" />
                   </div>
                 ) : (
                   <pre>{selectedItem.preview}</pre>
                 )}
                 <div className="detail-actions">
-                  <button onClick={() => void copySelectedItem()}>
-                    <Copy size={16} />
-                    复制
-                  </button>
                   <button onClick={() => void pasteSelectedItem()}>
                     <Pin size={16} />
                     粘贴
+                  </button>
+                  <button onClick={() => void copySelectedItem()}>
+                    <Copy size={16} />
+                    仅复制
                   </button>
                   <button onClick={() => void toggleFavorite(selectedItem.id)}>
                     <Heart size={16} />
