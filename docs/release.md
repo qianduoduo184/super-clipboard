@@ -89,6 +89,12 @@ TAURI_SIGNING_PRIVATE_KEY
 TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 ```
 
+`TAURI_SIGNING_PRIVATE_KEY` 必须填写 updater 私钥文件的完整内容，也就是 `npx tauri signer generate` 生成的 `.key` 文件内容。不要填写 `.key.pub` 公钥内容，也不要填写本地文件路径。
+
+当前私钥内容是 base64 文本，解码后应以 `untrusted comment:` 开头并包含 `secret key`。如果 GitHub Actions 报错 `Missing comment in secret key`，通常表示 `TAURI_SIGNING_PRIVATE_KEY` 填错、被截断，或填成了公钥。如果报错 `Wrong password for that key`，则表示 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 与生成私钥时输入的密码不一致。
+
+如果生成密钥时未设置密码，`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 可以留空；如果不确定密码，重新生成密钥对并同步更新 Secret 和 `src-tauri/tauri.conf.json` 中的公钥。
+
 本地可用以下命令生成密钥对：
 
 ```powershell
@@ -96,3 +102,12 @@ npx tauri signer generate -w .tmp\super-clipboard-updater.key
 ```
 
 将生成的公钥写入 `plugins.updater.pubkey`，私钥只保存到 GitHub Secrets 或安全的本地密钥库，不能提交到仓库。
+
+提交前可用下面的命令在本地验证私钥格式和密码是否可用：
+
+```powershell
+"updater signing preflight" | Set-Content .tmp\updater-signing-preflight.txt
+$env:TAURI_PRIVATE_KEY = (Get-Content .tmp\super-clipboard-updater.key -Raw).Trim()
+$env:TAURI_PRIVATE_KEY_PASSWORD = ""
+npx tauri signer sign .tmp\updater-signing-preflight.txt
+```
