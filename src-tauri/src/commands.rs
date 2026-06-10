@@ -140,12 +140,13 @@ pub fn update_settings(
     next_settings: AppSettings,
 ) -> Result<AppSettings, String> {
     crate::diagnostics::info("command: update_settings");
-    let current_shortcut = {
+    let (current_shortcut, current_update_check_date) = {
         let settings = state.settings.lock().map_err(|error| error.to_string())?;
-        settings.global_shortcut.clone()
+        (settings.global_shortcut.clone(), settings.last_update_check_date.clone())
     };
     let mut next_settings = next_settings;
     next_settings.global_shortcut = current_shortcut;
+    next_settings.last_update_check_date = current_update_check_date;
     apply_autostart_setting(&app, next_settings.autostart_enabled)
         .map_err(|error| error.to_string())?;
     next_settings
@@ -282,6 +283,9 @@ fn html_to_plain_text(value: &str) -> String {
                 in_tag = false;
             }
             '&' if !in_tag => {
+                if entity.starts_with('&') {
+                    output.push_str(&entity);
+                }
                 entity.clear();
                 entity.push(character);
             }
@@ -328,5 +332,10 @@ mod tests {
             html_to_plain_text("<p>Hello&nbsp;<strong>world</strong> &amp; clipboard</p>"),
             "Hello world & clipboard"
         );
+    }
+
+    #[test]
+    fn html_to_plain_text_keeps_text_between_bare_ampersands() {
+        assert_eq!(html_to_plain_text("A & B & C"), "A & B & C");
     }
 }

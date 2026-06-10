@@ -7,6 +7,7 @@ import {
   mergeSettings,
   shouldCheckForUpdatesToday,
   shouldClearHistory,
+  toLocalDateString,
   updateSettingValue,
   validateShortcut,
 } from './settings-model.js';
@@ -109,4 +110,9 @@ test('shouldCheckForUpdatesToday only runs once per enabled day', () => {
   assert.equal(shouldCheckForUpdatesToday(true, '2026-06-10', '2026-06-10'), false);
   assert.equal(shouldCheckForUpdatesToday(true, '2026-06-09', '2026-06-10'), true);
   assert.equal(shouldCheckForUpdatesToday(true, null, '2026-06-10'), true);
+});
+
+test('toLocalDateString formats local date with zero padding', () => {
+  assert.equal(toLocalDateString(new Date(2026, 5, 9)), '2026-06-09');
+  assert.equal(toLocalDateString(new Date(2026, 0, 5)), '2026-01-05');
 });

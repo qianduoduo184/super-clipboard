@@ -30,6 +30,8 @@ export function shouldCheckForUpdatesToday(
   today: string,
 ): boolean;
 
+export function toLocalDateString(date: Date): string;
+
 export function applyThemeMode(themeMode: string): 'light' | 'dark';
 
 export function formatShortcutFromEvent(event: Pick<KeyboardEvent, 'key' | 'ctrlKey' | 'altKey' | 'shiftKey' | 'metaKey'>): string;

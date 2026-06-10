@@ -17,7 +17,7 @@ import {
 } from 'lucide-react';
 import { filterItems, getTypeLabel, getVisibleFilters, getVisualPreview, reorderItemsByDrag } from './lib/clipboard-model';
 import { calculateVirtualWindow, moveSelection } from './lib/history-ui';
-import { applyThemeMode, getErrorMessage, shouldCheckForUpdatesToday } from './lib/settings-model';
+import { applyThemeMode, getErrorMessage, shouldCheckForUpdatesToday, toLocalDateString } from './lib/settings-model';
 import SettingsView from './features/settings/SettingsView';
 import { mapBackendItemToViewItem } from './lib/clipboard-adapter';
 import {
@@ -133,7 +133,6 @@ export default function App() {
   const [statusMessage, setStatusMessage] = useState('正在连接本地剪贴板服务');
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [draggingId, setDraggingId] = useState<string | null>(null);
-  const [suppressNextItemClick, setSuppressNextItemClick] = useState(false);
   const historyListRef = useRef<HTMLDivElement | null>(null);
   const debouncedQuery = useDebouncedValue(query, 100);
 
@@ -143,7 +142,7 @@ export default function App() {
         applyThemeMode(settings.theme_mode);
         setRecording(settings.recording_enabled);
         setPreviewEnabled(settings.preview_enabled);
-        const today = new Date().toISOString().slice(0, 10);
+        const today = toLocalDateString(new Date());
         if (shouldCheckForUpdatesToday(settings.auto_update_enabled, settings.last_update_check_date, today)) {
           void checkForUpdates()
             .then((update) => {
@@ -305,7 +304,6 @@ export default function App() {
     const currentIds = visibleItems.map((item) => item.id);
     const nextIds = reorderItemsByDrag(currentIds, draggingId, targetId);
     setDraggingId(null);
-    setSuppressNextItemClick(true);
     if (nextIds.join('\0') === currentIds.join('\0')) return;
 
     setItems((current) => {
@@ -451,14 +449,7 @@ export default function App() {
                 void handleDropItem(item.id);
               }}
               onDragEnd={() => setDraggingId(null)}
-              onClick={(event) => {
-                if (suppressNextItemClick) {
-                  event.preventDefault();
-                  setSuppressNextItemClick(false);
-                  return;
-                }
-                void pasteListItem(item);
-              }}
+              onClick={() => void pasteListItem(item)}
             >
               <span className={item.type === 'image' && item.contentPath ? 'type-icon image-thumb' : 'type-icon'}>
                 {item.type === 'image' && item.contentPath ? (
