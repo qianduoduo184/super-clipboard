@@ -11,7 +11,7 @@ use anyhow::{anyhow, Result};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, GetClipboardData, IsClipboardFormatAvailable,
-    EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    EmptyClipboard, OpenClipboard, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
@@ -100,17 +100,6 @@ pub fn read_current_clipboard(blob_dir: &Path) -> Result<Vec<ClipboardItemDraft>
         }]);
     }
 
-    if let Some(html) = read_html()? {
-        return Ok(vec![ClipboardItemDraft {
-            item_type: ClipboardItemType::Html,
-            size_bytes: html.len() as i64,
-            preview: html.lines().next().unwrap_or("<html>").to_string(),
-            content: Some(html),
-            content_path: None,
-            source_app: None,
-        }]);
-    }
-
     if let Some(text) = read_unicode_text()? {
         if !text.trim().is_empty() {
             return Ok(vec![ClipboardItemDraft {
@@ -150,6 +139,32 @@ pub fn write_text_to_clipboard(text: &str) -> Result<()> {
         GlobalUnlock(handle);
         if SetClipboardData(CF_UNICODETEXT as u32, handle) == Default::default() {
             return Err(anyhow!("set unicode text"));
+        }
+    }
+
+    Ok(())
+}
+
+pub fn write_dib_to_clipboard(dib_bytes: &[u8]) -> Result<()> {
+    let _guard = ClipboardGuard::open()?;
+    unsafe {
+        if EmptyClipboard() == 0 {
+            return Err(anyhow!("empty clipboard"));
+        }
+
+        let handle = GlobalAlloc(GMEM_MOVEABLE, dib_bytes.len());
+        if handle == Default::default() {
+            return Err(anyhow!("allocate clipboard image memory"));
+        }
+        let locked = GlobalLock(handle) as *mut u8;
+        if locked.is_null() {
+            return Err(anyhow!("lock clipboard image allocation"));
+        }
+
+        std::ptr::copy_nonoverlapping(dib_bytes.as_ptr(), locked, dib_bytes.len());
+        GlobalUnlock(handle);
+        if SetClipboardData(CF_DIB as u32, handle) == Default::default() {
+            return Err(anyhow!("set DIB image"));
         }
     }
 
@@ -298,23 +313,6 @@ fn read_unicode_text() -> Result<Option<String>> {
         let value = String::from_utf16_lossy(slice);
         GlobalUnlock(handle);
         Ok(Some(value))
-    }
-}
-
-fn read_html() -> Result<Option<String>> {
-    unsafe {
-        let html_format = RegisterClipboardFormatW(wide_null("HTML Format").as_ptr());
-        if html_format == 0 || IsClipboardFormatAvailable(html_format) == 0 {
-            return Ok(None);
-        }
-
-        read_global_bytes(html_format).map(|bytes| {
-            bytes.map(|bytes| {
-                String::from_utf8_lossy(&bytes)
-                    .trim_end_matches('\0')
-                    .to_string()
-            })
-        })
     }
 }
 

@@ -4,7 +4,10 @@ import { performance } from 'node:perf_hooks';
 import {
   filterItems,
   getTypeLabel,
+  getVisibleFilters,
+  getVisualPreview,
   normalizePreview,
+  reorderItemsByDrag,
   sortItemsByUpdatedTime,
 } from './clipboard-model.js';
 
@@ -56,6 +59,30 @@ test('getTypeLabel returns Chinese labels for supported clipboard types', () => 
   assert.equal(getTypeLabel('html'), 'HTML');
   assert.equal(getTypeLabel('image'), '图片');
   assert.equal(getTypeLabel('files'), '文件');
+});
+
+test('getVisibleFilters hides the HTML filter tab', () => {
+  assert.deepEqual(
+    getVisibleFilters().map((filter) => filter.key),
+    ['all', 'favorites', 'text', 'image', 'files'],
+  );
+});
+
+test('getVisualPreview hides image file paths and names', () => {
+  assert.equal(
+    getVisualPreview({
+      type: 'image',
+      preview: 'C:\\Users\\user\\AppData\\Roaming\\super-clipboard\\blobs\\image.bmp',
+    }),
+    '图片内容',
+  );
+});
+
+test('reorderItemsByDrag moves an item to the drop target position', () => {
+  assert.deepEqual(
+    reorderItemsByDrag(['a', 'b', 'c', 'd'], 'd', 'b'),
+    ['a', 'd', 'b', 'c'],
+  );
 });
 
 test('filterItems handles 1,000 copied text records without obvious slowdown', () => {

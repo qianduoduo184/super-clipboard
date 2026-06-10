@@ -29,11 +29,19 @@ export type AppSettings = {
   autostart_enabled: boolean;
   preview_enabled: boolean;
   theme_mode: 'light' | 'dark';
+  auto_update_enabled: boolean;
+  last_update_check_date: string | null;
 };
 
 export type DiagnosticsInfo = {
   app_data_dir: string;
   log_path: string;
+};
+
+export type UpdateInfo = {
+  available: boolean;
+  version?: string | null;
+  body?: string | null;
 };
 
 export function toSearchFilters(filter: ClipboardFilter): SearchFilters {
@@ -72,6 +80,10 @@ export async function deleteItem(id: string) {
   return invoke<void>('delete_item', { id });
 }
 
+export async function reorderItems(ids: string[]) {
+  return invoke<void>('reorder_items', { ids });
+}
+
 export async function setRecordingEnabled(enabled: boolean) {
   return invoke<void>('set_recording_enabled', { enabled });
 }
@@ -94,4 +106,12 @@ export async function clearHistory() {
 
 export async function getDiagnostics() {
   return invoke<DiagnosticsInfo>('get_diagnostics');
+}
+
+export async function checkForUpdates() {
+  return invoke<UpdateInfo>('check_update');
+}
+
+export async function installUpdate() {
+  return invoke<void>('install_update');
 }

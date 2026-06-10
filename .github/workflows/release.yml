@@ -4,6 +4,11 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+      - '.github/workflows/ci.yml'
   workflow_dispatch:
 
 permissions:
@@ -48,6 +53,8 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: super-clipboard-v__VERSION__-${{ github.run_number }}
           releaseName: super-clipboard v__VERSION__ build ${{ github.run_number }}
@@ -61,4 +68,4 @@ jobs:
 
             注意：当前项目仍处于早期版本，真实剪贴板监听、托盘、全局快捷键和大内容捕获需要在 Windows 实机继续验证。
           releaseDraft: false
-          prerelease: true
+          prerelease: false

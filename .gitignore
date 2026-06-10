@@ -33,3 +33,4 @@ CLAUDE.md
 *.db-wal
 *.db-shm
 /blobs/
+.tmp/

@@ -6,6 +6,8 @@ export type AppSettings = {
   autostart_enabled: boolean;
   preview_enabled: boolean;
   theme_mode: 'light' | 'dark';
+  auto_update_enabled: boolean;
+  last_update_check_date: string | null;
 };
 
 export function createDefaultSettings(): AppSettings;
@@ -21,6 +23,12 @@ export function updateSettingValue<K extends keyof AppSettings>(
 export function getErrorMessage(error: unknown, fallback: string): string;
 
 export function shouldClearHistory(confirmed: boolean): boolean;
+
+export function shouldCheckForUpdatesToday(
+  enabled: boolean,
+  lastCheckDate: string | null,
+  today: string,
+): boolean;
 
 export function applyThemeMode(themeMode: string): 'light' | 'dark';
 

@@ -75,5 +75,24 @@ src-tauri/target/release/bundle/
 ## 当前约定
 
 - 每次任务产生代码或文档修改后，完成验证即提交并推送。
-- 每次推送到 `main` 后，由 GitHub Actions 自动生成 prerelease。
-- 当前项目仍处于早期版本，Release 默认标记为 prerelease。
+- 每次推送到 `main` 后，由 GitHub Actions 自动生成正式 Release。
+- 自动更新依赖 GitHub latest release endpoint；如果改回 prerelease，需要同步调整 updater endpoint。
+
+## 自动更新签名
+
+Tauri updater 需要签名校验。当前 `src-tauri/tauri.conf.json` 已配置 GitHub Release endpoint 和 updater 公钥。
+
+发布前需要在 GitHub Secrets 配置：
+
+```text
+TAURI_SIGNING_PRIVATE_KEY
+TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+```
+
+本地可用以下命令生成密钥对：
+
+```powershell
+npx tauri signer generate -w .tmp\super-clipboard-updater.key
+```
+
+将生成的公钥写入 `plugins.updater.pubkey`，私钥只保存到 GitHub Secrets 或安全的本地密钥库，不能提交到仓库。

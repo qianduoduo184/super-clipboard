@@ -51,6 +51,11 @@ pub fn write_dib_as_bmp(blob_dir: &Path, dib_bytes: &[u8]) -> anyhow::Result<Pat
     Ok(path)
 }
 
+pub fn read_dib_from_bmp_file(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let bytes = fs::read(path)?;
+    bmp_file_to_dib(&bytes)
+}
+
 pub fn thumbnail_path_for(blob_path: &Path) -> PathBuf {
     let stem = blob_path
         .file_stem()
@@ -90,6 +95,13 @@ fn bmp_file_from_dib(dib_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     bmp.extend_from_slice(&(pixel_offset as u32).to_le_bytes());
     bmp.extend_from_slice(dib_bytes);
     Ok(bmp)
+}
+
+fn bmp_file_to_dib(bmp_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    if bmp_bytes.len() < 14 || &bmp_bytes[..2] != b"BM" {
+        return Err(anyhow::anyhow!("image blob is not a BMP file"));
+    }
+    Ok(bmp_bytes[14..].to_vec())
 }
 
 fn dib_pixel_offset(dib_bytes: &[u8]) -> anyhow::Result<usize> {
@@ -211,5 +223,30 @@ mod tests {
         assert_eq!(path.extension().and_then(|value| value.to_str()), Some("bmp"));
         assert_eq!(&bytes[..2], b"BM");
         assert!(thumbnail_path_for(&path).exists());
+    }
+
+    #[test]
+    fn read_dib_from_bmp_file_returns_original_dib_payload() {
+        let dir = std::env::temp_dir().join(format!("super-clipboard-blob-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir");
+
+        let mut dib = Vec::new();
+        dib.extend_from_slice(&40u32.to_le_bytes());
+        dib.extend_from_slice(&1i32.to_le_bytes());
+        dib.extend_from_slice(&(-1i32).to_le_bytes());
+        dib.extend_from_slice(&1u16.to_le_bytes());
+        dib.extend_from_slice(&32u16.to_le_bytes());
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        dib.extend_from_slice(&4u32.to_le_bytes());
+        dib.extend_from_slice(&0i32.to_le_bytes());
+        dib.extend_from_slice(&0i32.to_le_bytes());
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        dib.extend_from_slice(&[0, 0, 255, 255]);
+
+        let path = write_dib_as_bmp(&dir, &dib).expect("bmp blob");
+        let restored = read_dib_from_bmp_file(&path).expect("dib payload");
+
+        assert_eq!(restored, dib);
     }
 }

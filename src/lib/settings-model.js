@@ -7,6 +7,8 @@ export function createDefaultSettings() {
     autostart_enabled: false,
     preview_enabled: true,
     theme_mode: 'light',
+    auto_update_enabled: false,
+    last_update_check_date: null,
   };
 }
 
@@ -75,4 +77,8 @@ export function getErrorMessage(error, fallback) {
 
 export function shouldClearHistory(confirmed) {
   return confirmed === true;
+}
+
+export function shouldCheckForUpdatesToday(enabled, lastCheckDate, today) {
+  return enabled === true && lastCheckDate !== today;
 }
