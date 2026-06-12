@@ -172,6 +172,7 @@ pub fn write_dib_to_clipboard(dib_bytes: &[u8]) -> Result<()> {
 }
 
 pub fn simulate_paste_shortcut() -> Result<()> {
+    thread::sleep(Duration::from_millis(100));
     let inputs = [
         keyboard_input(VK_CONTROL, false),
         keyboard_input(VK_V, false),

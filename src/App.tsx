@@ -287,9 +287,9 @@ export default function App() {
     setSelectedId(item.id);
     if (backendAvailable) {
       try {
+        await getCurrentWindow().hide();
         await pasteItem(item.id);
         setStatusMessage('已粘贴当前记录');
-        await getCurrentWindow().hide();
       } catch (error) {
         setStatusMessage(getErrorMessage(error, '粘贴失败'));
       }
