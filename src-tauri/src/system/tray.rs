@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{App, Emitter, Manager};
