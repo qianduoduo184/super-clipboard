@@ -157,6 +157,7 @@ export default function App() {
             })
             .catch((error) => {
               const message = getErrorMessage(error, '检查更新失败');
+              // Silently ignore 404/endpoint not found to avoid disrupting users before first release
               if (!message.includes('GitHub Release') && !message.includes('404')) {
                 setStatusMessage(message);
               }
@@ -291,6 +292,8 @@ export default function App() {
         await pasteItem(item.id);
         setStatusMessage('已粘贴当前记录');
       } catch (error) {
+        await getCurrentWindow().show();
+        await getCurrentWindow().setFocus();
         setStatusMessage(getErrorMessage(error, '粘贴失败'));
       }
       return;

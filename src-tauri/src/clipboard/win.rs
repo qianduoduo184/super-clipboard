@@ -172,6 +172,9 @@ pub fn write_dib_to_clipboard(dib_bytes: &[u8]) -> Result<()> {
 }
 
 pub fn simulate_paste_shortcut() -> Result<()> {
+    // Wait for window focus to transition back to the previous application
+    // after getCurrentWindow().hide() is called from the frontend.
+    // Without this delay, SendInput may target the still-focused super-clipboard window.
     thread::sleep(Duration::from_millis(100));
     let inputs = [
         keyboard_input(VK_CONTROL, false),

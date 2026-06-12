@@ -10,7 +10,11 @@ pub fn setup(app: &App) -> anyhow::Result<()> {
     let menu = Menu::with_items(app, &[&show, &settings, &quit])?;
 
     TrayIconBuilder::new()
-        .icon(app.default_window_icon().unwrap().clone())
+        .icon(
+            app.default_window_icon()
+                .ok_or_else(|| anyhow!("default window icon not configured"))?
+                .clone(),
+        )
         .menu(&menu)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => {
