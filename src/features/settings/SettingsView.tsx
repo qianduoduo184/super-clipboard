@@ -171,7 +171,12 @@ export default function SettingsView({
         setStatus('已取消更新');
       }
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : String(error));
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes('Could not fetch') || message.includes('404') || message.includes('Not Found')) {
+        setStatus('GitHub Release 尚未配置，请先推送代码触发 CI 构建');
+      } else {
+        setStatus(`检查更新失败: ${message}`);
+      }
     }
   }
 

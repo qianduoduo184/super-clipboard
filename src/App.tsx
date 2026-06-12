@@ -156,7 +156,10 @@ export default function App() {
               }
             })
             .catch((error) => {
-              setStatusMessage(getErrorMessage(error, '检查更新失败'));
+              const message = getErrorMessage(error, '检查更新失败');
+              if (!message.includes('GitHub Release') && !message.includes('404')) {
+                setStatusMessage(message);
+              }
             });
         }
       })
