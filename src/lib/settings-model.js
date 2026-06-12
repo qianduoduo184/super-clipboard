@@ -9,6 +9,9 @@ export function createDefaultSettings() {
     theme_mode: 'light',
     auto_update_enabled: false,
     last_update_check_date: null,
+    nav_filters_config: {
+      visible: ['all', 'favorites', 'text', 'image', 'files'],
+    },
   };
 }
 

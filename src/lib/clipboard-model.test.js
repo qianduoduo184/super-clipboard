@@ -61,9 +61,23 @@ test('getTypeLabel returns Chinese labels for supported clipboard types', () => 
   assert.equal(getTypeLabel('files'), '文件');
 });
 
-test('getVisibleFilters hides the HTML filter tab', () => {
+test('getVisibleFilters returns all filters with default config', () => {
   assert.deepEqual(
-    getVisibleFilters().map((filter) => filter.key),
+    getVisibleFilters({ visible: ['all', 'favorites', 'text', 'image', 'files'] }).map((filter) => filter.key),
+    ['all', 'favorites', 'text', 'image', 'files'],
+  );
+});
+
+test('getVisibleFilters respects custom config', () => {
+  assert.deepEqual(
+    getVisibleFilters({ visible: ['all', 'text'] }).map((filter) => filter.key),
+    ['all', 'text'],
+  );
+});
+
+test('getVisibleFilters falls back to all when config is empty', () => {
+  assert.deepEqual(
+    getVisibleFilters({ visible: [] }).map((filter) => filter.key),
     ['all', 'favorites', 'text', 'image', 'files'],
   );
 });

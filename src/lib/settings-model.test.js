@@ -23,6 +23,9 @@ test('createDefaultSettings returns product defaults', () => {
     theme_mode: 'light',
     auto_update_enabled: false,
     last_update_check_date: null,
+    nav_filters_config: {
+      visible: ['all', 'favorites', 'text', 'image', 'files'],
+    },
   });
 });
 
@@ -37,6 +40,9 @@ test('mergeSettings keeps defaults for missing backend values', () => {
     theme_mode: 'light',
     auto_update_enabled: false,
     last_update_check_date: null,
+    nav_filters_config: {
+      visible: ['all', 'favorites', 'text', 'image', 'files'],
+    },
   });
 });
 
@@ -102,6 +108,9 @@ test('mergeSettings preserves auto update values from backend', () => {
     theme_mode: 'light',
     auto_update_enabled: true,
     last_update_check_date: '2026-06-10',
+    nav_filters_config: {
+      visible: ['all', 'favorites', 'text', 'image', 'files'],
+    },
   });
 });
 

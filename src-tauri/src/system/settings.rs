@@ -2,6 +2,25 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NavFiltersConfig {
+    pub visible: Vec<String>,
+}
+
+impl Default for NavFiltersConfig {
+    fn default() -> Self {
+        Self {
+            visible: vec![
+                "all".to_string(),
+                "favorites".to_string(),
+                "text".to_string(),
+                "image".to_string(),
+                "files".to_string(),
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub recording_enabled: bool,
     pub max_history_items: i64,
@@ -16,6 +35,8 @@ pub struct AppSettings {
     pub auto_update_enabled: bool,
     #[serde(default)]
     pub last_update_check_date: Option<String>,
+    #[serde(default)]
+    pub nav_filters_config: NavFiltersConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +64,7 @@ impl Default for AppSettings {
             theme_mode: ThemeMode::Light,
             auto_update_enabled: false,
             last_update_check_date: None,
+            nav_filters_config: NavFiltersConfig::default(),
         }
     }
 }

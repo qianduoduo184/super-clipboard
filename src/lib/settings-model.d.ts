@@ -1,3 +1,7 @@
+export type NavFiltersConfig = {
+  visible: string[];
+};
+
 export type AppSettings = {
   recording_enabled: boolean;
   max_history_items: number;
@@ -8,6 +12,7 @@ export type AppSettings = {
   theme_mode: 'light' | 'dark';
   auto_update_enabled: boolean;
   last_update_check_date: string | null;
+  nav_filters_config: NavFiltersConfig;
 };
 
 export function createDefaultSettings(): AppSettings;

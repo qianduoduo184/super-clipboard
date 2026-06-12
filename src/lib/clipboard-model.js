@@ -31,14 +31,22 @@ export function normalizePreview(value, maxLength = 120) {
   return `${singleLine.slice(0, maxLength - 1)}...`;
 }
 
-export function getVisibleFilters() {
-  return [
+export function getVisibleFilters(config) {
+  const allFilters = [
     { key: 'all', label: '全部' },
     { key: 'favorites', label: '收藏' },
     { key: 'text', label: '文本' },
     { key: 'image', label: '图片' },
     { key: 'files', label: '文件' },
   ];
+
+  if (!config || !config.visible || config.visible.length === 0) {
+    return allFilters;
+  }
+
+  return config.visible
+    .map((key) => allFilters.find((f) => f.key === key))
+    .filter(Boolean);
 }
 
 export function getVisualPreview(item) {

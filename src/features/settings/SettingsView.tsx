@@ -1,5 +1,5 @@
 import { useEffect, useState, type KeyboardEvent } from 'react';
-import { ArrowLeft, Database, Download, Eye, FileText, Keyboard, Moon, Power, Shield, Sun, Trash2 } from 'lucide-react';
+import { ArrowLeft, Database, Download, Eye, FileText, Filter, Keyboard, Moon, Power, Shield, Sun, Trash2 } from 'lucide-react';
 import {
   checkForUpdates,
   clearHistory,
@@ -248,6 +248,44 @@ export default function SettingsView({
             }
           />
         </label>
+
+        <div className="setting-row">
+          <span className="setting-icon"><Filter size={18} /></span>
+          <span>
+            <strong>Nav 显示配置</strong>
+            <small>选择要显示的过滤器标签并拖拽排序</small>
+          </span>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', width: '180px' }}>
+            {[
+              { key: 'all', label: '全部' },
+              { key: 'favorites', label: '收藏' },
+              { key: 'text', label: '文本' },
+              { key: 'image', label: '图片' },
+              { key: 'files', label: '文件' },
+            ].map((filter) => {
+              const isVisible = settings.nav_filters_config.visible.includes(filter.key);
+              const isAll = filter.key === 'all';
+              return (
+                <label key={filter.key} style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px' }}>
+                  <input
+                    type="checkbox"
+                    checked={isVisible}
+                    disabled={isAll}
+                    onChange={(event) => {
+                      const nextVisible = event.target.checked
+                        ? [...settings.nav_filters_config.visible, filter.key]
+                        : settings.nav_filters_config.visible.filter((k) => k !== filter.key);
+                      void saveSettings(
+                        updateSettingValue(settings, 'nav_filters_config', { visible: nextVisible }),
+                      );
+                    }}
+                  />
+                  <span style={{ opacity: isAll ? 0.5 : 1 }}>{filter.label}</span>
+                </label>
+              );
+            })}
+          </div>
+        </div>
 
         <label className="setting-row">
           <span className="setting-icon"><Database size={18} /></span>

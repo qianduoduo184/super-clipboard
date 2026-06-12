@@ -17,7 +17,7 @@ import {
 } from 'lucide-react';
 import { filterItems, getTypeLabel, getVisibleFilters, getVisualPreview, reorderItemsByDrag } from './lib/clipboard-model';
 import { calculateVirtualWindow, moveSelection } from './lib/history-ui';
-import { applyThemeMode, getErrorMessage, shouldCheckForUpdatesToday, toLocalDateString } from './lib/settings-model';
+import { applyThemeMode, getErrorMessage, mergeSettings, shouldCheckForUpdatesToday, toLocalDateString } from './lib/settings-model';
 import SettingsView from './features/settings/SettingsView';
 import { mapBackendItemToViewItem } from './lib/clipboard-adapter';
 import {
@@ -90,10 +90,6 @@ const seedItems: ClipboardItem[] = [
   },
 ];
 
-const filters: Array<{ key: FilterType; label: string }> = [
-  ...getVisibleFilters(),
-] as Array<{ key: FilterType; label: string }>;
-
 const HISTORY_ITEM_HEIGHT = 66;
 const HISTORY_VIEWPORT_HEIGHT = 380;
 
@@ -133,15 +129,22 @@ export default function App() {
   const [statusMessage, setStatusMessage] = useState('正在连接本地剪贴板服务');
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [navFiltersConfig, setNavFiltersConfig] = useState<{ visible: string[] }>({ visible: ['all', 'favorites', 'text', 'image', 'files'] });
   const historyListRef = useRef<HTMLDivElement | null>(null);
   const debouncedQuery = useDebouncedValue(query, 100);
+
+  const filters: Array<{ key: FilterType; label: string }> = [
+    ...getVisibleFilters(navFiltersConfig),
+  ] as Array<{ key: FilterType; label: string }>;
 
   useEffect(() => {
     getSettings()
       .then((settings) => {
-        applyThemeMode(settings.theme_mode);
-        setRecording(settings.recording_enabled);
-        setPreviewEnabled(settings.preview_enabled);
+        const mergedSettings = mergeSettings(settings);
+        applyThemeMode(mergedSettings.theme_mode);
+        setRecording(mergedSettings.recording_enabled);
+        setPreviewEnabled(mergedSettings.preview_enabled);
+        setNavFiltersConfig(mergedSettings.nav_filters_config);
         const today = toLocalDateString(new Date());
         if (shouldCheckForUpdatesToday(settings.auto_update_enabled, settings.last_update_check_date, today)) {
           void checkForUpdates()
@@ -375,6 +378,7 @@ export default function App() {
         onSettingsChanged={(settings) => {
           setRecording(settings.recording_enabled);
           setPreviewEnabled(settings.preview_enabled);
+          setNavFiltersConfig(settings.nav_filters_config);
         }}
         onHistoryCleared={() => {
           setItems([]);
