@@ -38,3 +38,7 @@ windows-sys = { version = ">=0.59, <=0.61", features = [
 [profile.release]
 # Trade a little runtime perf for faster, more parallel compiles in CI.
 codegen-units = 256
+
+[patch.crates-io]
+# Pin time to avoid trait conflict with tauri-utils 2.9.2
+time = { git = "https://github.com/time-rs/time", tag = "v0.3.36" }
