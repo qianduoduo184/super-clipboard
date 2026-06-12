@@ -65,7 +65,9 @@ button {
 }
 
 .app-shell {
-  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
   padding: 14px;
   background: var(--bg);
 }
@@ -197,6 +199,9 @@ kbd {
   grid-template-columns: minmax(300px, 1fr) minmax(360px, 1.12fr);
   gap: 12px;
   margin-top: 12px;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .content-grid.no-preview {
@@ -214,8 +219,7 @@ kbd {
 .history-list {
   position: relative;
   overflow: auto;
-  min-height: 380px;
-  max-height: calc(100vh - 140px);
+  height: 100%;
 }
 
 .history-spacer {
@@ -290,8 +294,11 @@ kbd {
 }
 
 .detail-pane {
-  min-height: 380px;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
   padding: 14px;
+  overflow: hidden;
 }
 
 .detail-header {
@@ -308,8 +315,8 @@ kbd {
 
 pre {
   overflow: auto;
-  min-height: 210px;
-  max-height: 260px;
+  flex: 1;
+  min-height: 0;
   margin: 14px 0;
   padding: 12px;
   border: 1px solid var(--border-soft);
@@ -325,18 +332,19 @@ pre {
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: 330px;
-  max-height: calc(100vh - 238px);
+  flex: 1;
+  min-height: 0;
   margin: 14px 0;
   padding: 10px;
   border: 1px solid var(--border-soft);
   border-radius: 7px;
   background: var(--panel-soft);
+  overflow: hidden;
 }
 
 .image-preview img {
   max-width: 100%;
-  max-height: calc(100vh - 260px);
+  max-height: 100%;
   object-fit: contain;
 }
 
