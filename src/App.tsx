@@ -156,7 +156,7 @@ export default function App() {
           void checkForUpdates()
             .then((update) => {
               if (!update.available) {
-                setStatusMessage('当前已是最新版本');
+                // Silently skip - no need to notify user on every startup
                 return;
               }
               const confirmed = window.confirm(`发现新版本 ${update.version ?? ''}，是否现在更新？`);
@@ -165,10 +165,11 @@ export default function App() {
               }
             })
             .catch((error) => {
-              const message = getErrorMessage(error, '检查更新失败');
-              // Silently ignore 404/endpoint not found to avoid disrupting users before first release
-              if (!message.includes('GitHub Release') && !message.includes('404')) {
-                setStatusMessage(message);
+              // Silently ignore update check failures to avoid disrupting users
+              // Users can manually check via Settings if needed
+              const message = getErrorMessage(error, '');
+              if (message) {
+                console.info('Auto update check skipped:', message);
               }
             });
         }

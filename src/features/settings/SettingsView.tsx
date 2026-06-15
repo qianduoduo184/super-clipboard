@@ -174,15 +174,18 @@ export default function SettingsView({
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      let userMessage = '检查更新失败';
+
       if (message.includes('Could not fetch') || message.includes('404') || message.includes('Not Found')) {
-        const errorMsg = 'GitHub Release 尚未配置，请先推送代码触发 CI 构建';
-        setStatus(errorMsg);
-        window.alert(errorMsg);
+        userMessage = '暂无可用更新。首次 Release 将在下次代码推送后自动构建。';
+      } else if (message.includes('Network') || message.includes('timeout')) {
+        userMessage = '网络连接失败，请检查网络后重试';
       } else {
-        const errorMsg = `检查更新失败: ${message}`;
-        setStatus(errorMsg);
-        window.alert(errorMsg);
+        userMessage = `检查更新失败: ${message}`;
       }
+
+      setStatus(userMessage);
+      window.alert(userMessage);
     }
   }
 
