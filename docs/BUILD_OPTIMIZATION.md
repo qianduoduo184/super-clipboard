@@ -30,9 +30,11 @@
 
 ### 2. Cargo 配置 (`.cargo/config.toml`)
 
-- `jobs = 0`: 使用所有 CPU 核心并行编译
+- 并行编译: Cargo 默认使用所有 CPU 核心（不需要显式设置 `jobs`）
 - 增量链接: Windows MSVC 启用 `/INCREMENTAL`
 - 依赖包优化: dev 模式依赖使用 `opt-level = 1`
+
+**注意**: 不要设置 `jobs = 0`，这在某些 Cargo 版本中会导致构建失败。Cargo 会自动使用所有可用核心。
 
 ### 3. Vite 前端优化 (`vite.config.ts`)
 
