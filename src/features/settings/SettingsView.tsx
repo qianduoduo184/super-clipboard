@@ -157,31 +157,50 @@ export default function SettingsView({
 
   async function handleManualUpdateCheck() {
     try {
-      setStatus('正在检查更新');
+      setStatus('正在检查更新...');
       const update = await checkForUpdates();
       if (!update.available) {
         setStatus('当前已是最新版本');
+        window.alert('当前已是最新版本');
         return;
       }
       const confirmed = window.confirm(`发现新版本 ${update.version ?? ''}，是否现在更新？`);
       if (confirmed) {
-        setStatus('正在下载并安装更新');
+        setStatus('正在下载并安装更新...');
         await installUpdate();
+        setStatus('更新已开始安装');
       } else {
         setStatus('已取消更新');
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (message.includes('Could not fetch') || message.includes('404') || message.includes('Not Found')) {
-        setStatus('GitHub Release 尚未配置，请先推送代码触发 CI 构建');
+        const errorMsg = 'GitHub Release 尚未配置，请先推送代码触发 CI 构建';
+        setStatus(errorMsg);
+        window.alert(errorMsg);
       } else {
-        setStatus(`检查更新失败: ${message}`);
+        const errorMsg = `检查更新失败: ${message}`;
+        setStatus(errorMsg);
+        window.alert(errorMsg);
+      }
+    }
+  }
+
+  function handleKeyboard(event: React.KeyboardEvent<HTMLElement>) {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      if (capturingShortcut) {
+        setCapturingShortcut(false);
+        setShortcutDraft('');
+        setShortcutError('');
+      } else {
+        onBack();
       }
     }
   }
 
   return (
-    <main className="app-shell settings-shell">
+    <main className="app-shell settings-shell" onKeyDown={handleKeyboard}>
       <section className="toolbar">
         <div className="title-group">
           <button className="icon-button" title="返回" onClick={onBack}>
@@ -249,43 +268,6 @@ export default function SettingsView({
           />
         </label>
 
-        <div className="setting-row">
-          <span className="setting-icon"><Filter size={18} /></span>
-          <span>
-            <strong>Nav 显示配置</strong>
-            <small>选择要显示的过滤器标签并拖拽排序</small>
-          </span>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', width: '180px' }}>
-            {[
-              { key: 'all', label: '全部' },
-              { key: 'favorites', label: '收藏' },
-              { key: 'text', label: '文本' },
-              { key: 'image', label: '图片' },
-              { key: 'files', label: '文件' },
-            ].map((filter) => {
-              const isVisible = settings.nav_filters_config.visible.includes(filter.key);
-              const isAll = filter.key === 'all';
-              return (
-                <label key={filter.key} style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px' }}>
-                  <input
-                    type="checkbox"
-                    checked={isVisible}
-                    disabled={isAll}
-                    onChange={(event) => {
-                      const nextVisible = event.target.checked
-                        ? [...settings.nav_filters_config.visible, filter.key]
-                        : settings.nav_filters_config.visible.filter((k) => k !== filter.key);
-                      void saveSettings(
-                        updateSettingValue(settings, 'nav_filters_config', { visible: nextVisible }),
-                      );
-                    }}
-                  />
-                  <span style={{ opacity: isAll ? 0.5 : 1 }}>{filter.label}</span>
-                </label>
-              );
-            })}
-          </div>
-        </div>
 
         <label className="setting-row">
           <span className="setting-icon"><Database size={18} /></span>

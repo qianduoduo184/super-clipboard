@@ -13,7 +13,9 @@ import {
   Play,
   Search,
   Settings,
+  SlidersHorizontal,
   Trash2,
+  X,
 } from 'lucide-react';
 import { filterItems, getTypeLabel, getVisibleFilters, getVisualPreview, reorderItemsByDrag } from './lib/clipboard-model';
 import { calculateVirtualWindow, moveSelection } from './lib/history-ui';
@@ -31,6 +33,7 @@ import {
   searchItems,
   setRecordingEnabled,
   toggleFavorite as toggleBackendFavorite,
+  updateSettings,
 } from './features/history/api';
 
 type ClipboardType = 'text' | 'html' | 'image' | 'files';
@@ -130,6 +133,8 @@ export default function App() {
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [navFiltersConfig, setNavFiltersConfig] = useState<{ visible: string[] }>({ visible: ['all', 'favorites', 'text', 'image', 'files'] });
+  const [navConfigOpen, setNavConfigOpen] = useState(false);
+  const [draggingFilterKey, setDraggingFilterKey] = useState<string | null>(null);
   const historyListRef = useRef<HTMLDivElement | null>(null);
   const debouncedQuery = useDebouncedValue(query, 100);
 
@@ -336,6 +341,16 @@ export default function App() {
   }
 
   function handleKeyboard(event: React.KeyboardEvent<HTMLElement>) {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      if (navConfigOpen) {
+        setNavConfigOpen(false);
+      } else {
+        void getCurrentWindow().hide();
+      }
+      return;
+    }
+
     if (settingsOpen || visibleItems.length === 0) return;
     const ids = visibleItems.map((item) => item.id);
 
@@ -366,6 +381,60 @@ export default function App() {
       await setRecordingEnabled(nextRecording);
     }
     setRecording(nextRecording);
+  }
+
+  async function handleNavFilterToggle(filterKey: string, checked: boolean) {
+    const nextVisible = checked
+      ? [...navFiltersConfig.visible, filterKey]
+      : navFiltersConfig.visible.filter((k) => k !== filterKey);
+    const nextConfig = { visible: nextVisible };
+    setNavFiltersConfig(nextConfig);
+
+    if (backendAvailable) {
+      try {
+        const currentSettings = await getSettings();
+        const mergedSettings = mergeSettings(currentSettings);
+        const updatedSettings = { ...mergedSettings, nav_filters_config: nextConfig };
+        await updateSettings(updatedSettings);
+      } catch (error) {
+        console.error('Failed to save nav filter config:', error);
+      }
+    }
+  }
+
+  async function handleNavFilterReorder(targetKey: string) {
+    if (!draggingFilterKey || draggingFilterKey === targetKey) {
+      setDraggingFilterKey(null);
+      return;
+    }
+
+    const currentOrder = navFiltersConfig.visible;
+    const dragIndex = currentOrder.indexOf(draggingFilterKey);
+    const targetIndex = currentOrder.indexOf(targetKey);
+
+    if (dragIndex === -1 || targetIndex === -1) {
+      setDraggingFilterKey(null);
+      return;
+    }
+
+    const nextOrder = [...currentOrder];
+    nextOrder.splice(dragIndex, 1);
+    nextOrder.splice(targetIndex, 0, draggingFilterKey);
+
+    const nextConfig = { visible: nextOrder };
+    setNavFiltersConfig(nextConfig);
+    setDraggingFilterKey(null);
+
+    if (backendAvailable) {
+      try {
+        const currentSettings = await getSettings();
+        const mergedSettings = mergeSettings(currentSettings);
+        const updatedSettings = { ...mergedSettings, nav_filters_config: nextConfig };
+        await updateSettings(updatedSettings);
+      } catch (error) {
+        console.error('Failed to save nav filter order:', error);
+      }
+    }
   }
 
   if (settingsOpen) {
@@ -434,7 +503,89 @@ export default function App() {
             {filter.label}
           </button>
         ))}
+        <button
+          className="filter-chip nav-config-btn"
+          title="配置导航过滤器"
+          onClick={() => setNavConfigOpen(!navConfigOpen)}
+        >
+          <SlidersHorizontal size={16} />
+        </button>
       </section>
+
+      {navConfigOpen && (
+        <div className="nav-config-overlay" onClick={() => setNavConfigOpen(false)}>
+          <div className="nav-config-panel" onClick={(e) => e.stopPropagation()}>
+            <div className="nav-config-header">
+              <h2>导航过滤器设置</h2>
+              <button className="icon-button" onClick={() => setNavConfigOpen(false)}>
+                <X size={16} />
+              </button>
+            </div>
+            <p className="nav-config-hint">拖动调整顺序，取消勾选隐藏（全部不可隐藏）</p>
+            <div className="nav-config-list">
+              {[
+                { key: 'all', label: '全部' },
+                { key: 'favorites', label: '收藏' },
+                { key: 'text', label: '文本' },
+                { key: 'image', label: '图片' },
+                { key: 'files', label: '文件' },
+              ]
+                .filter((f) => navFiltersConfig.visible.includes(f.key))
+                .sort((a, b) => navFiltersConfig.visible.indexOf(a.key) - navFiltersConfig.visible.indexOf(b.key))
+                .map((filter) => {
+                  const isVisible = navFiltersConfig.visible.includes(filter.key);
+                  const isAll = filter.key === 'all';
+                  return (
+                    <div
+                      key={filter.key}
+                      className={`nav-config-item ${draggingFilterKey === filter.key ? 'dragging' : ''}`}
+                      draggable={!isAll}
+                      onDragStart={() => !isAll && setDraggingFilterKey(filter.key)}
+                      onDragOver={(e) => e.preventDefault()}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        void handleNavFilterReorder(filter.key);
+                      }}
+                      onDragEnd={() => setDraggingFilterKey(null)}
+                    >
+                      <span className="drag-handle">::</span>
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={isVisible}
+                          disabled={isAll}
+                          onChange={(e) => void handleNavFilterToggle(filter.key, e.target.checked)}
+                        />
+                        <span style={{ opacity: isAll ? 0.6 : 1 }}>{filter.label}</span>
+                      </label>
+                    </div>
+                  );
+                })}
+              {[
+                { key: 'all', label: '全部' },
+                { key: 'favorites', label: '收藏' },
+                { key: 'text', label: '文本' },
+                { key: 'image', label: '图片' },
+                { key: 'files', label: '文件' },
+              ]
+                .filter((f) => !navFiltersConfig.visible.includes(f.key))
+                .map((filter) => (
+                  <div key={filter.key} className="nav-config-item">
+                    <span className="drag-handle" style={{ opacity: 0.3 }}>::</span>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={false}
+                        onChange={(e) => void handleNavFilterToggle(filter.key, e.target.checked)}
+                      />
+                      <span style={{ opacity: 0.5 }}>{filter.label}</span>
+                    </label>
+                  </div>
+                ))}
+            </div>
+          </div>
+        </div>
+      )}
 
       <section className={previewEnabled ? 'content-grid' : 'content-grid no-preview'}>
         <div

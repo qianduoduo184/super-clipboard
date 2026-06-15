@@ -77,8 +77,7 @@ button {
 .filter-row,
 .content-grid,
 .settings-list {
-  max-width: 980px;
-  margin: 0 auto;
+  width: 100%;
 }
 
 .toolbar {
@@ -510,4 +509,111 @@ select:focus-visible,
 .shortcut-capture:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
+}
+
+.nav-config-btn {
+  margin-left: auto;
+  padding: 0 8px;
+}
+
+.nav-config-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 100;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.4);
+}
+
+.nav-config-panel {
+  width: 420px;
+  max-height: 80vh;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.nav-config-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.nav-config-header h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.nav-config-hint {
+  padding: 12px 18px;
+  margin: 0;
+  background: var(--panel-soft);
+  color: var(--muted-2);
+  font-size: 13px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.nav-config-list {
+  overflow-y: auto;
+  flex: 1;
+  padding: 8px;
+}
+
+.nav-config-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 7px;
+  background: var(--panel);
+  border: 1px solid var(--border-soft);
+  margin-bottom: 6px;
+  cursor: move;
+}
+
+.nav-config-item.dragging {
+  opacity: 0.5;
+}
+
+.nav-config-item:last-child {
+  margin-bottom: 0;
+}
+
+.drag-handle {
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: bold;
+  user-select: none;
+  cursor: grab;
+}
+
+.nav-config-item label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.nav-config-item input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+  cursor: pointer;
+}
+
+.nav-config-item input[type="checkbox"]:disabled {
+  cursor: not-allowed;
 }
