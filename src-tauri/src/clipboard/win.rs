@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, GetClipboardData, IsClipboardFormatAvailable,
     EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -29,6 +29,15 @@ use windows_sys::Win32::UI::Shell::{DragQueryFileW, HDROP};
 
 use crate::blobs::write_dib_as_bmp;
 use crate::clipboard::types::{ClipboardItemDraft, ClipboardItemType};
+
+// DROPFILES structure for CF_HDROP
+#[repr(C)]
+struct DROPFILES {
+    pFiles: u32,
+    pt: POINT,
+    fNC: i32,
+    fWide: i32,
+}
 
 static CLIPBOARD_EVENT_TX: OnceLock<Mutex<Option<Sender<()>>>> = OnceLock::new();
 
@@ -165,6 +174,63 @@ pub fn write_dib_to_clipboard(dib_bytes: &[u8]) -> Result<()> {
         GlobalUnlock(handle);
         if SetClipboardData(CF_DIB as u32, handle) == Default::default() {
             return Err(anyhow!("set DIB image"));
+        }
+    }
+
+    Ok(())
+}
+
+pub fn write_files_to_clipboard(file_paths: &[String]) -> Result<()> {
+    let _guard = ClipboardGuard::open()?;
+    unsafe {
+        if EmptyClipboard() == 0 {
+            return Err(anyhow!("empty clipboard"));
+        }
+
+        // Calculate total size needed for DROPFILES structure + file paths
+        let mut total_size = size_of::<DROPFILES>();
+        let mut wide_paths: Vec<Vec<u16>> = Vec::new();
+
+        for path in file_paths {
+            let mut wide: Vec<u16> = path.encode_utf16().collect();
+            wide.push(0); // null terminator for each path
+            total_size += wide.len() * size_of::<u16>();
+            wide_paths.push(wide);
+        }
+        total_size += size_of::<u16>(); // final null terminator
+
+        let handle = GlobalAlloc(GMEM_MOVEABLE, total_size);
+        if handle == Default::default() {
+            return Err(anyhow!("allocate clipboard file memory"));
+        }
+
+        let locked = GlobalLock(handle) as *mut u8;
+        if locked.is_null() {
+            return Err(anyhow!("lock clipboard file allocation"));
+        }
+
+        // Write DROPFILES structure
+        let dropfiles = locked as *mut DROPFILES;
+        (*dropfiles).pFiles = size_of::<DROPFILES>() as u32;
+        (*dropfiles).pt.x = 0;
+        (*dropfiles).pt.y = 0;
+        (*dropfiles).fNC = 0;
+        (*dropfiles).fWide = 1; // Unicode paths
+
+        // Write file paths
+        let mut offset = size_of::<DROPFILES>();
+        for wide_path in &wide_paths {
+            let dest = locked.add(offset) as *mut u16;
+            std::ptr::copy_nonoverlapping(wide_path.as_ptr(), dest, wide_path.len());
+            offset += wide_path.len() * size_of::<u16>();
+        }
+        // Write final null terminator
+        let final_null = locked.add(offset) as *mut u16;
+        *final_null = 0;
+
+        GlobalUnlock(handle);
+        if SetClipboardData(CF_HDROP as u32, handle) == Default::default() {
+            return Err(anyhow!("set file list"));
         }
     }
 

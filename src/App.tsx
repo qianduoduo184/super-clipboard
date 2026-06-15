@@ -94,6 +94,7 @@ const seedItems: ClipboardItem[] = [
 ];
 
 const HISTORY_ITEM_HEIGHT = 66;
+const HISTORY_IMAGE_ITEM_HEIGHT = 198; // 3x normal height for images
 const HISTORY_VIEWPORT_HEIGHT = 380;
 
 function formatTime(value: number) {
@@ -241,15 +242,51 @@ export default function App() {
 
   const visibleItems = useMemo(() => filterItems(items, { type: 'all', query: '' }) as ClipboardItem[], [items]);
 
-  const selectedItem = visibleItems.find((item) => item.id === selectedId) ?? visibleItems[0];
-  const virtualWindow = calculateVirtualWindow({
-    itemCount: visibleItems.length,
-    scrollTop,
-    itemHeight: HISTORY_ITEM_HEIGHT,
-    viewportHeight: historyListRef.current?.clientHeight ?? HISTORY_VIEWPORT_HEIGHT,
-    overscan: 3,
-  });
+  const itemHeights = useMemo(() =>
+    visibleItems.map(item => item.type === 'image' ? HISTORY_IMAGE_ITEM_HEIGHT : HISTORY_ITEM_HEIGHT),
+    [visibleItems]
+  );
+
+  const cumulativeHeights = useMemo(() => {
+    const heights = [0];
+    for (let i = 0; i < itemHeights.length; i++) {
+      heights.push(heights[i] + itemHeights[i]);
+    }
+    return heights;
+  }, [itemHeights]);
+
+  const totalHeight = cumulativeHeights[cumulativeHeights.length - 1] || 0;
+
+  const virtualWindow = useMemo(() => {
+    const viewportHeight = historyListRef.current?.clientHeight ?? HISTORY_VIEWPORT_HEIGHT;
+    let startIndex = 0;
+    let endIndex = visibleItems.length;
+
+    // Find start index
+    for (let i = 0; i < cumulativeHeights.length - 1; i++) {
+      if (cumulativeHeights[i + 1] > scrollTop) {
+        startIndex = Math.max(0, i - 3); // overscan
+        break;
+      }
+    }
+
+    // Find end index
+    for (let i = startIndex; i < cumulativeHeights.length - 1; i++) {
+      if (cumulativeHeights[i] >= scrollTop + viewportHeight) {
+        endIndex = Math.min(visibleItems.length, i + 3); // overscan
+        break;
+      }
+    }
+
+    return {
+      startIndex,
+      endIndex,
+      offsetTop: cumulativeHeights[startIndex],
+    };
+  }, [visibleItems.length, scrollTop, cumulativeHeights]);
+
   const virtualItems = visibleItems.slice(virtualWindow.startIndex, virtualWindow.endIndex);
+  const selectedItem = visibleItems.find((item) => item.id === selectedId) ?? visibleItems[0];
 
   useEffect(() => {
     if (!selectedItem && visibleItems[0]) {
@@ -593,15 +630,20 @@ export default function App() {
           className="history-list"
           onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
         >
-          <div className="history-spacer" style={{ height: visibleItems.length * HISTORY_ITEM_HEIGHT }}>
+          <div className="history-spacer" style={{ height: totalHeight }}>
             <div style={{ transform: `translateY(${virtualWindow.offsetTop}px)` }}>
-          {virtualItems.map((item) => (
+          {virtualItems.map((item, idx) => {
+            const actualIndex = virtualWindow.startIndex + idx;
+            const itemHeight = itemHeights[actualIndex];
+            return (
             <button
               key={item.id}
               className={[
                 selectedItem?.id === item.id ? 'history-item selected' : 'history-item',
                 draggingId === item.id ? 'dragging' : '',
+                item.type === 'image' ? 'image-row' : '',
               ].join(' ')}
+              style={{ minHeight: `${itemHeight}px` }}
               draggable
               onDragStart={() => setDraggingId(item.id)}
               onDragOver={(event) => event.preventDefault()}
@@ -622,12 +664,13 @@ export default function App() {
               <span className="item-main">
                 <span className="item-preview">{getVisualPreview(item)}</span>
                 <span className="item-meta">
-                  {getTypeLabel(item.type)} · {item.source} · {formatTime(item.updatedAt)}
+                  {formatTime(item.updatedAt)}
                 </span>
               </span>
               {item.favorite ? <Heart className="favorite" size={15} fill="currentColor" /> : null}
             </button>
-          ))}
+          );
+          })}
             </div>
           </div>
           {visibleItems.length === 0 ? <div className="empty-state">没有匹配的剪贴板记录</div> : null}

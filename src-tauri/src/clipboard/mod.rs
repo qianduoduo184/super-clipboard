@@ -29,6 +29,10 @@ pub mod win {
         Ok(())
     }
 
+    pub fn write_files_to_clipboard(_file_paths: &[String]) -> Result<()> {
+        Ok(())
+    }
+
     pub fn simulate_paste_shortcut() -> Result<()> {
         Ok(())
     }

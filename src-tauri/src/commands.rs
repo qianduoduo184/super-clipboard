@@ -79,6 +79,21 @@ pub fn copy_item(state: State<'_, AppState>, id: String) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
         return Ok(());
     }
+    if item.item_type == "files" {
+        if let Some(content) = item.content {
+            let file_paths: Vec<String> = content
+                .lines()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect();
+            if !file_paths.is_empty() {
+                #[cfg(target_os = "windows")]
+                crate::clipboard::win::write_files_to_clipboard(&file_paths)
+                    .map_err(|error| error.to_string())?;
+                return Ok(());
+            }
+        }
+    }
 
     let error = format!("copy is not implemented for {} items", item.item_type);
     crate::diagnostics::warn(format!("command: copy_item failed: {error}"));
