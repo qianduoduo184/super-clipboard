@@ -2,7 +2,8 @@
 
 [build]
 # Use all available CPU cores for parallel compilation
-jobs = 0  # 0 = use all cores
+# Note: jobs = 0 means auto-detect, but some cargo versions don't support it
+# Omitting the jobs setting lets cargo use its default parallel behavior
 
 [target.x86_64-pc-windows-msvc]
 # Use faster linker if available
