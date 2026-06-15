@@ -10,12 +10,12 @@ tauri-build = { version = "2.0.0", features = [] }
 
 [dependencies]
 anyhow = "1.0"
-chrono = { version = "0.4", features = ["serde"] }
-image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png", "webp"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
-serde = { version = "1.0", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "png"] }
+rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = { version = "0.10", default-features = false }
 tauri = { version = "2.0.0", features = ["protocol-asset", "tray-icon"] }
 tauri-plugin-autostart = "2.0.0"
 tauri-plugin-global-shortcut = "2.0.0"
@@ -23,7 +23,7 @@ tauri-plugin-opener = "2.0.0"
 tauri-plugin-updater = "2.0.0"
 thiserror = "1.0"
 time = "=0.3.36"
-uuid = { version = "1.10", features = ["v4", "serde"] }
+uuid = { version = "1.10", default-features = false, features = ["v4", "serde"] }
 windows-sys = { version = ">=0.59, <=0.61", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
@@ -37,5 +37,15 @@ windows-sys = { version = ">=0.59, <=0.61", features = [
 ] }
 
 [profile.release]
-# Trade a little runtime perf for faster, more parallel compiles in CI.
-codegen-units = 256
+# Optimize for faster builds while maintaining good runtime performance
+codegen-units = 16        # Reduced from 256 for better optimization
+lto = "thin"              # Thin LTO for faster linking with good optimization
+opt-level = "z"           # Optimize for size (smaller binary, faster compile)
+strip = true              # Strip symbols to reduce binary size
+panic = "abort"           # Smaller binary, no unwinding overhead
+incremental = true        # Faster incremental builds
+
+[profile.dev]
+# Speed up dev builds
+opt-level = 1             # Minimal optimization for faster dev builds
+incremental = true        # Enable incremental compilation

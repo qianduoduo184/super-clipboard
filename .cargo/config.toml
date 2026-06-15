@@ -1,0 +1,27 @@
+# Cargo build optimization config
+
+[build]
+# Use all available CPU cores for parallel compilation
+jobs = 0  # 0 = use all cores
+
+[target.x86_64-pc-windows-msvc]
+# Use faster linker if available
+rustflags = [
+  "-C", "link-arg=/INCREMENTAL",  # Enable incremental linking
+]
+
+# Faster incremental builds
+[profile.dev]
+incremental = true
+
+# Reduce LLVM optimizations to speed up builds
+[profile.dev.package."*"]
+opt-level = 1
+
+# Share build artifacts across workspace members
+[profile.release.package."*"]
+incremental = false  # Full optimization for dependencies in release
+
+# Build cache settings
+[net]
+git-fetch-with-cli = true  # More reliable on some systems

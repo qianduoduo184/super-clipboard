@@ -9,4 +9,18 @@ export default defineConfig({
     strictPort: true,
   },
   envPrefix: ['VITE_', 'TAURI_'],
+  build: {
+    target: 'es2020',
+    minify: 'esbuild',
+    cssMinify: 'esbuild',
+    reportCompressedSize: false,  // Skip gzip size reporting for faster builds
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          react: ['react', 'react-dom'],
+          icons: ['lucide-react'],
+        },
+      },
+    },
+  },
 });
