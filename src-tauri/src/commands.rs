@@ -21,6 +21,34 @@ pub struct UpdateInfo {
     pub body: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BackupMetadata {
+    pub version: String,
+    pub created_at: String,
+    pub item_count: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BackupData {
+    pub metadata: BackupMetadata,
+    pub items: Vec<ClipboardItem>,
+    pub blobs: Vec<BlobData>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BlobData {
+    pub item_id: String,
+    pub filename: String,
+    pub data_base64: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BackupInfo {
+    pub created_at: String,
+    pub item_count: usize,
+    pub version: String,
+}
+
 #[tauri::command]
 pub fn search_items(
     state: State<'_, AppState>,
@@ -335,6 +363,344 @@ fn push_spacing(output: &mut String) {
     if !output.chars().last().map(char::is_whitespace).unwrap_or(false) {
         output.push(' ');
     }
+}
+
+// 存储路径管理命令
+
+#[tauri::command]
+pub async fn select_directory() -> Result<Option<String>, String> {
+    use rfd::FileDialog;
+
+    let selected = FileDialog::new()
+        .set_title("选择目录")
+        .pick_folder();
+
+    Ok(selected.map(|path| path.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+pub async fn migrate_directory(
+    old_path: String,
+    new_path: String,
+    move_files: bool,
+) -> Result<(), String> {
+    use std::fs;
+    use std::path::PathBuf;
+
+    let old_dir = PathBuf::from(&old_path);
+    let new_dir = PathBuf::from(&new_path);
+
+    crate::diagnostics::info(format!(
+        "migrate_directory: old={} new={} move={}",
+        old_path, new_path, move_files
+    ));
+
+    // 验证路径
+    if !old_dir.exists() {
+        return Err(format!("源目录不存在: {}", old_path));
+    }
+
+    // 创建新目录
+    fs::create_dir_all(&new_dir).map_err(|e| format!("创建新目录失败: {}", e))?;
+
+    // 检查写权限
+    let test_file = new_dir.join(".test_write");
+    if let Err(e) = fs::write(&test_file, b"test") {
+        return Err(format!("新目录无写入权限: {}", e));
+    }
+    let _ = fs::remove_file(&test_file);
+
+    if move_files {
+        // 迁移文件
+        for entry in fs::read_dir(&old_dir).map_err(|e| format!("读取源目录失败: {}", e))? {
+            let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
+            let file_name = entry.file_name();
+            let old_file = old_dir.join(&file_name);
+            let new_file = new_dir.join(&file_name);
+
+            // 跳过 .test_write 文件
+            if file_name == ".test_write" {
+                continue;
+            }
+
+            if entry.path().is_file() {
+                fs::copy(&old_file, &new_file)
+                    .map_err(|e| format!("复制文件 {} 失败: {}", file_name.to_string_lossy(), e))?;
+                crate::diagnostics::info(format!("migrated: {}", file_name.to_string_lossy()));
+            } else if entry.path().is_dir() {
+                // 递归复制目录
+                copy_dir_all(&old_file, &new_file)
+                    .map_err(|e| format!("复制目录 {} 失败: {}", file_name.to_string_lossy(), e))?;
+            }
+        }
+
+        crate::diagnostics::info("migrate_directory: files copied successfully");
+    }
+
+    Ok(())
+}
+
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    use std::fs;
+
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
+        } else {
+            fs::copy(entry.path(), dst.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn update_storage_settings(
+    state: State<'_, AppState>,
+    custom_data_dir: Option<String>,
+    custom_log_dir: Option<String>,
+) -> Result<AppSettings, String> {
+    crate::diagnostics::info(format!(
+        "command: update_storage_settings data_dir={:?} log_dir={:?}",
+        custom_data_dir, custom_log_dir
+    ));
+
+    let next_settings = {
+        let mut settings = state.settings.lock().map_err(|error| error.to_string())?;
+        settings.custom_data_dir = custom_data_dir;
+        settings.custom_log_dir = custom_log_dir;
+        settings.clone()
+    };
+
+    next_settings
+        .save(&state.settings_path)
+        .map_err(|error| error.to_string())?;
+
+    Ok(next_settings)
+}
+
+// 导入/导出备份功能
+
+#[tauri::command]
+pub async fn export_backup(state: State<'_, AppState>) -> Result<String, String> {
+    use rfd::FileDialog;
+    use std::fs;
+    use chrono::Utc;
+
+    // 选择保存路径
+    let default_filename = format!("super-clipboard-backup-{}.json",
+        Utc::now().format("%Y%m%d-%H%M%S"));
+
+    let save_path = FileDialog::new()
+        .set_title("导出备份")
+        .set_file_name(&default_filename)
+        .add_filter("JSON 文件", &["json"])
+        .save_file();
+
+    let Some(save_path) = save_path else {
+        return Err("用户取消导出".to_string());
+    };
+
+    crate::diagnostics::info(format!("export_backup: path={}", save_path.display()));
+
+    // 读取所有数据
+    let repository = state.repository.lock().map_err(|e| e.to_string())?;
+    let all_items = repository
+        .search("".to_string(), SearchFilters { item_type: None, favorites_only: false }, 100000, None)
+        .map_err(|e| format!("读取数据失败: {}", e))?;
+
+    drop(repository);
+
+    // 收集关联的 blob 文件
+    let mut blobs = Vec::new();
+    for item in &all_items {
+        if let Some(content_path) = &item.content_path {
+            let blob_path = state.blob_dir.join(content_path);
+            if blob_path.exists() {
+                match fs::read(&blob_path) {
+                    Ok(data) => {
+                        blobs.push(BlobData {
+                            item_id: item.id.clone(),
+                            filename: content_path.clone(),
+                            data_base64: base64_encode(&data),
+                        });
+                    }
+                    Err(e) => {
+                        crate::diagnostics::warn(format!(
+                            "export_backup: failed to read blob {}: {}",
+                            content_path, e
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // 构建备份数据
+    let backup = BackupData {
+        metadata: BackupMetadata {
+            version: "1.0".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            item_count: all_items.len(),
+        },
+        items: all_items,
+        blobs,
+    };
+
+    // 写入文件
+    let json = serde_json::to_string_pretty(&backup)
+        .map_err(|e| format!("序列化失败: {}", e))?;
+
+    fs::write(&save_path, json)
+        .map_err(|e| format!("写入文件失败: {}", e))?;
+
+    crate::diagnostics::info(format!(
+        "export_backup: success, {} items, {} blobs",
+        backup.metadata.item_count,
+        backup.blobs.len()
+    ));
+
+    Ok(save_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub async fn select_backup_file() -> Result<Option<String>, String> {
+    use rfd::FileDialog;
+
+    let selected = FileDialog::new()
+        .set_title("选择备份文件")
+        .add_filter("JSON 文件", &["json"])
+        .pick_file();
+
+    Ok(selected.map(|path| path.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+pub async fn parse_backup_info(backup_path: String) -> Result<BackupInfo, String> {
+    use std::fs;
+
+    let content = fs::read_to_string(&backup_path)
+        .map_err(|e| format!("读取备份文件失败: {}", e))?;
+
+    let backup: BackupData = serde_json::from_str(&content)
+        .map_err(|e| format!("解析备份文件失败: {}", e))?;
+
+    Ok(BackupInfo {
+        created_at: backup.metadata.created_at,
+        item_count: backup.metadata.item_count,
+        version: backup.metadata.version,
+    })
+}
+
+#[tauri::command]
+pub async fn import_backup(
+    state: State<'_, AppState>,
+    backup_path: String,
+    merge: bool,
+) -> Result<usize, String> {
+    use std::fs;
+    use chrono::Utc;
+
+    crate::diagnostics::info(format!("import_backup: path={} merge={}", backup_path, merge));
+
+    // 读取备份文件
+    let content = fs::read_to_string(&backup_path)
+        .map_err(|e| format!("读取备份文件失败: {}", e))?;
+
+    let backup: BackupData = serde_json::from_str(&content)
+        .map_err(|e| format!("解析备份文件失败: {}", e))?;
+
+    // 创建临时备份（防止误操作）
+    if !merge {
+        let temp_backup_path = state.app_data_dir.join(format!(
+            "temp-backup-before-import-{}.json",
+            Utc::now().format("%Y%m%d-%H%M%S")
+        ));
+
+        let repository = state.repository.lock().map_err(|e| e.to_string())?;
+        let current_items = repository
+            .search("".to_string(), SearchFilters { item_type: None, favorites_only: false }, 100000, None)
+            .map_err(|e| format!("创建临时备份失败: {}", e))?;
+        drop(repository);
+
+        let temp_backup = BackupData {
+            metadata: BackupMetadata {
+                version: "1.0".to_string(),
+                created_at: Utc::now().to_rfc3339(),
+                item_count: current_items.len(),
+            },
+            items: current_items,
+            blobs: vec![],
+        };
+
+        let temp_json = serde_json::to_string_pretty(&temp_backup)
+            .map_err(|e| format!("序列化临时备份失败: {}", e))?;
+
+        fs::write(&temp_backup_path, temp_json)
+            .map_err(|e| format!("写入临时备份失败: {}", e))?;
+
+        crate::diagnostics::info(format!("import_backup: temp backup created at {}", temp_backup_path.display()));
+    }
+
+    // 如果是覆盖模式，清空现有数据
+    if !merge {
+        let repository = state.repository.lock().map_err(|e| e.to_string())?;
+        repository.clear_history().map_err(|e| format!("清空历史失败: {}", e))?;
+        drop(repository);
+
+        crate::blobs::clear_blob_dir(&state.blob_dir)
+            .map_err(|e| format!("清空 blob 目录失败: {}", e))?;
+
+        crate::diagnostics::info("import_backup: existing data cleared");
+    }
+
+    // 恢复 blob 文件
+    for blob in &backup.blobs {
+        let blob_path = state.blob_dir.join(&blob.filename);
+        let data = base64_decode(&blob.data_base64)
+            .map_err(|e| format!("解码 blob {} 失败: {}", blob.filename, e))?;
+
+        fs::write(&blob_path, data)
+            .map_err(|e| format!("写入 blob {} 失败: {}", blob.filename, e))?;
+    }
+
+    // 导入数据到数据库
+    let repository = state.repository.lock().map_err(|e| e.to_string())?;
+    let mut imported_count = 0;
+
+    for item in backup.items {
+        // 在合并模式下，检查是否已存在相同 hash 的记录
+        if merge {
+            if let Ok(Some(_)) = repository.find_by_hash(&item.hash) {
+                continue; // 跳过重复项
+            }
+        }
+
+        // 插入记录（需要实现 insert_item 方法）
+        // 注意：这里需要修改 repository 以支持直接插入完整的 ClipboardItem
+        repository.insert_imported_item(&item)
+            .map_err(|e| format!("导入记录失败: {}", e))?;
+
+        imported_count += 1;
+    }
+
+    drop(repository);
+
+    crate::diagnostics::info(format!("import_backup: success, imported {} items", imported_count));
+
+    Ok(imported_count)
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    use base64::{Engine as _, engine::general_purpose};
+    general_purpose::STANDARD.encode(data)
+}
+
+fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+    use base64::{Engine as _, engine::general_purpose};
+    general_purpose::STANDARD.decode(s).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

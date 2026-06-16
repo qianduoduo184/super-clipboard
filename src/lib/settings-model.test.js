@@ -26,6 +26,8 @@ test('createDefaultSettings returns product defaults', () => {
     nav_filters_config: {
       visible: ['all', 'favorites', 'text', 'image', 'files'],
     },
+    custom_data_dir: null,
+    custom_log_dir: null,
   });
 });
 
@@ -43,6 +45,8 @@ test('mergeSettings keeps defaults for missing backend values', () => {
     nav_filters_config: {
       visible: ['all', 'favorites', 'text', 'image', 'files'],
     },
+    custom_data_dir: null,
+    custom_log_dir: null,
   });
 });
 
@@ -111,6 +115,8 @@ test('mergeSettings preserves auto update values from backend', () => {
     nav_filters_config: {
       visible: ['all', 'favorites', 'text', 'image', 'files'],
     },
+    custom_data_dir: null,
+    custom_log_dir: null,
   });
 });
 

@@ -526,9 +526,6 @@ export default function App() {
           placeholder="搜索文本、文件名或来源"
           autoFocus
         />
-        <kbd>Ctrl</kbd>
-        <kbd>Shift</kbd>
-        <kbd>V</kbd>
       </section>
 
       <section className="filter-row" aria-label="剪贴板类型过滤">

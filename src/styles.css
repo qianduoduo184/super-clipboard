@@ -632,3 +632,41 @@ select:focus-visible,
 .nav-config-item input[type="checkbox"]:disabled {
   cursor: not-allowed;
 }
+
+/* 快捷键说明分区 */
+.setting-section-divider {
+  padding: 24px 20px 12px;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.setting-row.shortcut-help {
+  opacity: 0.9;
+}
+
+.shortcut-display {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.shortcut-display kbd {
+  display: inline-block;
+  min-width: 32px;
+  padding: 4px 8px;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  text-align: center;
+  color: var(--text-strong);
+  background: var(--panel-soft);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+}
+

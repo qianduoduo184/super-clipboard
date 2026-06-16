@@ -144,7 +144,14 @@ fn main() {
             commands::clear_history,
             commands::get_diagnostics,
             commands::check_update,
-            commands::install_update
+            commands::install_update,
+            commands::select_directory,
+            commands::migrate_directory,
+            commands::update_storage_settings,
+            commands::export_backup,
+            commands::select_backup_file,
+            commands::parse_backup_info,
+            commands::import_backup
         ])
         .run(tauri::generate_context!())
         .expect("failed to run super-clipboard");

@@ -21,6 +21,10 @@ export type SearchFilters = {
   favorites_only: boolean;
 };
 
+export type NavFiltersConfig = {
+  visible: string[];
+};
+
 export type AppSettings = {
   recording_enabled: boolean;
   max_history_items: number;
@@ -31,6 +35,9 @@ export type AppSettings = {
   theme_mode: 'light' | 'dark';
   auto_update_enabled: boolean;
   last_update_check_date: string | null;
+  nav_filters_config: NavFiltersConfig;
+  custom_data_dir?: string | null;
+  custom_log_dir?: string | null;
 };
 
 export type DiagnosticsInfo = {
@@ -115,3 +122,40 @@ export async function checkForUpdates() {
 export async function installUpdate() {
   return invoke<void>('install_update');
 }
+
+// 存储路径管理
+export async function selectDirectory() {
+  return invoke<string | null>('select_directory');
+}
+
+export async function migrateDirectory(oldPath: string, newPath: string, moveFiles: boolean) {
+  return invoke<void>('migrate_directory', { oldPath, newPath, moveFiles });
+}
+
+export async function updateStorageSettings(customDataDir: string | null, customLogDir: string | null) {
+  return invoke<AppSettings>('update_storage_settings', { customDataDir, customLogDir });
+}
+
+// 导入/导出备份
+export type BackupInfo = {
+  created_at: string;
+  item_count: number;
+  version: string;
+};
+
+export async function exportBackup() {
+  return invoke<string>('export_backup');
+}
+
+export async function selectBackupFile() {
+  return invoke<string | null>('select_backup_file');
+}
+
+export async function parseBackupInfo(backupPath: string) {
+  return invoke<BackupInfo>('parse_backup_info', { backupPath });
+}
+
+export async function importBackup(backupPath: string, merge: boolean) {
+  return invoke<number>('import_backup', { backupPath, merge });
+}
+

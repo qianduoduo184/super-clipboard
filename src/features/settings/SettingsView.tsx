@@ -1,5 +1,5 @@
 import { useEffect, useState, type KeyboardEvent } from 'react';
-import { ArrowLeft, Database, Download, Eye, FileText, Filter, Keyboard, Moon, Power, Shield, Sun, Trash2 } from 'lucide-react';
+import { ArrowLeft, Database, Download, Eye, FileText, Filter, FolderOpen, HardDrive, Keyboard, Moon, Power, Shield, Sun, Trash2, Upload } from 'lucide-react';
 import {
   checkForUpdates,
   clearHistory,
@@ -8,6 +8,14 @@ import {
   installUpdate,
   setGlobalShortcut,
   updateSettings,
+  selectDirectory,
+  migrateDirectory,
+  updateStorageSettings,
+  exportBackup,
+  selectBackupFile,
+  parseBackupInfo,
+  importBackup,
+  type BackupInfo,
 } from '../history/api';
 import {
   applyThemeMode,
@@ -45,6 +53,9 @@ export default function SettingsView({
   const [capturingShortcut, setCapturingShortcut] = useState(false);
   const [shortcutDraft, setShortcutDraft] = useState('');
   const [shortcutError, setShortcutError] = useState('');
+  const [pendingDataDir, setPendingDataDir] = useState<string | null>(null);
+  const [pendingLogDir, setPendingLogDir] = useState<string | null>(null);
+  const [pendingBackup, setPendingBackup] = useState<{ path: string; info: BackupInfo } | null>(null);
 
   useEffect(() => {
     let ignore = false;
@@ -200,6 +211,198 @@ export default function SettingsView({
         onBack();
       }
     }
+  }
+
+  async function handleSelectDataDir() {
+    try {
+      const selected = await selectDirectory();
+      if (selected) {
+        setPendingDataDir(selected);
+      }
+    } catch (error) {
+      setStatus(`选择目录失败: ${error}`);
+    }
+  }
+
+  async function handleSelectLogDir() {
+    try {
+      const selected = await selectDirectory();
+      if (selected) {
+        setPendingLogDir(selected);
+      }
+    } catch (error) {
+      setStatus(`选择目录失败: ${error}`);
+    }
+  }
+
+  async function handleConfirmDataDirChange() {
+    if (!pendingDataDir || !diagnostics) return;
+
+    const oldPath = diagnostics.app_data_dir;
+    const newPath = pendingDataDir;
+
+    const choice = window.confirm(
+      `即将更改数据目录：\n\n` +
+      `当前目录: ${oldPath}\n` +
+      `新目录: ${newPath}\n\n` +
+      `是否将现有数据迁移到新目录？\n\n` +
+      `[确定] = 迁移并切换\n` +
+      `[取消] = 放弃更改`
+    );
+
+    if (!choice) {
+      setPendingDataDir(null);
+      setStatus('已取消数据目录更改');
+      return;
+    }
+
+    try {
+      setStatus('正在迁移数据...');
+      await migrateDirectory(oldPath, newPath, true);
+
+      const updatedSettings = await updateStorageSettings(newPath, settings.custom_log_dir ?? null);
+      setSettings(mergeSettings(updatedSettings));
+      onSettingsChanged(updatedSettings);
+
+      setPendingDataDir(null);
+      setStatus('数据目录已更改，需要重启应用生效');
+      window.alert('数据目录已更改。请重启应用以应用新设置。');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(`数据迁移失败: ${message}`);
+      window.alert(`数据迁移失败: ${message}\n\n数据目录保持不变。`);
+      setPendingDataDir(null);
+    }
+  }
+
+  async function handleConfirmLogDirChange() {
+    if (!pendingLogDir || !diagnostics) return;
+
+    const oldPath = diagnostics.log_path.substring(0, diagnostics.log_path.lastIndexOf('\\'));
+    const newPath = pendingLogDir;
+
+    const choice = window.confirm(
+      `即将更改日志目录：\n\n` +
+      `当前目录: ${oldPath}\n` +
+      `新目录: ${newPath}\n\n` +
+      `是否将现有日志迁移到新目录？\n\n` +
+      `[确定] = 迁移并切换\n` +
+      `[取消] = 放弃更改`
+    );
+
+    if (!choice) {
+      setPendingLogDir(null);
+      setStatus('已取消日志目录更改');
+      return;
+    }
+
+    try {
+      setStatus('正在迁移日志...');
+      await migrateDirectory(oldPath, newPath, true);
+
+      const updatedSettings = await updateStorageSettings(settings.custom_data_dir ?? null, newPath);
+      setSettings(mergeSettings(updatedSettings));
+      onSettingsChanged(updatedSettings);
+
+      setPendingLogDir(null);
+      setStatus('日志目录已更改，需要重启应用生效');
+      window.alert('日志目录已更改。请重启应用以应用新设置。');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(`日志迁移失败: ${message}`);
+      window.alert(`日志迁移失败: ${message}\n\n日志目录保持不变。`);
+      setPendingLogDir(null);
+    }
+  }
+
+  function handleCancelDataDirChange() {
+    setPendingDataDir(null);
+    setStatus('已取消数据目录更改');
+  }
+
+  function handleCancelLogDirChange() {
+    setPendingLogDir(null);
+    setStatus('已取消日志目录更改');
+  }
+
+  async function handleExportBackup() {
+    try {
+      setStatus('正在导出备份...');
+      const savedPath = await exportBackup();
+      setStatus(`备份已导出到: ${savedPath}`);
+      window.alert(`备份导出成功！\n\n保存路径: ${savedPath}\n\n可以在文件管理器中打开该目录。`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes('取消')) {
+        setStatus('已取消导出');
+      } else {
+        setStatus(`导出失败: ${message}`);
+        window.alert(`导出失败: ${message}`);
+      }
+    }
+  }
+
+  async function handleSelectBackupForImport() {
+    try {
+      const selected = await selectBackupFile();
+      if (!selected) {
+        setStatus('已取消导入');
+        return;
+      }
+
+      setStatus('正在解析备份文件...');
+      const info = await parseBackupInfo(selected);
+      setPendingBackup({ path: selected, info });
+      setStatus(`已选择备份: ${info.item_count} 条记录`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(`解析备份文件失败: ${message}`);
+      window.alert(`解析备份文件失败: ${message}`);
+    }
+  }
+
+  async function handleConfirmImport(merge: boolean) {
+    if (!pendingBackup) return;
+
+    const action = merge ? '合并' : '覆盖';
+    const warning = merge
+      ? '将导入备份数据并与现有数据合并（跳过重复项）。'
+      : '将清空现有数据并导入备份（会自动创建临时备份）。';
+
+    const confirmed = window.confirm(
+      `即将${action}导入备份：\n\n` +
+      `创建时间: ${new Date(pendingBackup.info.created_at).toLocaleString()}\n` +
+      `数据条数: ${pendingBackup.info.item_count}\n` +
+      `备份版本: ${pendingBackup.info.version}\n\n` +
+      `${warning}\n\n` +
+      `是否继续？`
+    );
+
+    if (!confirmed) {
+      setStatus('已取消导入');
+      return;
+    }
+
+    try {
+      setStatus('正在导入备份...');
+      const importedCount = await importBackup(pendingBackup.path, merge);
+
+      setPendingBackup(null);
+      setStatus(`导入成功，已导入 ${importedCount} 条记录`);
+      window.alert(`导入成功！\n\n已导入 ${importedCount} 条记录。\n\n请刷新历史列表以查看导入的数据。`);
+
+      // 触发历史记录刷新
+      onHistoryCleared();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(`导入失败: ${message}`);
+      window.alert(`导入失败: ${message}\n\n数据已回滚，请检查备份文件格式。`);
+    }
+  }
+
+  function handleCancelImport() {
+    setPendingBackup(null);
+    setStatus('已取消导入');
   }
 
   return (
@@ -382,6 +585,46 @@ export default function SettingsView({
           </button>
         </div>
 
+        <div className="setting-section-divider">备份管理</div>
+
+        <div className="setting-row">
+          <span className="setting-icon"><Download size={18} /></span>
+          <span>
+            <strong>导出备份</strong>
+            <small>将剪贴板历史导出为 JSON 文件</small>
+          </span>
+          <button onClick={handleExportBackup}>
+            <Download size={14} style={{ marginRight: '4px' }} />
+            导出
+          </button>
+        </div>
+
+        <div className="setting-row">
+          <span className="setting-icon"><Upload size={18} /></span>
+          <span>
+            <strong>导入备份</strong>
+            <small>
+              {pendingBackup
+                ? `${pendingBackup.info.item_count} 条记录 (${new Date(pendingBackup.info.created_at).toLocaleDateString()})`
+                : '从备份文件恢复剪贴板历史'}
+            </small>
+          </span>
+          <div style={{ display: 'flex', gap: '6px' }}>
+            {pendingBackup ? (
+              <>
+                <button onClick={() => handleConfirmImport(true)}>合并</button>
+                <button onClick={() => handleConfirmImport(false)}>覆盖</button>
+                <button onClick={handleCancelImport}>取消</button>
+              </>
+            ) : (
+              <button onClick={handleSelectBackupForImport}>
+                <Upload size={14} style={{ marginRight: '4px' }} />
+                选择
+              </button>
+            )}
+          </div>
+        </div>
+
         <div className="setting-row">
           <span className="setting-icon"><Trash2 size={18} /></span>
           <span>
@@ -392,6 +635,52 @@ export default function SettingsView({
             清空
           </button>
         </div>
+
+        <div className="setting-section-divider">存储设置</div>
+
+        <div className="setting-row">
+          <span className="setting-icon"><Database size={18} /></span>
+          <span>
+            <strong>数据目录</strong>
+            <small>{pendingDataDir || settings.custom_data_dir || diagnostics?.app_data_dir || '默认路径'}</small>
+          </span>
+          <div style={{ display: 'flex', gap: '6px' }}>
+            {pendingDataDir ? (
+              <>
+                <button onClick={handleConfirmDataDirChange}>确认</button>
+                <button onClick={handleCancelDataDirChange}>取消</button>
+              </>
+            ) : (
+              <button onClick={handleSelectDataDir}>
+                <FolderOpen size={14} style={{ marginRight: '4px' }} />
+                更改
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div className="setting-row">
+          <span className="setting-icon"><FileText size={18} /></span>
+          <span>
+            <strong>日志目录</strong>
+            <small>{pendingLogDir || settings.custom_log_dir || (diagnostics?.log_path ? diagnostics.log_path.substring(0, diagnostics.log_path.lastIndexOf('\\')) : '默认路径')}</small>
+          </span>
+          <div style={{ display: 'flex', gap: '6px' }}>
+            {pendingLogDir ? (
+              <>
+                <button onClick={handleConfirmLogDirChange}>确认</button>
+                <button onClick={handleCancelLogDirChange}>取消</button>
+              </>
+            ) : (
+              <button onClick={handleSelectLogDir}>
+                <FolderOpen size={14} style={{ marginRight: '4px' }} />
+                更改
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div className="setting-section-divider">诊断信息</div>
 
         <div className="setting-row">
           <span className="setting-icon"><FileText size={18} /></span>
@@ -407,6 +696,55 @@ export default function SettingsView({
             <strong>数据目录</strong>
             <small>{diagnostics?.app_data_dir ?? 'Tauri 后端可用后显示数据目录'}</small>
           </span>
+        </div>
+
+        <div className="setting-section-divider">快捷键说明</div>
+
+        <div className="setting-row shortcut-help">
+          <span className="setting-icon"><Keyboard size={18} /></span>
+          <span>
+            <strong>全局快捷键</strong>
+            <small>在任意应用中唤出剪贴板面板</small>
+          </span>
+          <div className="shortcut-display">
+            <kbd>Ctrl</kbd>
+            <kbd>Shift</kbd>
+            <kbd>V</kbd>
+          </div>
+        </div>
+
+        <div className="setting-row shortcut-help">
+          <span className="setting-icon"><Keyboard size={18} /></span>
+          <span>
+            <strong>选择并粘贴</strong>
+            <small>在历史列表中选择条目后按下</small>
+          </span>
+          <div className="shortcut-display">
+            <kbd>Enter</kbd>
+          </div>
+        </div>
+
+        <div className="setting-row shortcut-help">
+          <span className="setting-icon"><Keyboard size={18} /></span>
+          <span>
+            <strong>隐藏窗口</strong>
+            <small>关闭剪贴板面板返回工作区</small>
+          </span>
+          <div className="shortcut-display">
+            <kbd>ESC</kbd>
+          </div>
+        </div>
+
+        <div className="setting-row shortcut-help">
+          <span className="setting-icon"><Keyboard size={18} /></span>
+          <span>
+            <strong>上下导航</strong>
+            <small>在历史列表中移动选择</small>
+          </span>
+          <div className="shortcut-display">
+            <kbd>↑</kbd>
+            <kbd>↓</kbd>
+          </div>
         </div>
       </section>
     </main>

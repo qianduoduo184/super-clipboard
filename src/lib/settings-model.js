@@ -12,6 +12,8 @@ export function createDefaultSettings() {
     nav_filters_config: {
       visible: ['all', 'favorites', 'text', 'image', 'files'],
     },
+    custom_data_dir: null,
+    custom_log_dir: null,
   };
 }
 

@@ -13,6 +13,8 @@ export type AppSettings = {
   auto_update_enabled: boolean;
   last_update_check_date: string | null;
   nav_filters_config: NavFiltersConfig;
+  custom_data_dir?: string | null;
+  custom_log_dir?: string | null;
 };
 
 export function createDefaultSettings(): AppSettings;

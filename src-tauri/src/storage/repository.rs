@@ -390,6 +390,57 @@ impl ClipboardRepository {
         Ok(())
     }
 
+    pub fn find_by_hash(&self, hash: &str) -> anyhow::Result<Option<ClipboardItem>> {
+        let item = self.conn
+            .query_row(
+                "SELECT id, hash, item_type, content, content_path, preview, source_app, favorite, size_bytes, created_at, updated_at
+                 FROM clipboard_items WHERE hash = ?1 AND deleted_at IS NULL",
+                params![hash],
+                |row| {
+                    Ok(ClipboardItem {
+                        id: row.get(0)?,
+                        hash: row.get(1)?,
+                        item_type: row.get(2)?,
+                        content: row.get(3)?,
+                        content_path: row.get(4)?,
+                        preview: row.get(5)?,
+                        source_app: row.get(6)?,
+                        favorite: row.get(7)?,
+                        size_bytes: row.get(8)?,
+                        created_at: row.get(9)?,
+                        updated_at: row.get(10)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(item)
+    }
+
+    pub fn insert_imported_item(&self, item: &ClipboardItem) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO clipboard_items (id, hash, item_type, content, content_path, preview, source_app, favorite, size_bytes, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                item.id,
+                item.hash,
+                item.item_type,
+                item.content,
+                item.content_path,
+                item.preview,
+                item.source_app,
+                item.favorite,
+                item.size_bytes,
+                item.created_at,
+                item.updated_at,
+            ],
+        )?;
+
+        // 更新 FTS 索引
+        self.rebuild_fts_for_item(&item.id)?;
+
+        Ok(())
+    }
+
     fn rebuild_fts_for_item(&self, id: &str) -> anyhow::Result<()> {
         self.conn.execute("DELETE FROM clipboard_items_fts WHERE id = ?1", params![id])?;
         self.conn.execute(

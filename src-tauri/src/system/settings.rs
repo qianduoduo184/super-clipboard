@@ -37,6 +37,10 @@ pub struct AppSettings {
     pub last_update_check_date: Option<String>,
     #[serde(default)]
     pub nav_filters_config: NavFiltersConfig,
+    #[serde(default)]
+    pub custom_data_dir: Option<String>,
+    #[serde(default)]
+    pub custom_log_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +69,8 @@ impl Default for AppSettings {
             auto_update_enabled: false,
             last_update_check_date: None,
             nav_filters_config: NavFiltersConfig::default(),
+            custom_data_dir: None,
+            custom_log_dir: None,
         }
     }
 }
