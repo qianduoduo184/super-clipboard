@@ -19,6 +19,7 @@ pub struct ClipboardItem {
     pub preview: String,
     pub source_app: Option<String>,
     pub favorite: bool,
+    pub pinned: bool,
     pub size_bytes: i64,
     pub created_at: i64,
     pub updated_at: i64,
@@ -277,7 +278,7 @@ impl ClipboardRepository {
         cursor: Option<i64>,
     ) -> anyhow::Result<Vec<ClipboardItem>> {
         let mut sql = String::from(
-            "SELECT id, hash, item_type, content, content_path, preview, source_app, favorite, size_bytes, created_at, updated_at
+            "SELECT id, hash, item_type, content, content_path, preview, source_app, favorite, pinned, size_bytes, created_at, updated_at
              FROM clipboard_items
              WHERE deleted_at IS NULL",
         );
@@ -301,7 +302,7 @@ impl ClipboardRepository {
             );
             sql_params.push(Value::Text(to_fts_query(&query)));
         }
-        sql.push_str(" ORDER BY COALESCE(sort_rank, updated_at) DESC, updated_at DESC LIMIT ?");
+        sql.push_str(" ORDER BY pinned DESC, COALESCE(sort_rank, updated_at) DESC, updated_at DESC LIMIT ?");
         sql_params.push(Value::Integer(limit));
 
         let mut statement = self.conn.prepare(&sql)?;
@@ -313,7 +314,7 @@ impl ClipboardRepository {
     pub fn get_item(&self, id: &str) -> anyhow::Result<Option<ClipboardItem>> {
         self.conn
             .query_row(
-                "SELECT id, hash, item_type, content, content_path, preview, source_app, favorite, size_bytes, created_at, updated_at
+                "SELECT id, hash, item_type, content, content_path, preview, source_app, favorite, pinned, size_bytes, created_at, updated_at
                  FROM clipboard_items
                  WHERE id = ?1 AND deleted_at IS NULL",
                 params![id],
@@ -326,6 +327,14 @@ impl ClipboardRepository {
     pub fn toggle_favorite(&self, id: &str) -> anyhow::Result<()> {
         self.conn.execute(
             "UPDATE clipboard_items SET favorite = CASE favorite WHEN 1 THEN 0 ELSE 1 END WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn toggle_pin(&self, id: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE clipboard_items SET pinned = CASE pinned WHEN 1 THEN 0 ELSE 1 END WHERE id = ?1",
             params![id],
         )?;
         Ok(())
@@ -393,7 +402,7 @@ impl ClipboardRepository {
     pub fn find_by_hash(&self, hash: &str) -> anyhow::Result<Option<ClipboardItem>> {
         let item = self.conn
             .query_row(
-                "SELECT id, hash, item_type, content, content_path, preview, source_app, favorite, size_bytes, created_at, updated_at
+                "SELECT id, hash, item_type, content, content_path, preview, source_app, favorite, pinned, size_bytes, created_at, updated_at
                  FROM clipboard_items WHERE hash = ?1 AND deleted_at IS NULL",
                 params![hash],
                 |row| {
@@ -405,10 +414,11 @@ impl ClipboardRepository {
                         content_path: row.get(4)?,
                         preview: row.get(5)?,
                         source_app: row.get(6)?,
-                        favorite: row.get(7)?,
-                        size_bytes: row.get(8)?,
-                        created_at: row.get(9)?,
-                        updated_at: row.get(10)?,
+                        favorite: row.get::<_, i64>(7)? == 1,
+                        pinned: row.get::<_, i64>(8)? == 1,
+                        size_bytes: row.get(9)?,
+                        created_at: row.get(10)?,
+                        updated_at: row.get(11)?,
                     })
                 },
             )
@@ -418,8 +428,8 @@ impl ClipboardRepository {
 
     pub fn insert_imported_item(&self, item: &ClipboardItem) -> anyhow::Result<()> {
         self.conn.execute(
-            "INSERT INTO clipboard_items (id, hash, item_type, content, content_path, preview, source_app, favorite, size_bytes, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO clipboard_items (id, hash, item_type, content, content_path, preview, source_app, favorite, pinned, size_bytes, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 item.id,
                 item.hash,
@@ -429,6 +439,7 @@ impl ClipboardRepository {
                 item.preview,
                 item.source_app,
                 item.favorite,
+                item.pinned,
                 item.size_bytes,
                 item.created_at,
                 item.updated_at,
@@ -527,9 +538,10 @@ impl ClipboardRepository {
             preview: row.get(5)?,
             source_app: row.get(6)?,
             favorite: row.get::<_, i64>(7)? == 1,
-            size_bytes: row.get(8)?,
-            created_at: row.get(9)?,
-            updated_at: row.get(10)?,
+            pinned: row.get::<_, i64>(8)? == 1,
+            size_bytes: row.get(9)?,
+            created_at: row.get(10)?,
+            updated_at: row.get(11)?,
         })
     }
 }

@@ -7,6 +7,7 @@ export type BackendClipboardItem = {
   preview: string;
   source_app?: string | null;
   favorite: boolean;
+  pinned: boolean;
   size_bytes: number;
   created_at: number;
   updated_at: number;
@@ -18,6 +19,7 @@ export type ViewClipboardItem = {
   preview: string;
   contentPath: string | null;
   favorite: boolean;
+  pinned: boolean;
   updatedAt: number;
   size: string;
   source: string;

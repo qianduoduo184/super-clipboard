@@ -1,5 +1,12 @@
 export function sortItemsByUpdatedTime(items) {
-  return [...items].sort((a, b) => b.updatedAt - a.updatedAt);
+  return [...items].sort((a, b) => {
+    // Pinned items always come first
+    if (a.pinned !== b.pinned) {
+      return a.pinned ? -1 : 1;
+    }
+    // Within pinned or unpinned groups, sort by updatedAt
+    return b.updatedAt - a.updatedAt;
+  });
 }
 
 export function filterItems(items, { type, query }) {
@@ -24,6 +31,8 @@ export function filterItems(items, { type, query }) {
 }
 
 export function normalizePreview(value, maxLength = 120) {
+  // Collapse all whitespace (including \n, \r, \t) into single spaces for single-line display
+  // The original multi-line content is preserved in storage and restored on paste
   const singleLine = value.replace(/\s+/g, ' ').trim();
   if (singleLine.length <= maxLength) {
     return singleLine;

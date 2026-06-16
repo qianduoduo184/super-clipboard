@@ -238,6 +238,28 @@ kbd {
   color: inherit;
   background: transparent;
   text-align: left;
+  position: relative;
+  cursor: pointer;
+}
+
+.history-item .drag-handle-icon {
+  position: absolute;
+  left: -20px;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 100%;
+  color: var(--muted);
+  cursor: grab;
+}
+
+.history-item:hover .drag-handle-icon {
+  display: flex;
+}
+
+.history-item .drag-handle-icon:active {
+  cursor: grabbing;
 }
 
 .history-item.image-row {
@@ -305,6 +327,16 @@ kbd {
 
 .favorite {
   color: var(--danger);
+}
+
+.item-indicators {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.pinned-icon {
+  color: var(--primary);
 }
 
 .detail-pane {

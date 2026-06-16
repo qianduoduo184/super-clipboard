@@ -6,6 +6,7 @@ import {
   Clipboard,
   Copy,
   FileText,
+  GripVertical,
   Heart,
   Image,
   Pause,
@@ -33,6 +34,7 @@ import {
   searchItems,
   setRecordingEnabled,
   toggleFavorite as toggleBackendFavorite,
+  togglePin as toggleBackendPin,
   updateSettings,
 } from './features/history/api';
 
@@ -45,6 +47,7 @@ type ClipboardItem = {
   preview: string;
   contentPath: string | null;
   favorite: boolean;
+  pinned: boolean;
   updatedAt: number;
   size: string;
   source: string;
@@ -57,6 +60,7 @@ const seedItems: ClipboardItem[] = [
     preview: 'SQLite WAL 模式 + FTS5 搜索，保证大量历史记录下仍能快速返回首屏。',
     contentPath: null,
     favorite: true,
+    pinned: false,
     updatedAt: Date.now() - 1000 * 60 * 2,
     size: '112 B',
     source: 'VS Code',
@@ -67,6 +71,7 @@ const seedItems: ClipboardItem[] = [
     preview: 'screenshot-2026-06-08.png',
     contentPath: null,
     favorite: false,
+    pinned: false,
     updatedAt: Date.now() - 1000 * 60 * 18,
     size: '1.8 MB',
     source: 'Snipping Tool',
@@ -77,6 +82,7 @@ const seedItems: ClipboardItem[] = [
     preview: '需求说明.docx, 架构草图.png',
     contentPath: null,
     favorite: false,
+    pinned: false,
     updatedAt: Date.now() - 1000 * 60 * 42,
     size: '2 个文件',
     source: 'Explorer',
@@ -87,6 +93,7 @@ const seedItems: ClipboardItem[] = [
     preview: '<table><tr><td>CopyQ / Ditto / PasteBar 功能对比</td></tr></table>',
     contentPath: null,
     favorite: false,
+    pinned: false,
     updatedAt: Date.now() - 1000 * 60 * 85,
     size: '624 B',
     source: 'Edge',
@@ -301,6 +308,15 @@ export default function App() {
     }
     setItems((current) =>
       current.map((item) => (item.id === id ? { ...item, favorite: !item.favorite } : item)),
+    );
+  }
+
+  async function togglePin(id: string) {
+    if (backendAvailable) {
+      await toggleBackendPin(id);
+    }
+    setItems((current) =>
+      current.map((item) => (item.id === id ? { ...item, pinned: !item.pinned } : item)),
     );
   }
 
@@ -633,6 +649,7 @@ export default function App() {
           {virtualItems.map((item, idx) => {
             const actualIndex = virtualWindow.startIndex + idx;
             const itemHeight = itemHeights[actualIndex];
+            const isDraggingDisabled = query.trim() !== '' || activeFilter !== 'all';
             return (
             <button
               key={item.id}
@@ -642,16 +659,23 @@ export default function App() {
                 item.type === 'image' ? 'image-row' : '',
               ].join(' ')}
               style={{ minHeight: `${itemHeight}px` }}
-              draggable
-              onDragStart={() => setDraggingId(item.id)}
-              onDragOver={(event) => event.preventDefault()}
+              draggable={!isDraggingDisabled}
+              onDragStart={() => !isDraggingDisabled && setDraggingId(item.id)}
+              onDragOver={(event) => !isDraggingDisabled && event.preventDefault()}
               onDrop={(event) => {
-                event.preventDefault();
-                void handleDropItem(item.id);
+                if (!isDraggingDisabled) {
+                  event.preventDefault();
+                  void handleDropItem(item.id);
+                }
               }}
               onDragEnd={() => setDraggingId(null)}
               onClick={() => void pasteListItem(item)}
             >
+              {!isDraggingDisabled && (
+                <span className="drag-handle-icon">
+                  <GripVertical size={16} />
+                </span>
+              )}
               <span className={item.type === 'image' && item.contentPath ? 'type-icon image-thumb' : 'type-icon'}>
                 {item.type === 'image' && item.contentPath ? (
                   <img src={convertFileSrc(item.contentPath)} alt="" />
@@ -665,7 +689,10 @@ export default function App() {
                   {formatTime(item.updatedAt)}
                 </span>
               </span>
-              {item.favorite ? <Heart className="favorite" size={15} fill="currentColor" /> : null}
+              <span className="item-indicators">
+                {item.pinned ? <Pin className="pinned-icon" size={15} fill="currentColor" /> : null}
+                {item.favorite ? <Heart className="favorite" size={15} fill="currentColor" /> : null}
+              </span>
             </button>
           );
           })}
@@ -697,6 +724,10 @@ export default function App() {
                   <button onClick={() => void copySelectedItem()}>
                     <Copy size={16} />
                     仅复制
+                  </button>
+                  <button onClick={() => void togglePin(selectedItem.id)}>
+                    <Pin size={16} />
+                    {selectedItem.pinned ? '取消置顶' : '置顶'}
                   </button>
                   <button onClick={() => void toggleFavorite(selectedItem.id)}>
                     <Heart size={16} />

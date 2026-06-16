@@ -3,6 +3,7 @@ export type ClipboardItemLike = {
   type: string;
   preview: string;
   favorite: boolean;
+  pinned: boolean;
   updatedAt: number;
 };
 

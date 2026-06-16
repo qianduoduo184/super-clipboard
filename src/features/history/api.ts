@@ -11,6 +11,7 @@ export type ClipboardSearchItem = {
   preview: string;
   source_app?: string | null;
   favorite: boolean;
+  pinned: boolean;
   size_bytes: number;
   created_at: number;
   updated_at: number;
@@ -81,6 +82,10 @@ export async function pasteItem(id: string) {
 
 export async function toggleFavorite(id: string) {
   return invoke<void>('toggle_favorite', { id });
+}
+
+export async function togglePin(id: string) {
+  return invoke<void>('toggle_pin', { id });
 }
 
 export async function deleteItem(id: string) {

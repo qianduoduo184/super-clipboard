@@ -143,6 +143,13 @@ pub fn toggle_favorite(state: State<'_, AppState>, id: String) -> Result<(), Str
 }
 
 #[tauri::command]
+pub fn toggle_pin(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    crate::diagnostics::info(format!("command: toggle_pin id={id}"));
+    let repository = state.repository.lock().map_err(|error| error.to_string())?;
+    repository.toggle_pin(&id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub fn delete_item(state: State<'_, AppState>, id: String) -> Result<(), String> {
     crate::diagnostics::info(format!("command: delete_item id={id}"));
     let repository = state.repository.lock().map_err(|error| error.to_string())?;

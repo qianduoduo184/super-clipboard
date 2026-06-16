@@ -135,6 +135,7 @@ fn main() {
             commands::copy_item,
             commands::paste_item,
             commands::toggle_favorite,
+            commands::toggle_pin,
             commands::delete_item,
             commands::reorder_items,
             commands::set_recording_enabled,

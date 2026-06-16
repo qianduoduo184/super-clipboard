@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS clipboard_items (
   preview TEXT NOT NULL,
   source_app TEXT,
   favorite INTEGER NOT NULL DEFAULT 0,
+  pinned INTEGER NOT NULL DEFAULT 0,
   size_bytes INTEGER NOT NULL DEFAULT 0,
   sort_rank INTEGER,
   created_at INTEGER NOT NULL,
@@ -27,6 +28,9 @@ WHERE deleted_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_clipboard_items_type_updated_at
 ON clipboard_items(item_type, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_clipboard_items_pinned_updated_at
+ON clipboard_items(pinned DESC, updated_at DESC);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS clipboard_items_fts
 USING fts5(id UNINDEXED, preview, content);
