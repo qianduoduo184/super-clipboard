@@ -216,6 +216,10 @@ pub fn update_settings(
 #[tauri::command]
 pub async fn check_update(app: AppHandle, state: State<'_, AppState>) -> Result<UpdateInfo, String> {
     crate::diagnostics::info("command: check_update");
+
+    let current_version = app.package_info().version.to_string();
+    crate::diagnostics::info(format!("check_update: current version = {}", current_version));
+
     let today = chrono::Local::now().date_naive().to_string();
     let update = app
         .updater()
@@ -233,16 +237,22 @@ pub async fn check_update(app: AppHandle, state: State<'_, AppState>) -> Result<
     }
 
     Ok(match update {
-        Some(update) => UpdateInfo {
-            available: true,
-            version: Some(update.version.to_string()),
-            body: update.body,
-        },
-        None => UpdateInfo {
-            available: false,
-            version: None,
-            body: None,
-        },
+        Some(update) => {
+            crate::diagnostics::info(format!("check_update: new version available = {}", update.version));
+            UpdateInfo {
+                available: true,
+                version: Some(update.version.to_string()),
+                body: update.body,
+            }
+        }
+        None => {
+            crate::diagnostics::info("check_update: no update available");
+            UpdateInfo {
+                available: false,
+                version: None,
+                body: None,
+            }
+        }
     })
 }
 

@@ -27,6 +27,7 @@ import {
   validateShortcut,
   type AppSettings,
 } from '../../lib/settings-model';
+import { getCurrentVersion } from '../../lib/version';
 
 type SettingsViewProps = {
   recording: boolean;
@@ -56,6 +57,11 @@ export default function SettingsView({
   const [pendingDataDir, setPendingDataDir] = useState<string | null>(null);
   const [pendingLogDir, setPendingLogDir] = useState<string | null>(null);
   const [pendingBackup, setPendingBackup] = useState<{ path: string; info: BackupInfo } | null>(null);
+  const [appVersion, setAppVersion] = useState<string>('');
+
+  useEffect(() => {
+    getCurrentVersion().then(setAppVersion).catch(() => setAppVersion('未知版本'));
+  }, []);
 
   useEffect(() => {
     let ignore = false;
@@ -171,8 +177,9 @@ export default function SettingsView({
       setStatus('正在检查更新...');
       const update = await checkForUpdates();
       if (!update.available) {
-        setStatus('当前已是最新版本');
-        window.alert('当前已是最新版本');
+        const currentVersion = await getCurrentVersion();
+        setStatus(`当前已是最新版本（${currentVersion}）`);
+        window.alert(`当前已是最新版本（${currentVersion}）`);
         return;
       }
       const confirmed = window.confirm(`发现新版本 ${update.version ?? ''}，是否现在更新？`);
@@ -189,9 +196,9 @@ export default function SettingsView({
       let userMessage = '检查更新失败';
 
       if (message.includes('Could not fetch') || message.includes('404') || message.includes('Not Found')) {
-        userMessage = '暂无可用更新。首次 Release 将在下次代码推送后自动构建。';
+        userMessage = '检查更新失败，GitHub Release 不存在或网络异常';
       } else if (message.includes('Network') || message.includes('timeout')) {
-        userMessage = '网络连接失败，请检查网络后重试';
+        userMessage = '检查更新失败，请检查网络连接';
       } else {
         userMessage = `检查更新失败: ${message}`;
       }
@@ -746,6 +753,16 @@ export default function SettingsView({
             <kbd>↑</kbd>
             <kbd>↓</kbd>
           </div>
+        </div>
+
+        <div className="setting-section-divider">关于</div>
+
+        <div className="setting-row">
+          <span className="setting-icon"><Shield size={18} /></span>
+          <span>
+            <strong>版本</strong>
+            <small>{appVersion || '加载中...'}</small>
+          </span>
         </div>
       </section>
     </main>
