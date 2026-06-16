@@ -143,8 +143,48 @@ cargo test
 - 托盘图标、全局快捷键、开机启动
 - 自动更新（GitHub Release）
 - 暗色/亮色主题切换
-- 前端测试覆盖（31 个测试 + TypeScript 类型检查）
+- 前端测试覆盖（33 个测试 + TypeScript 类型检查）
 - GitHub Actions 自动构建和发布
+- 文件列表复制粘贴支持
+- 动态高度虚拟滚动（图片行 3 倍高度）
+- 拖拽排序和导航过滤器配置
+
+### 🔧 待完善
+详见 [docs/TODO.md](docs/TODO.md)
+
+## 贡献
+
+欢迎贡献！请查看 [CONTRIBUTING.md](CONTRIBUTING.md) 了解：
+- 如何报告 Bug 和建议新功能
+- 开发环境搭建
+- 代码规范和提交流程
+- Pull Request 指南
+
+### 快速开始贡献
+
+1. **Fork 仓库**并克隆
+2. **创建分支**: `git checkout -b feat/your-feature`
+3. **开发并测试**: `npm run ci:frontend && cargo test`
+4. **提交**: 遵循 [Conventional Commits](https://www.conventionalcommits.org/) 规范
+5. **推送并创建 PR**
+
+### 文档资源
+
+- **[QUICK_REFERENCE.md](.github/QUICK_REFERENCE.md)** - 高效指令速查表（推荐先看）
+- **[DEV_CHECKLIST.md](.github/DEV_CHECKLIST.md)** - 开发指令最佳实践
+- **[COMMIT_TEMPLATE.md](.github/COMMIT_TEMPLATE.md)** - Git 提交规范
+- **[CHANGELOG.md](CHANGELOG.md)** - 版本变更历史
+- **[CLAUDE.md](CLAUDE.md)** - AI 助手开发指南
+
+## 许可证
+
+[许可证类型] - 详见 LICENSE 文件
+
+## 致谢
+
+- [Tauri](https://tauri.app/) - 跨平台应用框架
+- [React](https://react.dev/) - UI 框架
+- [rusqlite](https://github.com/rusqlite/rusqlite) - SQLite Rust 绑定
 
 ### 🚧 进行中
 - 文件列表写回剪贴板（当前只支持读取）
