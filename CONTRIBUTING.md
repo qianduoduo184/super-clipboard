@@ -222,6 +222,37 @@ super-clipboard/
 4. 推送到 main 触发 CI 构建
 5. GitHub Release 自动创建
 
+### 版本管理规则
+
+#### 版本号格式
+采用语义化版本（Semantic Versioning）：`MAJOR.MINOR.PATCH`
+
+| 字段 | 含义 | 触发场景 |
+|------|------|---------|
+| MAJOR | 主版本 | 不兼容的重大架构变更或功能重写 |
+| MINOR | 次版本 | 新增功能，向后兼容 |
+| PATCH | 修订版本 | Bug 修复、构建发布、小优化 |
+
+#### 当前基准版本
+`1.0.0`（正式发布于首次生产发版）
+
+#### 发版规则
+- **正式功能发版**：递增 `MINOR`，如 `1.0.0` → `1.1.0`
+- **构建发布 / Bug 修复 / 小版本迭代**：递增 `PATCH`，如 `1.0.0` → `1.0.1`
+- **重大重构或破坏性变更**：递增 `MAJOR`，如 `1.x.x` → `2.0.0`，需提前告知
+
+#### 版本号同步要求
+每次发版必须确保以下所有位置的版本号保持一致：
+- `package.json` → `version`
+- `src-tauri/tauri.conf.json` → `version`
+- `src-tauri/Cargo.toml` → `version`
+
+#### AI 协作约定
+在与 AI（如 Claude）协作开发时：
+- 每次发版前，告知 AI 本次发版类型（修复 / 新功能 / 重大变更），由 AI 自动推导正确的版本号
+- AI 在执行发版任务时，必须同步更新上述所有版本号字段，不允许只更新部分文件
+- AI 不得在未明确告知发版类型的情况下自行递增版本号
+
 ## 获取帮助
 
 - **问题**: 在 [Issues](https://github.com/qianduoduo184/super-clipboard/issues) 提问
