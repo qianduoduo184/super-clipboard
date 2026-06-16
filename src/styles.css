@@ -400,10 +400,25 @@ pre {
 
 .settings-shell {
   background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.settings-shell .toolbar {
+  flex-shrink: 0;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--bg);
+  padding-bottom: 12px;
 }
 
 .settings-list {
   padding: 8px;
+  flex: 1;
+  overflow-y: auto;
 }
 
 .setting-row {

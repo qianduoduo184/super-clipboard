@@ -109,11 +109,9 @@ pub fn copy_item(state: State<'_, AppState>, id: String) -> Result<(), String> {
     }
     if item.item_type == "files" {
         if let Some(content) = item.content {
-            let file_paths: Vec<String> = content
-                .lines()
-                .map(|line| line.trim().to_string())
-                .filter(|line| !line.is_empty())
-                .collect();
+            // Parse JSON array of file paths
+            let file_paths: Vec<String> = serde_json::from_str(&content)
+                .map_err(|e| format!("failed to parse file paths: {}", e))?;
             if !file_paths.is_empty() {
                 #[cfg(target_os = "windows")]
                 crate::clipboard::win::write_files_to_clipboard(&file_paths)
@@ -258,7 +256,15 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
         .download_and_install(|_, _| {}, || {})
         .await
         .map_err(|error| error.to_string())?;
-    app.restart();
+
+    // Return success and let the app restart after a short delay
+    // This allows the frontend to show feedback before restart
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        app.restart();
+    });
+
+    Ok(())
 }
 
 #[tauri::command]

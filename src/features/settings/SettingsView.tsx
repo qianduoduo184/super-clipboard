@@ -179,7 +179,8 @@ export default function SettingsView({
       if (confirmed) {
         setStatus('正在下载并安装更新...');
         await installUpdate();
-        setStatus('更新已开始安装');
+        setStatus('更新已安装完成，应用即将重启');
+        window.alert('更新已安装完成，应用将在 2 秒后自动重启');
       } else {
         setStatus('已取消更新');
       }
