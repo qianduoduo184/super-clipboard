@@ -89,10 +89,13 @@ jobs:
           "updater signing preflight" | Set-Content -Path .tmp\updater-signing-preflight.txt -Encoding utf8
 
           $env:TAURI_PRIVATE_KEY = $privateKey
-          $env:TAURI_PRIVATE_KEY_PASSWORD = if ($null -eq $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) { "" } else { $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD }
+          # Set password to empty string if not provided (rsign accepts empty password via env var)
+          if ([string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
+            $env:TAURI_PRIVATE_KEY_PASSWORD = ""
+          }
 
-          # Use --ci flag to skip interactive prompts (password will come from env vars)
-          npx tauri signer sign .tmp\updater-signing-preflight.txt --ci
+          # The signer will read from TAURI_PRIVATE_KEY and TAURI_PRIVATE_KEY_PASSWORD env vars automatically
+          npx tauri signer sign .tmp\updater-signing-preflight.txt
 
       - name: Build and upload Tauri release
         if: steps.signing-secrets.outputs.available == 'true'
