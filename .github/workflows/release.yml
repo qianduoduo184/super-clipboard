@@ -90,7 +90,9 @@ jobs:
 
           $env:TAURI_PRIVATE_KEY = $privateKey
           $env:TAURI_PRIVATE_KEY_PASSWORD = if ($null -eq $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) { "" } else { $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD }
-          npx tauri signer sign .tmp\updater-signing-preflight.txt -p $env:TAURI_PRIVATE_KEY_PASSWORD
+
+          # Use --ci flag to skip interactive prompts (password will come from env vars)
+          npx tauri signer sign .tmp\updater-signing-preflight.txt --ci
 
       - name: Build and upload Tauri release
         if: steps.signing-secrets.outputs.available == 'true'
