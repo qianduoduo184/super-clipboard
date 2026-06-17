@@ -25,19 +25,25 @@
       "csp": null,
       "assetProtocol": {
         "enable": true,
-        "scope": ["$APPDATA/**"]
+        "scope": [
+          "$APPDATA/**"
+        ]
       }
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "createUpdaterArtifacts": true,
-    "icon": ["icons/icon.ico"]
+    "icon": [
+      "icons/icon.ico"
+    ]
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IERDMDM3RTVCNTdBNzhBMzEKUldReGlxZFhXMzREM05nNGl6SG8zYXlZU29NQjFDY1pIR3M0VHlJdkF6L24vUENsT3I5TlNaaHcK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZBQjIxRjAyMjcyOTA4NjgKUldSb0NDa25BaCt5K29JbU1xRjhlS0l6M0ZDejcrUmdyRDJuVFdxN1dNTHFHVDloQ0NBaEpDbFgK",
       "endpoints": [
         "https://github.com/qianduoduo184/super-clipboard/releases/latest/download/latest.json"
       ]
