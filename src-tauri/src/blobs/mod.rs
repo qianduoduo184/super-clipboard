@@ -66,7 +66,9 @@ pub fn thumbnail_path_for(blob_path: &Path) -> PathBuf {
 
 pub fn create_thumbnail(blob_path: &Path) -> anyhow::Result<PathBuf> {
     let thumbnail_path = thumbnail_path_for(blob_path);
-    let image = ImageReader::open(blob_path)?.with_guessed_format()?.decode()?;
+    let image = ImageReader::open(blob_path)?
+        .with_guessed_format()?
+        .decode()?;
     image.thumbnail(320, 320).save(&thumbnail_path)?;
     Ok(thumbnail_path)
 }
@@ -176,13 +178,19 @@ mod tests {
     #[test]
     fn build_blob_path_keeps_requested_extension() {
         let path = build_blob_path(Path::new("root"), ".png");
-        assert_eq!(path.extension().and_then(|value| value.to_str()), Some("png"));
+        assert_eq!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("png")
+        );
     }
 
     #[test]
     fn thumbnail_path_uses_png_extension() {
         let path = thumbnail_path_for(Path::new("root/item.jpg"));
-        assert_eq!(path.file_name().and_then(|value| value.to_str()), Some("item.thumb.png"));
+        assert_eq!(
+            path.file_name().and_then(|value| value.to_str()),
+            Some("item.thumb.png")
+        );
     }
 
     #[test]
@@ -220,7 +228,10 @@ mod tests {
         let path = write_dib_as_bmp(&dir, &dib).expect("bmp blob");
         let bytes = fs::read(&path).expect("bmp file");
 
-        assert_eq!(path.extension().and_then(|value| value.to_str()), Some("bmp"));
+        assert_eq!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("bmp")
+        );
         assert_eq!(&bytes[..2], b"BM");
         assert!(thumbnail_path_for(&path).exists());
     }

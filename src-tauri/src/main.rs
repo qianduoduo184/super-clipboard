@@ -118,10 +118,14 @@ fn main() {
                 .lock()
                 .map(|settings| settings.global_shortcut.clone())
                 .unwrap_or_else(|_| AppSettings::default().global_shortcut);
-            if let Err(error) =
-                system::shortcuts::register_shortcut(app.handle(), &startup_shortcut, current_shortcut)
-            {
-                diagnostics::error(format!("setup: global shortcut registration failed: {error}"));
+            if let Err(error) = system::shortcuts::register_shortcut(
+                app.handle(),
+                &startup_shortcut,
+                current_shortcut,
+            ) {
+                diagnostics::error(format!(
+                    "setup: global shortcut registration failed: {error}"
+                ));
             } else {
                 diagnostics::info("setup: global shortcut registered");
             }

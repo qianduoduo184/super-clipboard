@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::clipboard::types::ClipboardItemDraft;
 
-use super::schema::INIT_SQL;
+use super::schema::{INDEX_SQL, INIT_SQL};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClipboardItem {
@@ -51,8 +51,12 @@ mod tests {
     fn insert_or_touch_deduplicates_by_hash() {
         let repository = open_test_repository();
 
-        let first = repository.insert_or_touch(text_draft("hello")).expect("first insert");
-        let second = repository.insert_or_touch(text_draft("hello")).expect("second insert");
+        let first = repository
+            .insert_or_touch(text_draft("hello"))
+            .expect("first insert");
+        let second = repository
+            .insert_or_touch(text_draft("hello"))
+            .expect("second insert");
 
         assert_eq!(first.id, second.id);
     }
@@ -60,7 +64,9 @@ mod tests {
     #[test]
     fn search_returns_matching_items() {
         let repository = open_test_repository();
-        repository.insert_or_touch(text_draft("sqlite clipboard history")).expect("insert");
+        repository
+            .insert_or_touch(text_draft("sqlite clipboard history"))
+            .expect("insert");
 
         let results = repository
             .search(
@@ -82,7 +88,9 @@ mod tests {
     fn search_handles_fts_special_characters_without_error() {
         let repository = open_test_repository();
         repository
-            .insert_or_touch(text_draft("open http://example.com/path and keep \"quoted\" text"))
+            .insert_or_touch(text_draft(
+                "open http://example.com/path and keep \"quoted\" text",
+            ))
             .expect("insert");
 
         let url_results = repository
@@ -116,9 +124,13 @@ mod tests {
     fn insert_or_touch_allows_reinserting_soft_deleted_content() {
         let repository = open_test_repository();
 
-        let first = repository.insert_or_touch(text_draft("repeatable")).expect("first insert");
+        let first = repository
+            .insert_or_touch(text_draft("repeatable"))
+            .expect("first insert");
         repository.soft_delete(&first.id).expect("soft delete");
-        let second = repository.insert_or_touch(text_draft("repeatable")).expect("second insert");
+        let second = repository
+            .insert_or_touch(text_draft("repeatable"))
+            .expect("second insert");
 
         assert_ne!(first.id, second.id);
     }
@@ -126,9 +138,15 @@ mod tests {
     #[test]
     fn prune_history_soft_deletes_old_non_favorites_over_limit() {
         let repository = open_test_repository();
-        let first = repository.insert_or_touch(text_draft("first")).expect("first insert");
-        let second = repository.insert_or_touch(text_draft("second")).expect("second insert");
-        let favorite = repository.insert_or_touch(text_draft("favorite")).expect("favorite insert");
+        let first = repository
+            .insert_or_touch(text_draft("first"))
+            .expect("first insert");
+        let second = repository
+            .insert_or_touch(text_draft("second"))
+            .expect("second insert");
+        let favorite = repository
+            .insert_or_touch(text_draft("favorite"))
+            .expect("favorite insert");
         repository.toggle_favorite(&favorite.id).expect("favorite");
 
         repository.prune_history(1, 0).expect("prune");
@@ -136,15 +154,24 @@ mod tests {
         let first_active = repository.get_item(&first.id).expect("first").is_some();
         let second_active = repository.get_item(&second.id).expect("second").is_some();
         assert_ne!(first_active, second_active);
-        assert!(repository.get_item(&favorite.id).expect("favorite").is_some());
+        assert!(repository
+            .get_item(&favorite.id)
+            .expect("favorite")
+            .is_some());
     }
 
     #[test]
     fn reorder_items_persists_custom_history_order() {
         let repository = open_test_repository();
-        let first = repository.insert_or_touch(text_draft("first")).expect("first insert");
-        let second = repository.insert_or_touch(text_draft("second")).expect("second insert");
-        let third = repository.insert_or_touch(text_draft("third")).expect("third insert");
+        let first = repository
+            .insert_or_touch(text_draft("first"))
+            .expect("first insert");
+        let second = repository
+            .insert_or_touch(text_draft("second"))
+            .expect("second insert");
+        let third = repository
+            .insert_or_touch(text_draft("third"))
+            .expect("third insert");
 
         repository
             .reorder_items(&[third.id.clone(), first.id.clone(), second.id.clone()])
@@ -163,7 +190,10 @@ mod tests {
             .expect("search");
 
         assert_eq!(
-            results.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+            results
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
             vec![third.id.as_str(), first.id.as_str(), second.id.as_str()]
         );
     }
@@ -171,13 +201,19 @@ mod tests {
     #[test]
     fn insert_or_touch_places_new_items_before_custom_order() {
         let repository = open_test_repository();
-        let first = repository.insert_or_touch(text_draft("first")).expect("first insert");
-        let second = repository.insert_or_touch(text_draft("second")).expect("second insert");
+        let first = repository
+            .insert_or_touch(text_draft("first"))
+            .expect("first insert");
+        let second = repository
+            .insert_or_touch(text_draft("second"))
+            .expect("second insert");
         repository
             .reorder_items(&[first.id.clone(), second.id.clone()])
             .expect("reorder");
 
-        let third = repository.insert_or_touch(text_draft("third")).expect("third insert");
+        let third = repository
+            .insert_or_touch(text_draft("third"))
+            .expect("third insert");
         let results = repository
             .search(
                 String::new(),
@@ -191,6 +227,47 @@ mod tests {
             .expect("search");
 
         assert_eq!(results[0].id, third.id);
+    }
+
+    #[test]
+    fn open_migrates_legacy_database_without_pinned_column() {
+        let path =
+            std::env::temp_dir().join(format!("super-clipboard-legacy-{}.sqlite3", Uuid::new_v4()));
+        {
+            let conn = Connection::open(&path).expect("legacy db");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE clipboard_items (
+                  id TEXT PRIMARY KEY,
+                  hash TEXT NOT NULL,
+                  item_type TEXT NOT NULL,
+                  content TEXT,
+                  content_path TEXT,
+                  preview TEXT NOT NULL,
+                  source_app TEXT,
+                  favorite INTEGER NOT NULL DEFAULT 0,
+                  size_bytes INTEGER NOT NULL DEFAULT 0,
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL,
+                  deleted_at INTEGER
+                );
+                CREATE VIRTUAL TABLE clipboard_items_fts
+                USING fts5(id UNINDEXED, preview, content);
+                INSERT INTO clipboard_items
+                (id, hash, item_type, content, preview, favorite, size_bytes, created_at, updated_at)
+                VALUES ('legacy-id', 'legacy-hash', 'text', 'legacy text', 'legacy text', 0, 11, 1, 1);
+                "#,
+            )
+            .expect("legacy schema");
+        }
+
+        let repository = ClipboardRepository::open(path).expect("open migrated db");
+        let item = repository
+            .get_item("legacy-id")
+            .expect("get legacy item")
+            .expect("legacy item exists");
+
+        assert!(!item.pinned);
     }
 }
 
@@ -211,7 +288,8 @@ impl ClipboardRepository {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(INIT_SQL)?;
-        migrate_sort_rank(&conn)?;
+        migrate_schema(&conn)?;
+        conn.execute_batch(INDEX_SQL)?;
         Ok(Self { conn })
     }
 
@@ -232,7 +310,9 @@ impl ClipboardRepository {
                 "UPDATE clipboard_items SET updated_at = ?1, sort_rank = ?1 WHERE id = ?2",
                 params![now, existing_id],
             )?;
-            return self.get_item(&existing_id)?.ok_or_else(|| anyhow::anyhow!("item missing"));
+            return self
+                .get_item(&existing_id)?
+                .ok_or_else(|| anyhow::anyhow!("item missing"));
         }
 
         let id = Uuid::new_v4().to_string();
@@ -255,7 +335,8 @@ impl ClipboardRepository {
             ],
         )?;
         self.rebuild_fts_for_item(&id)?;
-        self.get_item(&id)?.ok_or_else(|| anyhow::anyhow!("inserted item missing"))
+        self.get_item(&id)?
+            .ok_or_else(|| anyhow::anyhow!("inserted item missing"))
     }
 
     pub fn reorder_items(&self, ids: &[String]) -> anyhow::Result<()> {
@@ -302,7 +383,9 @@ impl ClipboardRepository {
             );
             sql_params.push(Value::Text(to_fts_query(&query)));
         }
-        sql.push_str(" ORDER BY pinned DESC, COALESCE(sort_rank, updated_at) DESC, updated_at DESC LIMIT ?");
+        sql.push_str(
+            " ORDER BY pinned DESC, COALESCE(sort_rank, updated_at) DESC, updated_at DESC LIMIT ?",
+        );
         sql_params.push(Value::Integer(limit));
 
         let mut statement = self.conn.prepare(&sql)?;
@@ -453,7 +536,8 @@ impl ClipboardRepository {
     }
 
     fn rebuild_fts_for_item(&self, id: &str) -> anyhow::Result<()> {
-        self.conn.execute("DELETE FROM clipboard_items_fts WHERE id = ?1", params![id])?;
+        self.conn
+            .execute("DELETE FROM clipboard_items_fts WHERE id = ?1", params![id])?;
         self.conn.execute(
             "INSERT INTO clipboard_items_fts(id, preview, content)
              SELECT id, preview, COALESCE(content, '') FROM clipboard_items WHERE id = ?1",
@@ -522,7 +606,8 @@ impl ClipboardRepository {
                  )
                )",
         )?;
-        let rows = statement.query_map(params![max_history_items], |row| row.get::<_, String>(0))?;
+        let rows =
+            statement.query_map(params![max_history_items], |row| row.get::<_, String>(0))?;
         rows.map(|row| row.map(PathBuf::from))
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
@@ -553,16 +638,24 @@ fn to_fts_query(raw: &str) -> String {
         .join(" ")
 }
 
-fn migrate_sort_rank(conn: &Connection) -> anyhow::Result<()> {
-    let has_sort_rank = conn
+fn migrate_schema(conn: &Connection) -> anyhow::Result<()> {
+    let columns = conn
         .prepare("PRAGMA table_info(clipboard_items)")?
         .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?
-        .iter()
-        .any(|name| name == "sort_rank");
+        .collect::<Result<Vec<_>, _>>()?;
 
-    if !has_sort_rank {
-        conn.execute("ALTER TABLE clipboard_items ADD COLUMN sort_rank INTEGER", [])?;
+    if !columns.iter().any(|name| name == "pinned") {
+        conn.execute(
+            "ALTER TABLE clipboard_items ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+
+    if !columns.iter().any(|name| name == "sort_rank") {
+        conn.execute(
+            "ALTER TABLE clipboard_items ADD COLUMN sort_rank INTEGER",
+            [],
+        )?;
     }
 
     conn.execute(

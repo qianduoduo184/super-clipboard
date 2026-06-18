@@ -99,7 +99,7 @@ pub fn start_background_listener(
                     last_error = Some(error);
                 }
             }
-        };
+        }
         let Some(drafts) = drafts else {
             crate::diagnostics::error(format!(
                 "clipboard: failed to read clipboard after retries: {}",
@@ -124,10 +124,9 @@ pub fn start_background_listener(
             }
 
             if stored_any {
-                if let Err(error) = repository.prune_history(
-                    app_settings.max_history_items,
-                    app_settings.retention_days,
-                ) {
+                if let Err(error) = repository
+                    .prune_history(app_settings.max_history_items, app_settings.retention_days)
+                {
                     crate::diagnostics::error(format!(
                         "clipboard: failed to prune clipboard history: {error}"
                     ));

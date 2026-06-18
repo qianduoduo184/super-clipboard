@@ -11,6 +11,9 @@ src-tauri/target/
 .env
 .env.*
 !.env.example
+.tauri-keys
+.tauri-keys.backup
+.tauri-keys.pub
 
 # Logs
 *.log

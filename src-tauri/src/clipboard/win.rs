@@ -10,8 +10,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::DataExchange::{
-    AddClipboardFormatListener, CloseClipboard, GetClipboardData, IsClipboardFormatAvailable,
-    EmptyClipboard, OpenClipboard, SetClipboardData,
+    AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
+    IsClipboardFormatAvailable, OpenClipboard, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
@@ -21,11 +21,11 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
     VK_CONTROL, VK_V,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW, HWND_MESSAGE,
-    MSG, PostQuitMessage, WM_CLIPBOARDUPDATE, WM_DESTROY, WNDCLASSW,
-};
 use windows_sys::Win32::UI::Shell::{DragQueryFileW, HDROP};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostQuitMessage,
+    RegisterClassW, HWND_MESSAGE, MSG, WM_CLIPBOARDUPDATE, WM_DESTROY, WNDCLASSW,
+};
 
 use crate::blobs::write_dib_as_bmp;
 use crate::clipboard::types::{ClipboardItemDraft, ClipboardItemType};
@@ -248,7 +248,13 @@ pub fn simulate_paste_shortcut() -> Result<()> {
         keyboard_input(VK_V, true),
         keyboard_input(VK_CONTROL, true),
     ];
-    let sent = unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32) };
+    let sent = unsafe {
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_ptr(),
+            size_of::<INPUT>() as i32,
+        )
+    };
     if sent != inputs.len() as u32 {
         return Err(anyhow!("send Ctrl+V input"));
     }
@@ -302,7 +308,12 @@ fn run_message_window() -> Result<()> {
     Ok(())
 }
 
-extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+extern "system" fn window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match message {
         WM_CLIPBOARDUPDATE => {
             if let Some(lock) = CLIPBOARD_EVENT_TX.get() {
@@ -459,7 +470,11 @@ fn keyboard_input(key: VIRTUAL_KEY, key_up: bool) -> INPUT {
             ki: KEYBDINPUT {
                 wVk: key,
                 wScan: 0,
-                dwFlags: if key_up { KEYEVENTF_KEYUP } else { Default::default() },
+                dwFlags: if key_up {
+                    KEYEVENTF_KEYUP
+                } else {
+                    Default::default()
+                },
                 time: 0,
                 dwExtraInfo: 0,
             },

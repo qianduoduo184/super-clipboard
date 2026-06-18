@@ -14,15 +14,16 @@ pub fn register_shortcut(
     let handle = app.clone();
     let shortcut_for_handler = shortcut_text.to_string();
 
-    app.global_shortcut().on_shortcut(shortcut, move |_app, _shortcut, _event| {
-        if let Some(window) = handle.get_webview_window("main") {
-            crate::diagnostics::info(format!(
-                "shortcuts: {shortcut_for_handler} pressed, showing main window"
-            ));
-            let _ = window.show();
-            let _ = window.set_focus();
-        }
-    })?;
+    app.global_shortcut()
+        .on_shortcut(shortcut, move |_app, _shortcut, _event| {
+            if let Some(window) = handle.get_webview_window("main") {
+                crate::diagnostics::info(format!(
+                    "shortcuts: {shortcut_for_handler} pressed, showing main window"
+                ));
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        })?;
     if let Ok(mut guard) = current_shortcut.lock() {
         *guard = Some(shortcut_text.to_string());
     }
@@ -65,7 +66,9 @@ pub fn replace_shortcut(
     match register_shortcut(app, next_shortcut, current_shortcut.clone()) {
         Ok(()) => Ok(()),
         Err(error) => {
-            crate::diagnostics::error(format!("shortcuts: failed to register {next_shortcut}: {error}"));
+            crate::diagnostics::error(format!(
+                "shortcuts: failed to register {next_shortcut}: {error}"
+            ));
             if let Some(previous) = previous_shortcut {
                 let _ = register_shortcut(app, &previous, current_shortcut);
             }
@@ -81,9 +84,7 @@ pub fn validate_shortcut(shortcut_text: &str) -> anyhow::Result<()> {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
 
-    let has_modifier = parts
-        .iter()
-        .any(|part| matches_modifier(part));
+    let has_modifier = parts.iter().any(|part| matches_modifier(part));
     let has_key = parts.iter().any(|part| !matches_modifier(part));
 
     if !has_modifier || !has_key {

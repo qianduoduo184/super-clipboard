@@ -2,7 +2,8 @@ use tauri::{AppHandle, State};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_updater::UpdaterExt;
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 
 use crate::storage::repository::{ClipboardItem, SearchFilters};
 use crate::system::settings::AppSettings;
@@ -69,7 +70,10 @@ pub fn search_items(
 }
 
 #[tauri::command]
-pub fn get_item_detail(state: State<'_, AppState>, id: String) -> Result<Option<ClipboardItem>, String> {
+pub fn get_item_detail(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Option<ClipboardItem>, String> {
     crate::diagnostics::info(format!("command: get_item_detail id={id}"));
     let repository = state.repository.lock().map_err(|error| error.to_string())?;
     repository.get_item(&id).map_err(|error| error.to_string())
@@ -139,28 +143,36 @@ pub fn paste_item(state: State<'_, AppState>, id: String) -> Result<(), String> 
 pub fn toggle_favorite(state: State<'_, AppState>, id: String) -> Result<(), String> {
     crate::diagnostics::info(format!("command: toggle_favorite id={id}"));
     let repository = state.repository.lock().map_err(|error| error.to_string())?;
-    repository.toggle_favorite(&id).map_err(|error| error.to_string())
+    repository
+        .toggle_favorite(&id)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub fn toggle_pin(state: State<'_, AppState>, id: String) -> Result<(), String> {
     crate::diagnostics::info(format!("command: toggle_pin id={id}"));
     let repository = state.repository.lock().map_err(|error| error.to_string())?;
-    repository.toggle_pin(&id).map_err(|error| error.to_string())
+    repository
+        .toggle_pin(&id)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub fn delete_item(state: State<'_, AppState>, id: String) -> Result<(), String> {
     crate::diagnostics::info(format!("command: delete_item id={id}"));
     let repository = state.repository.lock().map_err(|error| error.to_string())?;
-    repository.soft_delete(&id).map_err(|error| error.to_string())
+    repository
+        .soft_delete(&id)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub fn reorder_items(state: State<'_, AppState>, ids: Vec<String>) -> Result<(), String> {
     crate::diagnostics::info(format!("command: reorder_items count={}", ids.len()));
     let repository = state.repository.lock().map_err(|error| error.to_string())?;
-    repository.reorder_items(&ids).map_err(|error| error.to_string())
+    repository
+        .reorder_items(&ids)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -190,7 +202,10 @@ pub fn update_settings(
     crate::diagnostics::info("command: update_settings");
     let (current_shortcut, current_update_check_date) = {
         let settings = state.settings.lock().map_err(|error| error.to_string())?;
-        (settings.global_shortcut.clone(), settings.last_update_check_date.clone())
+        (
+            settings.global_shortcut.clone(),
+            settings.last_update_check_date.clone(),
+        )
     };
     let mut next_settings = next_settings;
     next_settings.global_shortcut = current_shortcut;
@@ -207,18 +222,27 @@ pub fn update_settings(
     {
         let repository = state.repository.lock().map_err(|error| error.to_string())?;
         repository
-            .prune_history(next_settings.max_history_items, next_settings.retention_days)
+            .prune_history(
+                next_settings.max_history_items,
+                next_settings.retention_days,
+            )
             .map_err(|error| error.to_string())?;
     }
     Ok(next_settings)
 }
 
 #[tauri::command]
-pub async fn check_update(app: AppHandle, state: State<'_, AppState>) -> Result<UpdateInfo, String> {
+pub async fn check_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<UpdateInfo, String> {
     crate::diagnostics::info("command: check_update");
 
     let current_version = app.package_info().version.to_string();
-    crate::diagnostics::info(format!("check_update: current version = {}", current_version));
+    crate::diagnostics::info(format!(
+        "check_update: current version = {}",
+        current_version
+    ));
 
     let today = chrono::Local::now().date_naive().to_string();
     let update = app
@@ -238,7 +262,10 @@ pub async fn check_update(app: AppHandle, state: State<'_, AppState>) -> Result<
 
     Ok(match update {
         Some(update) => {
-            crate::diagnostics::info(format!("check_update: new version available = {}", update.version));
+            crate::diagnostics::info(format!(
+                "check_update: new version available = {}",
+                update.version
+            ));
             UpdateInfo {
                 available: true,
                 version: Some(update.version.to_string()),
@@ -309,7 +336,9 @@ pub fn set_global_shortcut(
 pub fn clear_history(state: State<'_, AppState>) -> Result<(), String> {
     crate::diagnostics::warn("command: clear_history");
     let repository = state.repository.lock().map_err(|error| error.to_string())?;
-    repository.clear_history().map_err(|error| error.to_string())?;
+    repository
+        .clear_history()
+        .map_err(|error| error.to_string())?;
     crate::blobs::clear_blob_dir(&state.blob_dir).map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -383,8 +412,67 @@ fn html_to_plain_text(value: &str) -> String {
 }
 
 fn push_spacing(output: &mut String) {
-    if !output.chars().last().map(char::is_whitespace).unwrap_or(false) {
+    if !output
+        .chars()
+        .last()
+        .map(char::is_whitespace)
+        .unwrap_or(false)
+    {
         output.push(' ');
+    }
+}
+
+fn validate_migration_paths(old_dir: &Path, new_dir: &Path) -> Result<(), String> {
+    let old_dir = old_dir
+        .canonicalize()
+        .map_err(|e| format!("解析源目录失败: {}", e))?;
+    let new_dir = if new_dir.exists() {
+        new_dir
+            .canonicalize()
+            .map_err(|e| format!("解析新目录失败: {}", e))?
+    } else {
+        let parent = new_dir
+            .parent()
+            .ok_or_else(|| "新目录路径无效".to_string())?;
+        let parent = parent
+            .canonicalize()
+            .map_err(|e| format!("解析新目录父目录失败: {}", e))?;
+        parent.join(
+            new_dir
+                .file_name()
+                .ok_or_else(|| "新目录路径无效".to_string())?,
+        )
+    };
+
+    if old_dir == new_dir {
+        return Err("新目录不能与源目录相同".to_string());
+    }
+    if new_dir.starts_with(&old_dir) {
+        return Err("新目录不能位于源目录内部".to_string());
+    }
+    if old_dir.starts_with(&new_dir) {
+        return Err("源目录不能位于新目录内部".to_string());
+    }
+    Ok(())
+}
+
+fn safe_backup_blob_filename(filename: &str) -> Result<String, String> {
+    let path = Path::new(filename);
+    if path.is_absolute() {
+        return Err("blob 文件名不能是绝对路径".to_string());
+    }
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(name)), None) => {
+            let name = name
+                .to_str()
+                .ok_or_else(|| "blob 文件名必须是有效文本".to_string())?;
+            if name.is_empty() {
+                return Err("blob 文件名不能为空".to_string());
+            }
+            Ok(name.to_string())
+        }
+        _ => Err("blob 文件名不能包含路径分隔符或上级目录".to_string()),
     }
 }
 
@@ -394,9 +482,7 @@ fn push_spacing(output: &mut String) {
 pub async fn select_directory() -> Result<Option<String>, String> {
     use rfd::FileDialog;
 
-    let selected = FileDialog::new()
-        .set_title("选择目录")
-        .pick_folder();
+    let selected = FileDialog::new().set_title("选择目录").pick_folder();
 
     Ok(selected.map(|path| path.to_string_lossy().to_string()))
 }
@@ -408,8 +494,6 @@ pub async fn migrate_directory(
     move_files: bool,
 ) -> Result<(), String> {
     use std::fs;
-    use std::path::PathBuf;
-
     let old_dir = PathBuf::from(&old_path);
     let new_dir = PathBuf::from(&new_path);
 
@@ -422,6 +506,7 @@ pub async fn migrate_directory(
     if !old_dir.exists() {
         return Err(format!("源目录不存在: {}", old_path));
     }
+    validate_migration_paths(&old_dir, &new_dir)?;
 
     // 创建新目录
     fs::create_dir_all(&new_dir).map_err(|e| format!("创建新目录失败: {}", e))?;
@@ -508,13 +593,15 @@ pub fn update_storage_settings(
 
 #[tauri::command]
 pub async fn export_backup(state: State<'_, AppState>) -> Result<String, String> {
+    use chrono::Utc;
     use rfd::FileDialog;
     use std::fs;
-    use chrono::Utc;
 
     // 选择保存路径
-    let default_filename = format!("super-clipboard-backup-{}.json",
-        Utc::now().format("%Y%m%d-%H%M%S"));
+    let default_filename = format!(
+        "super-clipboard-backup-{}.json",
+        Utc::now().format("%Y%m%d-%H%M%S")
+    );
 
     let save_path = FileDialog::new()
         .set_title("导出备份")
@@ -530,31 +617,59 @@ pub async fn export_backup(state: State<'_, AppState>) -> Result<String, String>
 
     // 读取所有数据
     let repository = state.repository.lock().map_err(|e| e.to_string())?;
-    let all_items = repository
-        .search("".to_string(), SearchFilters { item_type: None, favorites_only: false }, 100000, None)
+    let mut all_items = repository
+        .search(
+            "".to_string(),
+            SearchFilters {
+                item_type: None,
+                favorites_only: false,
+            },
+            100000,
+            None,
+        )
         .map_err(|e| format!("读取数据失败: {}", e))?;
 
     drop(repository);
 
     // 收集关联的 blob 文件
     let mut blobs = Vec::new();
-    for item in &all_items {
+    for item in &mut all_items {
         if let Some(content_path) = &item.content_path {
-            let blob_path = state.blob_dir.join(content_path);
+            let content_path = Path::new(content_path);
+            let blob_path = if content_path.is_absolute() {
+                content_path.to_path_buf()
+            } else {
+                state.blob_dir.join(content_path)
+            };
             if blob_path.exists() {
+                let Some(filename) = blob_path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_string)
+                else {
+                    crate::diagnostics::warn(format!(
+                        "export_backup: skipped blob with invalid filename {}",
+                        blob_path.display()
+                    ));
+                    item.content_path = None;
+                    continue;
+                };
                 match fs::read(&blob_path) {
                     Ok(data) => {
                         blobs.push(BlobData {
                             item_id: item.id.clone(),
-                            filename: content_path.clone(),
+                            filename: filename.clone(),
                             data_base64: base64_encode(&data),
                         });
+                        item.content_path = Some(filename);
                     }
                     Err(e) => {
                         crate::diagnostics::warn(format!(
                             "export_backup: failed to read blob {}: {}",
-                            content_path, e
+                            blob_path.display(),
+                            e
                         ));
+                        item.content_path = None;
                     }
                 }
             }
@@ -573,11 +688,9 @@ pub async fn export_backup(state: State<'_, AppState>) -> Result<String, String>
     };
 
     // 写入文件
-    let json = serde_json::to_string_pretty(&backup)
-        .map_err(|e| format!("序列化失败: {}", e))?;
+    let json = serde_json::to_string_pretty(&backup).map_err(|e| format!("序列化失败: {}", e))?;
 
-    fs::write(&save_path, json)
-        .map_err(|e| format!("写入文件失败: {}", e))?;
+    fs::write(&save_path, json).map_err(|e| format!("写入文件失败: {}", e))?;
 
     crate::diagnostics::info(format!(
         "export_backup: success, {} items, {} blobs",
@@ -604,11 +717,11 @@ pub async fn select_backup_file() -> Result<Option<String>, String> {
 pub async fn parse_backup_info(backup_path: String) -> Result<BackupInfo, String> {
     use std::fs;
 
-    let content = fs::read_to_string(&backup_path)
-        .map_err(|e| format!("读取备份文件失败: {}", e))?;
+    let content =
+        fs::read_to_string(&backup_path).map_err(|e| format!("读取备份文件失败: {}", e))?;
 
-    let backup: BackupData = serde_json::from_str(&content)
-        .map_err(|e| format!("解析备份文件失败: {}", e))?;
+    let backup: BackupData =
+        serde_json::from_str(&content).map_err(|e| format!("解析备份文件失败: {}", e))?;
 
     Ok(BackupInfo {
         created_at: backup.metadata.created_at,
@@ -623,17 +736,20 @@ pub async fn import_backup(
     backup_path: String,
     merge: bool,
 ) -> Result<usize, String> {
-    use std::fs;
     use chrono::Utc;
+    use std::fs;
 
-    crate::diagnostics::info(format!("import_backup: path={} merge={}", backup_path, merge));
+    crate::diagnostics::info(format!(
+        "import_backup: path={} merge={}",
+        backup_path, merge
+    ));
 
     // 读取备份文件
-    let content = fs::read_to_string(&backup_path)
-        .map_err(|e| format!("读取备份文件失败: {}", e))?;
+    let content =
+        fs::read_to_string(&backup_path).map_err(|e| format!("读取备份文件失败: {}", e))?;
 
-    let backup: BackupData = serde_json::from_str(&content)
-        .map_err(|e| format!("解析备份文件失败: {}", e))?;
+    let backup: BackupData =
+        serde_json::from_str(&content).map_err(|e| format!("解析备份文件失败: {}", e))?;
 
     // 创建临时备份（防止误操作）
     if !merge {
@@ -644,7 +760,15 @@ pub async fn import_backup(
 
         let repository = state.repository.lock().map_err(|e| e.to_string())?;
         let current_items = repository
-            .search("".to_string(), SearchFilters { item_type: None, favorites_only: false }, 100000, None)
+            .search(
+                "".to_string(),
+                SearchFilters {
+                    item_type: None,
+                    favorites_only: false,
+                },
+                100000,
+                None,
+            )
             .map_err(|e| format!("创建临时备份失败: {}", e))?;
         drop(repository);
 
@@ -661,16 +785,20 @@ pub async fn import_backup(
         let temp_json = serde_json::to_string_pretty(&temp_backup)
             .map_err(|e| format!("序列化临时备份失败: {}", e))?;
 
-        fs::write(&temp_backup_path, temp_json)
-            .map_err(|e| format!("写入临时备份失败: {}", e))?;
+        fs::write(&temp_backup_path, temp_json).map_err(|e| format!("写入临时备份失败: {}", e))?;
 
-        crate::diagnostics::info(format!("import_backup: temp backup created at {}", temp_backup_path.display()));
+        crate::diagnostics::info(format!(
+            "import_backup: temp backup created at {}",
+            temp_backup_path.display()
+        ));
     }
 
     // 如果是覆盖模式，清空现有数据
     if !merge {
         let repository = state.repository.lock().map_err(|e| e.to_string())?;
-        repository.clear_history().map_err(|e| format!("清空历史失败: {}", e))?;
+        repository
+            .clear_history()
+            .map_err(|e| format!("清空历史失败: {}", e))?;
         drop(repository);
 
         crate::blobs::clear_blob_dir(&state.blob_dir)
@@ -680,20 +808,30 @@ pub async fn import_backup(
     }
 
     // 恢复 blob 文件
+    let mut restored_blob_paths = HashMap::new();
     for blob in &backup.blobs {
-        let blob_path = state.blob_dir.join(&blob.filename);
+        let filename = safe_backup_blob_filename(&blob.filename)?;
+        let blob_path = state.blob_dir.join(&filename);
         let data = base64_decode(&blob.data_base64)
             .map_err(|e| format!("解码 blob {} 失败: {}", blob.filename, e))?;
 
         fs::write(&blob_path, data)
             .map_err(|e| format!("写入 blob {} 失败: {}", blob.filename, e))?;
+        restored_blob_paths.insert(
+            blob.item_id.clone(),
+            blob_path.to_string_lossy().to_string(),
+        );
     }
 
     // 导入数据到数据库
     let repository = state.repository.lock().map_err(|e| e.to_string())?;
     let mut imported_count = 0;
 
-    for item in backup.items {
+    for mut item in backup.items {
+        if item.content_path.is_some() {
+            item.content_path = restored_blob_paths.get(&item.id).cloned();
+        }
+
         // 在合并模式下，检查是否已存在相同 hash 的记录
         if merge {
             if let Ok(Some(_)) = repository.find_by_hash(&item.hash) {
@@ -703,7 +841,8 @@ pub async fn import_backup(
 
         // 插入记录（需要实现 insert_item 方法）
         // 注意：这里需要修改 repository 以支持直接插入完整的 ClipboardItem
-        repository.insert_imported_item(&item)
+        repository
+            .insert_imported_item(&item)
             .map_err(|e| format!("导入记录失败: {}", e))?;
 
         imported_count += 1;
@@ -711,24 +850,31 @@ pub async fn import_backup(
 
     drop(repository);
 
-    crate::diagnostics::info(format!("import_backup: success, imported {} items", imported_count));
+    crate::diagnostics::info(format!(
+        "import_backup: success, imported {} items",
+        imported_count
+    ));
 
     Ok(imported_count)
 }
 
 fn base64_encode(data: &[u8]) -> String {
-    use base64::{Engine as _, engine::general_purpose};
+    use base64::{engine::general_purpose, Engine as _};
     general_purpose::STANDARD.encode(data)
 }
 
 fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
-    use base64::{Engine as _, engine::general_purpose};
-    general_purpose::STANDARD.decode(s).map_err(|e| e.to_string())
+    use base64::{engine::general_purpose, Engine as _};
+    general_purpose::STANDARD
+        .decode(s)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::html_to_plain_text;
+    use std::path::Path;
+
+    use super::{html_to_plain_text, safe_backup_blob_filename, validate_migration_paths};
 
     #[test]
     fn html_to_plain_text_removes_tags_and_decodes_common_entities() {
@@ -741,5 +887,42 @@ mod tests {
     #[test]
     fn html_to_plain_text_keeps_text_between_bare_ampersands() {
         assert_eq!(html_to_plain_text("A & B & C"), "A & B & C");
+    }
+
+    #[test]
+    fn safe_backup_blob_filename_rejects_path_traversal() {
+        assert!(safe_backup_blob_filename("../escape.bmp").is_err());
+        assert!(safe_backup_blob_filename("nested/file.bmp").is_err());
+        assert!(safe_backup_blob_filename("C:\\temp\\escape.bmp").is_err());
+        assert_eq!(
+            safe_backup_blob_filename("image.bmp").expect("safe filename"),
+            "image.bmp"
+        );
+    }
+
+    #[test]
+    fn validate_migration_paths_rejects_nested_destination() {
+        let temp =
+            std::env::temp_dir().join(format!("super-clipboard-migrate-{}", uuid::Uuid::new_v4()));
+        let old_dir = temp.join("old");
+        let nested_new_dir = old_dir.join("backup");
+        std::fs::create_dir_all(&old_dir).expect("old dir");
+
+        let result = validate_migration_paths(&old_dir, &nested_new_dir);
+
+        assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(Path::new(&temp));
+    }
+
+    #[test]
+    fn validate_migration_paths_rejects_same_directory() {
+        let temp =
+            std::env::temp_dir().join(format!("super-clipboard-migrate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp).expect("temp dir");
+
+        let result = validate_migration_paths(&temp, &temp);
+
+        assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(Path::new(&temp));
     }
 }

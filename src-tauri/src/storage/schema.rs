@@ -19,6 +19,11 @@ CREATE TABLE IF NOT EXISTS clipboard_items (
   deleted_at INTEGER
 );
 
+CREATE VIRTUAL TABLE IF NOT EXISTS clipboard_items_fts
+USING fts5(id UNINDEXED, preview, content);
+"#;
+
+pub const INDEX_SQL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_clipboard_items_updated_at
 ON clipboard_items(updated_at DESC);
 
@@ -31,7 +36,4 @@ ON clipboard_items(item_type, updated_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_clipboard_items_pinned_updated_at
 ON clipboard_items(pinned DESC, updated_at DESC);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS clipboard_items_fts
-USING fts5(id UNINDEXED, preview, content);
 "#;
