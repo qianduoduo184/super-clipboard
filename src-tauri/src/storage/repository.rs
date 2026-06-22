@@ -121,6 +121,29 @@ mod tests {
     }
 
     #[test]
+    fn search_finds_cjk_substring() {
+        let repository = open_test_repository();
+        repository
+            .insert_or_touch(text_draft("同步组织排序码到云之家"))
+            .expect("insert");
+
+        let results = repository
+            .search(
+                "云之家".to_string(),
+                SearchFilters {
+                    item_type: Some("text".to_string()),
+                    favorites_only: false,
+                },
+                10,
+                None,
+            )
+            .expect("search");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].preview, "同步组织排序码到云之家");
+    }
+
+    #[test]
     fn insert_or_touch_allows_reinserting_soft_deleted_content() {
         let repository = open_test_repository();
 
@@ -644,7 +667,8 @@ fn to_fts_query(raw: &str) -> String {
             if cleaned.is_empty() {
                 String::new()
             } else {
-                format!("\"{}\"", cleaned)
+                // Use prefix match for better substring matching (especially for CJK)
+                format!("\"{}\"*", cleaned)
             }
         })
         .filter(|s| !s.is_empty())
