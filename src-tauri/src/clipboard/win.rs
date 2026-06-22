@@ -32,6 +32,7 @@ use crate::clipboard::types::{ClipboardItemDraft, ClipboardItemType};
 
 // DROPFILES structure for CF_HDROP
 #[repr(C)]
+#[allow(non_snake_case)]
 struct DROPFILES {
     pFiles: u32,
     pt: POINT,

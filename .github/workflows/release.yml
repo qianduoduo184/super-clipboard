@@ -78,7 +78,8 @@ jobs:
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
           # Update version in tauri.conf.json to include build number
-          $fullVersion = "${version}+build.${nextBuild}"
+          # Tauri requires build metadata to be numeric-only, so use "+5" instead of "+build.5"
+          $fullVersion = "${version}+${nextBuild}"
           $config.version = $fullVersion
           $config | ConvertTo-Json -Depth 100 | Set-Content "src-tauri\tauri.conf.json" -Encoding utf8
           Write-Host "Updated tauri.conf.json version to: $fullVersion"

@@ -9,8 +9,8 @@ export async function getCurrentVersion(): Promise<string> {
 
   try {
     const rawVersion = await getVersion();
-    // Format: "1.0.3+build.5" -> "v1.0.3 build 5"
-    const match = rawVersion.match(/^(\d+\.\d+\.\d+)\+build\.(\d+)$/);
+    // Format: "1.0.3+5" -> "v1.0.3 build 5"
+    const match = rawVersion.match(/^(\d+\.\d+\.\d+)\+(\d+)$/);
     if (match) {
       cachedVersion = `v${match[1]} build ${match[2]}`;
     } else {
