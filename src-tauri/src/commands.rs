@@ -431,7 +431,7 @@ fn validate_migration_paths(old_dir: &Path, new_dir: &Path) -> Result<(), String
     // This prevents symlink-based path traversal attacks
     if !new_dir.exists() {
         std::fs::create_dir_all(new_dir)
-            .map_err(|e| format!("创建新目录失败: ", e))?;
+            .map_err(|e| format!("创建新目录失败: {}", e))?;
     }
 
     let new_dir = new_dir
