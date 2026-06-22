@@ -47,7 +47,13 @@ pub fn write_dib_as_bmp(blob_dir: &Path, dib_bytes: &[u8]) -> anyhow::Result<Pat
     let path = build_blob_path(blob_dir, "bmp");
     let bmp_bytes = bmp_file_from_dib(dib_bytes)?;
     fs::write(&path, bmp_bytes)?;
-    let _ = create_thumbnail(&path);
+    if let Err(e) = create_thumbnail(&path) {
+        crate::diagnostics::warn(format!(
+            "blobs: thumbnail creation failed for {}: {}",
+            path.display(),
+            e
+        ));
+    }
     Ok(path)
 }
 

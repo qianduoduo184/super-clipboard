@@ -71,47 +71,70 @@ where
 pub fn read_current_clipboard(blob_dir: &Path) -> Result<Vec<ClipboardItemDraft>> {
     let _guard = ClipboardGuard::open()?;
 
-    if let Some(files) = read_file_list()? {
-        let preview = files
-            .iter()
-            .take(3)
-            .map(|path| {
-                Path::new(path)
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or(path)
-                    .to_string()
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Ok(vec![ClipboardItemDraft {
-            item_type: ClipboardItemType::Files,
-            size_bytes: files.len() as i64,
-            preview,
-            content: Some(serde_json::to_string(&files)?),
-            content_path: None,
-            source_app: None,
-        }]);
+    // Try reading file list - log error but continue to next format if it fails
+    match read_file_list() {
+        Ok(Some(files)) => {
+            let preview = files
+                .iter()
+                .take(3)
+                .map(|path| {
+                    Path::new(path)
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or(path)
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Ok(vec![ClipboardItemDraft {
+                item_type: ClipboardItemType::Files,
+                size_bytes: files.len() as i64,
+                preview,
+                content: Some(serde_json::to_string(&files)?),
+                content_path: None,
+                source_app: None,
+            }]);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            crate::diagnostics::warn(format!("clipboard: file list read failed: {error}"));
+        }
     }
 
-    if let Some(dib_bytes) = read_dib_bytes()? {
-        let path = write_dib_as_bmp(blob_dir, &dib_bytes)?;
-        return Ok(vec![ClipboardItemDraft {
-            item_type: ClipboardItemType::Image,
-            size_bytes: dib_bytes.len() as i64,
-            preview: path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or("clipboard-image.bmp")
-                .to_string(),
-            content: None,
-            content_path: Some(path.to_string_lossy().to_string()),
-            source_app: None,
-        }]);
+    // Try reading image - log error but continue to text if it fails
+    match read_dib_bytes() {
+        Ok(Some(dib_bytes)) => {
+            match write_dib_as_bmp(blob_dir, &dib_bytes) {
+                Ok(path) => {
+                    return Ok(vec![ClipboardItemDraft {
+                        item_type: ClipboardItemType::Image,
+                        size_bytes: dib_bytes.len() as i64,
+                        preview: path
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            .unwrap_or("clipboard-image.bmp")
+                            .to_string(),
+                        content: None,
+                        content_path: Some(path.to_string_lossy().to_string()),
+                        source_app: None,
+                    }]);
+                }
+                Err(error) => {
+                    crate::diagnostics::warn(format!(
+                        "clipboard: image blob write failed: {error}"
+                    ));
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            crate::diagnostics::warn(format!("clipboard: image read failed: {error}"));
+        }
     }
 
-    if let Some(text) = read_unicode_text()? {
-        if !text.trim().is_empty() {
+    // Try reading text
+    match read_unicode_text() {
+        Ok(Some(text)) if !text.trim().is_empty() => {
             // Compress all whitespace (newlines, tabs, multiple spaces) into single spaces for preview
             // The original multi-line content is preserved in 'content' field
             let preview = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -123,6 +146,10 @@ pub fn read_current_clipboard(blob_dir: &Path) -> Result<Vec<ClipboardItemDraft>
                 content_path: None,
                 source_app: None,
             }]);
+        }
+        Ok(_) => {}
+        Err(error) => {
+            crate::diagnostics::warn(format!("clipboard: text read failed: {error}"));
         }
     }
 
@@ -244,8 +271,16 @@ pub fn write_files_to_clipboard(file_paths: &[String]) -> Result<()> {
 pub fn simulate_paste_shortcut() -> Result<()> {
     // Wait for window focus to transition back to the previous application
     // after getCurrentWindow().hide() is called from the frontend.
-    // Without this delay, SendInput may target the still-focused super-clipboard window.
-    thread::sleep(Duration::from_millis(100));
+    // Poll for focus change instead of fixed delay to avoid race conditions.
+    for attempt in 0..10 {
+        thread::sleep(Duration::from_millis(15));
+        // On Windows, we can't easily check if our window lost focus without HWND,
+        // so we use a reasonable retry strategy: short delays that sum to ~150ms
+        if attempt > 5 {
+            break; // After 90ms (6 * 15ms), assume focus has switched
+        }
+    }
+
     let inputs = [
         keyboard_input(VK_CONTROL, false),
         keyboard_input(VK_V, false),

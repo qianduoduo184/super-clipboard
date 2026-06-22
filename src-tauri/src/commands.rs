@@ -426,23 +426,17 @@ fn validate_migration_paths(old_dir: &Path, new_dir: &Path) -> Result<(), String
     let old_dir = old_dir
         .canonicalize()
         .map_err(|e| format!("解析源目录失败: {}", e))?;
-    let new_dir = if new_dir.exists() {
-        new_dir
-            .canonicalize()
-            .map_err(|e| format!("解析新目录失败: {}", e))?
-    } else {
-        let parent = new_dir
-            .parent()
-            .ok_or_else(|| "新目录路径无效".to_string())?;
-        let parent = parent
-            .canonicalize()
-            .map_err(|e| format!("解析新目录父目录失败: {}", e))?;
-        parent.join(
-            new_dir
-                .file_name()
-                .ok_or_else(|| "新目录路径无效".to_string())?,
-        )
-    };
+
+    // Create the new directory first to ensure it can be safely canonicalized
+    // This prevents symlink-based path traversal attacks
+    if !new_dir.exists() {
+        std::fs::create_dir_all(new_dir)
+            .map_err(|e| format!("创建新目录失败: ", e))?;
+    }
+
+    let new_dir = new_dir
+        .canonicalize()
+        .map_err(|e| format!("解析新目录失败: {}", e))?;
 
     if old_dir == new_dir {
         return Err("新目录不能与源目录相同".to_string());
@@ -808,7 +802,7 @@ pub async fn import_backup(
     }
 
     // 恢复 blob 文件
-    let mut restored_blob_paths = HashMap::new();
+    let mut restored_blob_map: HashMap<String, String> = HashMap::new();
     for blob in &backup.blobs {
         let filename = safe_backup_blob_filename(&blob.filename)?;
         let blob_path = state.blob_dir.join(&filename);
@@ -817,10 +811,9 @@ pub async fn import_backup(
 
         fs::write(&blob_path, data)
             .map_err(|e| format!("写入 blob {} 失败: {}", blob.filename, e))?;
-        restored_blob_paths.insert(
-            blob.item_id.clone(),
-            blob_path.to_string_lossy().to_string(),
-        );
+
+        // Use filename as key to avoid confusion with ID conflicts in merge mode
+        restored_blob_map.insert(blob.filename.clone(), blob_path.to_string_lossy().to_string());
     }
 
     // 导入数据到数据库
@@ -828,8 +821,9 @@ pub async fn import_backup(
     let mut imported_count = 0;
 
     for mut item in backup.items {
-        if item.content_path.is_some() {
-            item.content_path = restored_blob_paths.get(&item.id).cloned();
+        // Restore blob path using the original filename from backup
+        if let Some(original_filename) = &item.content_path {
+            item.content_path = restored_blob_map.get(original_filename).cloned();
         }
 
         // 在合并模式下，检查是否已存在相同 hash 的记录

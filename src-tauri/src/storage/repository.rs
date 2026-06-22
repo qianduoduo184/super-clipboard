@@ -295,7 +295,7 @@ impl ClipboardRepository {
 
     pub fn insert_or_touch(&self, draft: ClipboardItemDraft) -> anyhow::Result<ClipboardItem> {
         let hash = draft.stable_hash();
-        let now = Utc::now().timestamp_millis();
+        let now = Utc::now().timestamp_micros();
 
         if let Some(existing_id) = self
             .conn
@@ -340,7 +340,7 @@ impl ClipboardRepository {
     }
 
     pub fn reorder_items(&self, ids: &[String]) -> anyhow::Result<()> {
-        let now = Utc::now().timestamp_millis();
+        let now = Utc::now().timestamp_micros();
         for (index, id) in ids.iter().enumerate() {
             let rank = now.saturating_sub(index as i64);
             self.conn.execute(
@@ -427,7 +427,7 @@ impl ClipboardRepository {
         let blob_paths = self.content_paths_for_ids(&[id.to_string()])?;
         self.conn.execute(
             "UPDATE clipboard_items SET deleted_at = ?1 WHERE id = ?2",
-            params![Utc::now().timestamp_millis(), id],
+            params![Utc::now().timestamp_micros(), id],
         )?;
         self.remove_deleted_from_fts()?;
         remove_blob_paths(&blob_paths)?;
@@ -435,10 +435,10 @@ impl ClipboardRepository {
     }
 
     pub fn prune_history(&self, max_history_items: i64, retention_days: i64) -> anyhow::Result<()> {
-        let now = Utc::now().timestamp_millis();
+        let now = Utc::now().timestamp_micros();
 
         if retention_days > 0 {
-            let cutoff = now - retention_days.saturating_mul(24 * 60 * 60 * 1000);
+            let cutoff = now - retention_days.saturating_mul(24 * 60 * 60 * 1_000_000);
             let blob_paths = self.content_paths_for_retention_cutoff(cutoff)?;
             self.conn.execute(
                 "UPDATE clipboard_items
@@ -633,7 +633,21 @@ impl ClipboardRepository {
 
 fn to_fts_query(raw: &str) -> String {
     raw.split_whitespace()
-        .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+        .map(|token| {
+            // Escape double quotes and strip FTS5 special characters
+            let escaped = token.replace('"', "\"\"");
+            // Remove FTS5 operators that could break the query
+            let cleaned = escaped
+                .chars()
+                .filter(|c| !matches!(c, '*' | '^' | '(' | ')' | ':'))
+                .collect::<String>();
+            if cleaned.is_empty() {
+                String::new()
+            } else {
+                format!("\"{}\"", cleaned)
+            }
+        })
+        .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
 }
