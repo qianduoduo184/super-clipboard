@@ -46,6 +46,43 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Calculate version-specific build number
+        id: build-number
+        shell: pwsh
+        run: |
+          # Read current version from tauri.conf.json
+          $config = Get-Content "src-tauri\tauri.conf.json" -Raw | ConvertFrom-Json
+          $version = $config.version
+          Write-Host "Current version: $version"
+
+          # Get all tags for this version
+          git fetch --tags
+          $tags = git tag -l "super-clipboard-v${version}-*" | Sort-Object
+
+          if ($tags) {
+            # Extract build numbers and find the highest
+            $buildNumbers = $tags | ForEach-Object {
+              if ($_ -match "super-clipboard-v${version}-(\d+)") {
+                [int]$matches[1]
+              }
+            }
+            $maxBuild = ($buildNumbers | Measure-Object -Maximum).Maximum
+            $nextBuild = $maxBuild + 1
+          } else {
+            # First build for this version
+            $nextBuild = 1
+          }
+
+          Write-Host "Next build number: $nextBuild"
+          "build_number=$nextBuild" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+          # Update version in tauri.conf.json to include build number
+          $fullVersion = "${version}+build.${nextBuild}"
+          $config.version = $fullVersion
+          $config | ConvertTo-Json -Depth 100 | Set-Content "src-tauri\tauri.conf.json" -Encoding utf8
+          Write-Host "Updated tauri.conf.json version to: $fullVersion"
+
       - name: Run frontend checks
         run: npm run ci:frontend
 
@@ -71,10 +108,12 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: super-clipboard-v__VERSION__-${{ github.run_number }}
-          releaseName: super-clipboard v__VERSION__ build ${{ github.run_number }}
+          tagName: super-clipboard-v__VERSION__-${{ steps.build-number.outputs.build_number }}
+          releaseName: super-clipboard v__VERSION__ build ${{ steps.build-number.outputs.build_number }}
           releaseBody: |
             自动发版：本预发布版由 GitHub Actions 在 main 分支提交后生成。
+
+            **版本**: v${{ steps.build-number.outputs.version }} build ${{ steps.build-number.outputs.build_number }}
 
             验证内容：
             - npm test
@@ -101,10 +140,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: super-clipboard-v__VERSION__-${{ github.run_number }}
-          releaseName: super-clipboard v__VERSION__ build ${{ github.run_number }}
+          tagName: super-clipboard-v__VERSION__-${{ steps.build-number.outputs.build_number }}
+          releaseName: super-clipboard v__VERSION__ build ${{ steps.build-number.outputs.build_number }}
           releaseBody: |
             自动发版：本版本由 GitHub Actions 在 main 分支提交后生成。
+
+            **版本**: v${{ steps.build-number.outputs.version }} build ${{ steps.build-number.outputs.build_number }}
 
             验证内容：
             - npm test
