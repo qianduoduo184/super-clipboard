@@ -143,6 +143,7 @@ export default function App() {
   const [navFiltersConfig, setNavFiltersConfig] = useState<{ visible: string[] }>({ visible: ['all', 'favorites', 'text', 'image', 'files'] });
   const [navConfigOpen, setNavConfigOpen] = useState(false);
   const [draggingFilterKey, setDraggingFilterKey] = useState<string | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; item: ClipboardItem } | null>(null);
   const historyListRef = useRef<HTMLDivElement | null>(null);
   const debouncedQuery = useDebouncedValue(query, 100);
 
@@ -397,7 +398,9 @@ export default function App() {
   function handleKeyboard(event: React.KeyboardEvent<HTMLElement>) {
     if (event.key === 'Escape') {
       event.preventDefault();
-      if (navConfigOpen) {
+      if (contextMenu) {
+        setContextMenu(null);
+      } else if (navConfigOpen) {
         setNavConfigOpen(false);
       } else {
         void getCurrentWindow().hide();
@@ -513,7 +516,15 @@ export default function App() {
   }
 
   return (
-    <main className="app-shell" onKeyDown={handleKeyboard}>
+    <main
+      className="app-shell"
+      onKeyDown={handleKeyboard}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        setContextMenu(null);
+      }}
+      onClick={() => setContextMenu(null)}
+    >
       <section className="toolbar">
         <div className="title-group">
           <div className="app-mark">
@@ -592,14 +603,18 @@ export default function App() {
                       className={`nav-config-item ${draggingFilterKey === filter.key ? 'dragging' : ''}`}
                       draggable={!isAll}
                       onDragStart={() => !isAll && setDraggingFilterKey(filter.key)}
-                      onDragOver={(e) => e.preventDefault()}
+                      onDragOver={(e) => {
+                        if (!isAll) e.preventDefault();
+                      }}
                       onDrop={(e) => {
-                        e.preventDefault();
-                        void handleNavFilterReorder(filter.key);
+                        if (!isAll) {
+                          e.preventDefault();
+                          void handleNavFilterReorder(filter.key);
+                        }
                       }}
                       onDragEnd={() => setDraggingFilterKey(null)}
                     >
-                      <span className="drag-handle">::</span>
+                      <span className={`drag-handle ${isAll ? 'disabled' : ''}`}>::</span>
                       <label>
                         <input
                           type="checkbox"
@@ -621,7 +636,7 @@ export default function App() {
               ]
                 .filter((f) => !navFiltersConfig.visible.includes(f.key))
                 .map((filter) => (
-                  <div key={filter.key} className="nav-config-item">
+                  <div key={filter.key} className="nav-config-item not-draggable">
                     <span className="drag-handle" style={{ opacity: 0.3 }}>::</span>
                     <label>
                       <input
@@ -638,6 +653,51 @@ export default function App() {
         </div>
       )}
 
+      {contextMenu && (
+        <div
+          className="context-menu"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button onClick={async () => {
+            await copySelectedItem();
+            setContextMenu(null);
+          }}>
+            <Copy size={15} />
+            复制
+          </button>
+          <button onClick={async () => {
+            await pasteAndHideItem(contextMenu.item);
+            setContextMenu(null);
+          }}>
+            <Pin size={15} />
+            粘贴
+          </button>
+          <button onClick={async () => {
+            await toggleFavorite(contextMenu.item.id);
+            setContextMenu(null);
+          }}>
+            <Heart size={15} fill={contextMenu.item.favorite ? 'currentColor' : 'none'} />
+            {contextMenu.item.favorite ? '取消收藏' : '收藏'}
+          </button>
+          <button onClick={async () => {
+            await togglePin(contextMenu.item.id);
+            setContextMenu(null);
+          }}>
+            <Pin size={15} fill={contextMenu.item.pinned ? 'currentColor' : 'none'} />
+            {contextMenu.item.pinned ? '取消置顶' : '置顶'}
+          </button>
+          <div className="context-menu-divider" />
+          <button className="danger" onClick={async () => {
+            await deleteItem(contextMenu.item.id);
+            setContextMenu(null);
+          }}>
+            <Trash2 size={15} />
+            删除
+          </button>
+        </div>
+      )}
+
       <section className={previewEnabled ? 'content-grid' : 'content-grid no-preview'}>
         <div
           ref={historyListRef}
@@ -649,7 +709,7 @@ export default function App() {
           {virtualItems.map((item, idx) => {
             const actualIndex = virtualWindow.startIndex + idx;
             const itemHeight = itemHeights[actualIndex];
-            const isDraggingDisabled = query.trim() !== '' || activeFilter !== 'all';
+            const isDraggingDisabled = false;
             return (
             <button
               key={item.id}
@@ -670,6 +730,11 @@ export default function App() {
               }}
               onDragEnd={() => setDraggingId(null)}
               onClick={() => void pasteListItem(item)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setContextMenu({ x: e.clientX, y: e.clientY, item });
+              }}
             >
               {!isDraggingDisabled && (
                 <span className="drag-handle-icon">

@@ -60,7 +60,7 @@ export function getVisibleFilters(config) {
 
 export function getVisualPreview(item) {
   if (item.type === 'image') {
-    return '图片内容';
+    return '';
   }
   return normalizePreview(item.preview, 88);
 }

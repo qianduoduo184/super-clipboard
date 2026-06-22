@@ -661,6 +661,19 @@ select:focus-visible,
   cursor: grab;
 }
 
+.drag-handle.disabled {
+  cursor: not-allowed;
+  opacity: 0.3;
+}
+
+.nav-config-item.not-draggable {
+  cursor: default;
+}
+
+.nav-config-item.not-draggable .drag-handle {
+  cursor: not-allowed;
+}
+
 .nav-config-item label {
   display: flex;
   align-items: center;
@@ -715,5 +728,48 @@ select:focus-visible,
   border: 1px solid var(--border);
   border-radius: 5px;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+}
+
+.context-menu {
+  position: fixed;
+  z-index: 200;
+  min-width: 180px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+}
+
+.context-menu button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text);
+  background: transparent;
+  text-align: left;
+  font-size: 14px;
+}
+
+.context-menu button:hover {
+  background: var(--hover);
+}
+
+.context-menu button.danger {
+  color: var(--danger);
+}
+
+.context-menu button.danger:hover {
+  background: var(--danger-border);
+}
+
+.context-menu-divider {
+  height: 1px;
+  margin: 4px 0;
+  background: var(--border-soft);
 }
 

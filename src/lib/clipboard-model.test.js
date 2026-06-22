@@ -88,7 +88,7 @@ test('getVisualPreview hides image file paths and names', () => {
       type: 'image',
       preview: 'C:\\Users\\user\\AppData\\Roaming\\super-clipboard\\blobs\\image.bmp',
     }),
-    '图片内容',
+    '',
   );
 });
 
