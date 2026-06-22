@@ -1,5 +1,5 @@
 use std::ffi::c_void;
-use std::mem::size_of;
+use std::mem::{size_of, zeroed};
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::sync::mpsc::{self, Sender};
@@ -264,11 +264,9 @@ pub fn simulate_paste_shortcut() -> Result<()> {
 fn run_message_window() -> Result<()> {
     unsafe {
         let class_name = wide_null("SuperClipboardListenerWindow");
-        let window_class = WNDCLASSW {
-            lpfnWndProc: Some(window_proc),
-            lpszClassName: class_name.as_ptr(),
-            ..Default::default()
-        };
+        let mut window_class: WNDCLASSW = zeroed();
+        window_class.lpfnWndProc = Some(window_proc);
+        window_class.lpszClassName = class_name.as_ptr();
 
         if RegisterClassW(&window_class) == 0 {
             return Err(anyhow!("register clipboard listener window class"));
@@ -289,7 +287,7 @@ fn run_message_window() -> Result<()> {
             null_mut(),
             null(),
         );
-        if hwnd == Default::default() {
+        if hwnd == 0 {
             return Err(anyhow!("create clipboard listener window"));
         }
         crate::diagnostics::info("clipboard: listener message window created");
@@ -299,7 +297,7 @@ fn run_message_window() -> Result<()> {
         }
         crate::diagnostics::info("clipboard: format listener registered");
 
-        let mut message = MSG::default();
+        let mut message: MSG = zeroed();
         while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
             DispatchMessageW(&message);
         }
