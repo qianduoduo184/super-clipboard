@@ -111,10 +111,13 @@ pub fn read_current_clipboard(blob_dir: &Path) -> Result<Vec<ClipboardItemDraft>
 
     if let Some(text) = read_unicode_text()? {
         if !text.trim().is_empty() {
+            // Compress all whitespace (newlines, tabs, multiple spaces) into single spaces for preview
+            // The original multi-line content is preserved in 'content' field
+            let preview = text.split_whitespace().collect::<Vec<_>>().join(" ");
             return Ok(vec![ClipboardItemDraft {
                 item_type: ClipboardItemType::Text,
                 size_bytes: text.len() as i64,
-                preview: text.lines().next().unwrap_or_default().to_string(),
+                preview,
                 content: Some(text),
                 content_path: None,
                 source_app: None,
