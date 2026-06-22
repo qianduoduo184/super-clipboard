@@ -602,13 +602,19 @@ export default function App() {
                       key={filter.key}
                       className={`nav-config-item ${draggingFilterKey === filter.key ? 'dragging' : ''}`}
                       draggable={!isAll}
-                      onDragStart={() => !isAll && setDraggingFilterKey(filter.key)}
+                      onDragStart={(e) => {
+                        if (!isAll) {
+                          setDraggingFilterKey(filter.key);
+                        } else {
+                          e.preventDefault();
+                        }
+                      }}
                       onDragOver={(e) => {
-                        if (!isAll) e.preventDefault();
+                        e.preventDefault();
                       }}
                       onDrop={(e) => {
-                        if (!isAll) {
-                          e.preventDefault();
+                        e.preventDefault();
+                        if (!isAll && draggingFilterKey && draggingFilterKey !== filter.key) {
                           void handleNavFilterReorder(filter.key);
                         }
                       }}
@@ -736,11 +742,9 @@ export default function App() {
                 setContextMenu({ x: e.clientX, y: e.clientY, item });
               }}
             >
-              {!isDraggingDisabled && (
-                <span className="drag-handle-icon">
-                  <GripVertical size={16} />
-                </span>
-              )}
+              <span className="drag-handle-icon">
+                <GripVertical size={16} />
+              </span>
               <span className={item.type === 'image' && item.contentPath ? 'type-icon image-thumb' : 'type-icon'}>
                 {item.type === 'image' && item.contentPath ? (
                   <img src={convertFileSrc(item.contentPath)} alt="" />

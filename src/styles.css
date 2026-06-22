@@ -228,7 +228,7 @@ kbd {
 
 .history-item {
   display: grid;
-  grid-template-columns: 30px minmax(0, 1fr) 20px;
+  grid-template-columns: 24px 30px minmax(0, 1fr) 20px;
   align-items: center;
   width: 100%;
   min-height: 66px;
@@ -243,19 +243,19 @@ kbd {
 }
 
 .history-item .drag-handle-icon {
-  position: absolute;
-  left: -20px;
-  display: none;
+  display: flex;
   align-items: center;
   justify-content: center;
-  width: 20px;
+  width: 24px;
   height: 100%;
   color: var(--muted);
   cursor: grab;
+  opacity: 0;
+  transition: opacity 0.15s;
 }
 
 .history-item:hover .drag-handle-icon {
-  display: flex;
+  opacity: 1;
 }
 
 .history-item .drag-handle-icon:active {
