@@ -287,7 +287,7 @@ fn run_message_window() -> Result<()> {
             null_mut(),
             null(),
         );
-        if hwnd == 0 {
+        if hwnd == null_mut() {
             return Err(anyhow!("create clipboard listener window"));
         }
         crate::diagnostics::info("clipboard: listener message window created");

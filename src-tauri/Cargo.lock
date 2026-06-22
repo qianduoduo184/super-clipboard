@@ -3765,7 +3765,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "super-clipboard"
-version = "1.0.1"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3785,7 +3785,7 @@ dependencies = [
  "thiserror 1.0.69",
  "time",
  "uuid",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
