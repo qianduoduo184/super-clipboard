@@ -195,8 +195,8 @@ kbd {
 
 .content-grid {
   display: grid;
-  grid-template-columns: minmax(300px, 1fr) minmax(360px, 1.12fr);
-  gap: 12px;
+  grid-template-columns: minmax(300px, 1fr) 4px minmax(360px, 1.12fr);
+  gap: 0;
   margin-top: 12px;
   flex: 1;
   min-height: 0;
@@ -250,7 +250,7 @@ kbd {
   height: 100%;
   color: var(--muted);
   cursor: grab;
-  opacity: 0;
+  opacity: 0.3;
   transition: opacity 0.15s;
 }
 
@@ -265,16 +265,19 @@ kbd {
 .history-item.image-row {
   align-items: flex-start;
   padding: 12px;
+  min-height: 144px;
 }
 
 .history-item.image-row .type-icon {
   width: 120px;
   height: 120px;
   border-radius: 8px;
+  flex-shrink: 0;
 }
 
 .history-item.image-row .item-main {
-  align-self: center;
+  align-self: flex-start;
+  margin-top: 8px;
 }
 
 .history-item:hover,
@@ -337,6 +340,19 @@ kbd {
 
 .pinned-icon {
   color: var(--primary);
+}
+
+.resize-handle {
+  width: 4px;
+  background: var(--border);
+  cursor: col-resize;
+  position: relative;
+  transition: background 0.15s;
+}
+
+.resize-handle:hover,
+.resize-handle.resizing {
+  background: var(--primary);
 }
 
 .detail-pane {

@@ -20,8 +20,8 @@ test('mapBackendItemToViewItem maps backend fields to UI fields', () => {
     favorite: true,
     pinned: false,
     size_bytes: 5,
-    created_at: 100,
-    updated_at: 200,
+    created_at: 100_000,
+    updated_at: 200_000,
   });
 
   assert.deepEqual(item, {
@@ -46,8 +46,8 @@ test('mapBackendItemToViewItem falls back for unknown source and type', () => {
     favorite: false,
     pinned: false,
     size_bytes: 0,
-    created_at: 100,
-    updated_at: 200,
+    created_at: 100_000,
+    updated_at: 200_000,
   });
 
   assert.equal(item.type, 'text');
@@ -66,8 +66,8 @@ test('mapBackendItemToViewItem renders file list count as files', () => {
     favorite: false,
     pinned: false,
     size_bytes: 2,
-    created_at: 100,
-    updated_at: 200,
+    created_at: 100_000,
+    updated_at: 200_000,
   });
 
   assert.equal(item.size, '2 个文件');
@@ -83,8 +83,8 @@ test('mapBackendItemToViewItem keeps image content path for previews', () => {
     favorite: false,
     pinned: false,
     size_bytes: 2048,
-    created_at: 100,
-    updated_at: 200,
+    created_at: 100_000,
+    updated_at: 200_000,
   });
 
   assert.equal(item.contentPath, 'C:\\blob\\image.bmp');

@@ -20,7 +20,7 @@ export function mapBackendItemToViewItem(item) {
     contentPath: item.content_path ?? null,
     favorite: item.favorite,
     pinned: item.pinned || false,
-    updatedAt: item.updated_at,
+    updatedAt: Math.floor(item.updated_at / 1000),
     size: type === 'files' ? `${item.size_bytes} 个文件` : formatBytes(item.size_bytes),
     source: item.source_app || '未知来源',
   };

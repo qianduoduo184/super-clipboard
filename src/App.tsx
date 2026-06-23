@@ -144,6 +144,8 @@ export default function App() {
   const [navConfigOpen, setNavConfigOpen] = useState(false);
   const [draggingFilterKey, setDraggingFilterKey] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; item: ClipboardItem } | null>(null);
+  const [previewPaneWidth, setPreviewPaneWidth] = useState(0.47);
+  const [isResizing, setIsResizing] = useState(false);
   const historyListRef = useRef<HTMLDivElement | null>(null);
   const debouncedQuery = useDebouncedValue(query, 100);
 
@@ -433,6 +435,35 @@ export default function App() {
     }
   }
 
+  function handleResizeStart() {
+    setIsResizing(true);
+  }
+
+  useEffect(() => {
+    if (!isResizing) return;
+
+    function handleMouseMove(event: MouseEvent) {
+      const container = document.querySelector('.content-grid');
+      if (!container) return;
+      const rect = container.getBoundingClientRect();
+      const offsetX = event.clientX - rect.left;
+      const newWidth = Math.max(0.25, Math.min(0.75, offsetX / rect.width));
+      setPreviewPaneWidth(newWidth);
+    }
+
+    function handleMouseUp() {
+      setIsResizing(false);
+    }
+
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [isResizing]);
+
   async function handleRecordingChange(nextRecording: boolean) {
     if (backendAvailable) {
       await setRecordingEnabled(nextRecording);
@@ -704,7 +735,12 @@ export default function App() {
         </div>
       )}
 
-      <section className={previewEnabled ? 'content-grid' : 'content-grid no-preview'}>
+      <section
+        className={previewEnabled ? 'content-grid' : 'content-grid no-preview'}
+        style={previewEnabled ? {
+          gridTemplateColumns: `minmax(300px, ${(1 - previewPaneWidth) * 100}%) 4px minmax(360px, ${previewPaneWidth * 100}%)`
+        } : undefined}
+      >
         <div
           ref={historyListRef}
           className="history-list"
@@ -771,7 +807,12 @@ export default function App() {
         </div>
 
         {previewEnabled ? (
-          <aside className="detail-pane">
+          <>
+            <div
+              className={`resize-handle ${isResizing ? 'resizing' : ''}`}
+              onMouseDown={handleResizeStart}
+            />
+            <aside className="detail-pane">
             {selectedItem ? (
               <>
                 <div className="detail-header">
@@ -812,6 +853,7 @@ export default function App() {
               <div className="empty-state">选择一条记录查看详情</div>
             )}
           </aside>
+          </>
         ) : null}
       </section>
     </main>
