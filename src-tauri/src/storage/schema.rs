@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS clipboard_items (
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS clipboard_items_fts
-USING fts5(id UNINDEXED, preview, content);
+USING fts5(id UNINDEXED, preview, content, tokenize='trigram');
 "#;
 
 pub const INDEX_SQL: &str = r#"

@@ -247,10 +247,26 @@ pub async fn check_update(
     let today = chrono::Local::now().date_naive().to_string();
     let update = app
         .updater()
-        .map_err(|error| error.to_string())?
+        .map_err(|error| {
+            let error_msg = error.to_string();
+            crate::diagnostics::error(format!("更新检查失败: {}", error_msg));
+            if error_msg.contains("error sending request") || error_msg.contains("timeout") {
+                format!("检查更新失败: 网络连接超时。如果您在中国大陆，请检查网络连接或稍后重试。原始错误: {}", error_msg)
+            } else {
+                format!("检查更新失败: {}", error_msg)
+            }
+        })?
         .check()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            let error_msg = error.to_string();
+            crate::diagnostics::error(format!("更新检查失败: {}", error_msg));
+            if error_msg.contains("error sending request") || error_msg.contains("timeout") {
+                format!("检查更新失败: 网络连接超时。如果您在中国大陆，请检查网络连接或稍后重试。原始错误: {}", error_msg)
+            } else {
+                format!("检查更新失败: {}", error_msg)
+            }
+        })?;
 
     {
         let mut settings = state.settings.lock().map_err(|error| error.to_string())?;
@@ -288,10 +304,26 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
     crate::diagnostics::info("command: install_update");
     let Some(update) = app
         .updater()
-        .map_err(|error| error.to_string())?
+        .map_err(|error| {
+            let error_msg = error.to_string();
+            crate::diagnostics::error(format!("获取更新失败: {}", error_msg));
+            if error_msg.contains("error sending request") || error_msg.contains("timeout") {
+                format!("获取更新失败: 网络连接超时。如果您在中国大陆，请检查网络连接或稍后重试。原始错误: {}", error_msg)
+            } else {
+                format!("获取更新失败: {}", error_msg)
+            }
+        })?
         .check()
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| {
+            let error_msg = error.to_string();
+            crate::diagnostics::error(format!("获取更新失败: {}", error_msg));
+            if error_msg.contains("error sending request") || error_msg.contains("timeout") {
+                format!("获取更新失败: 网络连接超时。如果您在中国大陆，请检查网络连接或稍后重试。原始错误: {}", error_msg)
+            } else {
+                format!("获取更新失败: {}", error_msg)
+            }
+        })?
     else {
         return Err("当前没有可用更新".to_string());
     };
@@ -299,7 +331,15 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
     update
         .download_and_install(|_, _| {}, || {})
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            let error_msg = error.to_string();
+            crate::diagnostics::error(format!("下载或安装更新失败: {}", error_msg));
+            if error_msg.contains("error sending request") || error_msg.contains("timeout") {
+                format!("下载更新失败: 网络连接超时。如果您在中国大陆，请检查网络连接或稍后重试。原始错误: {}", error_msg)
+            } else {
+                format!("安装更新失败: {}", error_msg)
+            }
+        })?;
 
     // Return success and let the app restart after a short delay
     // This allows the frontend to show feedback before restart

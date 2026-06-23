@@ -216,6 +216,7 @@ cargo test
 - 首次安装时，GitHub Release 可能尚未创建，属于正常现象
 - 推送代码到 main 分支后，CI 会自动构建并发布 Release
 - 之后每日首次启动会自动检查更新
+- **中国大陆用户**：应用已配置 GitHub 镜像加速，如仍然超时请查看 [更新镜像说明](docs/UPDATE_MIRRORS.md)
 
 ## 文档
 
@@ -225,6 +226,8 @@ cargo test
 - [配置审计](docs/configuration-audit.md) - 自动更新、粘贴、托盘配置检查
 - [Windows 打包说明](docs/windows-packaging.md) - 本地构建指南
 - [Release 说明](docs/release.md) - CI/CD 和自动发版流程
+- [更新镜像说明](docs/UPDATE_MIRRORS.md) - 中国大陆用户更新加速方案
+- [测试报告](docs/TEST_REPORT.md) - 自动化测试详细报告
 - [TODO](docs/TODO.md) - 开发进度和待办事项
 
 ## 隐私说明摘要

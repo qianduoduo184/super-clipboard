@@ -45,7 +45,9 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZBQjIxRjAyMjcyOTA4NjgKUldSb0NDa25BaCt5K29JbU1xRjhlS0l6M0ZDejcrUmdyRDJuVFdxN1dNTHFHVDloQ0NBaEpDbFgK",
       "endpoints": [
-        "https://github.com/qianduoduo184/super-clipboard/releases/latest/download/latest.json"
+        "https://github.com/qianduoduo184/super-clipboard/releases/latest/download/latest.json",
+        "https://mirror.ghproxy.com/https://github.com/qianduoduo184/super-clipboard/releases/latest/download/latest.json",
+        "https://ghproxy.net/https://github.com/qianduoduo184/super-clipboard/releases/latest/download/latest.json"
       ]
     }
   }
