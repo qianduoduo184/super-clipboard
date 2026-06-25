@@ -70,13 +70,20 @@ export function reorderItemsByDrag(ids, draggedId, targetId) {
     return ids;
   }
 
-  const nextIds = ids.filter((id) => id !== draggedId);
-  const targetIndex = nextIds.indexOf(targetId);
-  if (targetIndex === -1 || ids.indexOf(draggedId) === -1) {
+  const draggedIndex = ids.indexOf(draggedId);
+  const targetIndex = ids.indexOf(targetId);
+
+  if (draggedIndex === -1 || targetIndex === -1) {
     return ids;
   }
 
-  nextIds.splice(targetIndex, 0, draggedId);
+  // Remove dragged item
+  const nextIds = ids.filter((id) => id !== draggedId);
+
+  // Insert after target (not before)
+  const newTargetIndex = nextIds.indexOf(targetId);
+  nextIds.splice(newTargetIndex + 1, 0, draggedId);
+
   return nextIds;
 }
 

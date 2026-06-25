@@ -92,10 +92,10 @@ test('getVisualPreview hides image file paths and names', () => {
   );
 });
 
-test('reorderItemsByDrag moves an item to the drop target position', () => {
+test('reorderItemsByDrag moves an item after the drop target', () => {
   assert.deepEqual(
     reorderItemsByDrag(['a', 'b', 'c', 'd'], 'd', 'b'),
-    ['a', 'd', 'b', 'c'],
+    ['a', 'b', 'd', 'c'],
   );
 });
 

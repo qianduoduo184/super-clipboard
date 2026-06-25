@@ -281,21 +281,23 @@ kbd {
 }
 
 .history-item.image-row .item-main {
-  align-self: flex-start;
-  margin-top: 8px;
+  align-self: stretch;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  justify-content: space-between;
   min-height: 120px;
+  padding-top: 0;
 }
 
 .history-item.image-row .item-preview {
   flex: 0 0 auto;
+  padding-bottom: 8px;
 }
 
 .history-item.image-row .item-meta {
-  margin-top: auto;
+  margin-top: 0;
   flex: 0 0 auto;
+  align-self: flex-start;
 }
 
 .history-item:hover,
