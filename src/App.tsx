@@ -227,6 +227,31 @@ export default function App() {
     };
   }, []);
 
+  // Window blur/hide handler: clear search and close window on blur
+  useEffect(() => {
+    let unlistenBlur: (() => void) | undefined;
+
+    getCurrentWindow()
+      .onFocusChanged(({ payload: focused }) => {
+        if (!focused) {
+          // Window lost focus, clear search and hide
+          setQuery('');
+          void getCurrentWindow().hide();
+        }
+      })
+      .then((unlisten) => {
+        unlistenBlur = unlisten;
+      })
+      .catch((error) => {
+        console.error('Failed to listen to window blur:', error);
+      });
+
+    return () => {
+      unlistenBlur?.();
+    };
+  }, []);
+
+
   useEffect(() => {
     let ignore = false;
 
@@ -404,7 +429,12 @@ export default function App() {
         setContextMenu(null);
       } else if (navConfigOpen) {
         setNavConfigOpen(false);
+      } else if (query) {
+        // Clear search query first
+        setQuery('');
       } else {
+        // Hide window and clear search
+        setQuery('');
         void getCurrentWindow().hide();
       }
       return;
