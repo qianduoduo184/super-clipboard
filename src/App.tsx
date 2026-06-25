@@ -636,12 +636,17 @@ export default function App() {
                       onDragStart={(e) => {
                         if (!isAll) {
                           setDraggingFilterKey(filter.key);
+                          e.dataTransfer.effectAllowed = 'move';
+                          e.dataTransfer.setData('text/plain', filter.key);
                         } else {
                           e.preventDefault();
                         }
                       }}
                       onDragOver={(e) => {
                         e.preventDefault();
+                        if (!isAll) {
+                          e.dataTransfer.dropEffect = 'move';
+                        }
                       }}
                       onDrop={(e) => {
                         e.preventDefault();
@@ -762,8 +767,20 @@ export default function App() {
               ].join(' ')}
               style={{ minHeight: `${itemHeight}px` }}
               draggable={!isDraggingDisabled}
-              onDragStart={() => !isDraggingDisabled && setDraggingId(item.id)}
-              onDragOver={(event) => !isDraggingDisabled && event.preventDefault()}
+              onDragStart={(e) => {
+                if (!isDraggingDisabled) {
+                  setDraggingId(item.id);
+                  // Add visual feedback
+                  e.dataTransfer.effectAllowed = 'move';
+                  e.dataTransfer.setData('text/plain', item.id);
+                }
+              }}
+              onDragOver={(event) => {
+                if (!isDraggingDisabled) {
+                  event.preventDefault();
+                  event.dataTransfer.dropEffect = 'move';
+                }
+              }}
               onDrop={(event) => {
                 if (!isDraggingDisabled) {
                   event.preventDefault();
@@ -771,7 +788,12 @@ export default function App() {
                 }
               }}
               onDragEnd={() => setDraggingId(null)}
-              onClick={() => void pasteListItem(item)}
+              onClick={(e) => {
+                // Only trigger click if not dragging
+                if (!draggingId) {
+                  void pasteListItem(item);
+                }
+              }}
               onContextMenu={(e) => {
                 e.preventDefault();
                 e.stopPropagation();

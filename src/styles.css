@@ -239,7 +239,12 @@ kbd {
   background: transparent;
   text-align: left;
   position: relative;
-  cursor: pointer;
+  cursor: grab;
+  transition: background 0.15s ease, opacity 0.15s ease;
+}
+
+.history-item:active {
+  cursor: grabbing;
 }
 
 .history-item .drag-handle-icon {
@@ -299,7 +304,10 @@ kbd {
 }
 
 .history-item.dragging {
-  opacity: 0.58;
+  opacity: 0.4;
+  background: var(--primary-soft);
+  border: 2px dashed var(--primary);
+  cursor: grabbing;
 }
 
 .type-icon {
@@ -672,10 +680,19 @@ select:focus-visible,
   border: 1px solid var(--border-soft);
   margin-bottom: 6px;
   cursor: move;
+  transition: all 0.15s ease;
+}
+
+.nav-config-item:hover {
+  background: var(--selected);
+  border-color: var(--border);
 }
 
 .nav-config-item.dragging {
-  opacity: 0.5;
+  opacity: 0.4;
+  background: var(--primary-soft);
+  border: 2px dashed var(--primary);
+  transform: scale(0.98);
 }
 
 .nav-config-item:last-child {
