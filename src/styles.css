@@ -278,6 +278,19 @@ kbd {
 .history-item.image-row .item-main {
   align-self: flex-start;
   margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 120px;
+}
+
+.history-item.image-row .item-preview {
+  flex: 0 0 auto;
+}
+
+.history-item.image-row .item-meta {
+  margin-top: auto;
+  flex: 0 0 auto;
 }
 
 .history-item:hover,
