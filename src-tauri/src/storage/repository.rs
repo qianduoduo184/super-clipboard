@@ -675,10 +675,15 @@ impl ClipboardRepository {
                 sql_params.push(Value::Text(like_pattern));
             } else {
                 // Long query: use FTS5 trigram
-                sql.push_str(
-                    " AND id IN (SELECT id FROM clipboard_items_fts WHERE clipboard_items_fts MATCH ?)",
-                );
-                sql_params.push(Value::Text(to_fts_query(trimmed)));
+                let fts_query = to_fts_query(trimmed);
+                // Only add FTS clause if sanitization produced a valid query
+                if !fts_query.is_empty() {
+                    sql.push_str(
+                        " AND id IN (SELECT id FROM clipboard_items_fts WHERE clipboard_items_fts MATCH ?)",
+                    );
+                    sql_params.push(Value::Text(fts_query));
+                }
+                // If sanitization removed everything, fall back to matching all items
             }
         }
 
@@ -931,25 +936,33 @@ impl ClipboardRepository {
 }
 
 fn to_fts_query(raw: &str) -> String {
-    // With trigram tokenizer, we can search for substrings directly
-    // Just escape quotes and wrap in quotes for phrase matching
+    // Security: Strict sanitization to prevent FTS5 injection attacks
+    // With trigram tokenizer, we search for substrings directly
     raw.split_whitespace()
-        .map(|token| {
-            // Escape double quotes
-            let escaped = token.replace('"', "\"\"");
-            // Remove FTS5 operators that could break the query
-            let cleaned = escaped
+        .filter_map(|token| {
+            // Only allow alphanumeric characters, basic punctuation, and CJK characters
+            let cleaned: String = token
                 .chars()
-                .filter(|c| !matches!(c, '*' | '^' | '(' | ')' | ':'))
-                .collect::<String>();
+                .filter(|c| {
+                    c.is_alphanumeric()
+                        || matches!(c, '-' | '_' | '.' | '@')
+                        || (*c >= '\u{4E00}' && *c <= '\u{9FFF}') // CJK Unified Ideographs
+                        || (*c >= '\u{3400}' && *c <= '\u{4DBF}') // CJK Extension A
+                        || (*c >= '\u{20000}' && *c <= '\u{2A6DF}') // CJK Extension B
+                        || (*c >= '\u{AC00}' && *c <= '\u{D7AF}') // Hangul
+                        || (*c >= '\u{3040}' && *c <= '\u{309F}') // Hiragana
+                        || (*c >= '\u{30A0}' && *c <= '\u{30FF}') // Katakana
+                })
+                .collect();
+
             if cleaned.is_empty() {
-                String::new()
+                None
             } else {
-                // Trigram tokenizer handles substring matching naturally
-                format!("\"{}\"", cleaned)
+                // Escape quotes and wrap in quotes for exact phrase matching
+                // This prevents FTS5 operator injection (AND, OR, NOT, etc.)
+                Some(format!("\"{}\"", cleaned.replace('"', "\"\"")))
             }
         })
-        .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
 }

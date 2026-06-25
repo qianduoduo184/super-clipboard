@@ -104,7 +104,26 @@ pub fn copy_item(state: State<'_, AppState>, id: String) -> Result<(), String> {
         let content_path = item
             .content_path
             .ok_or_else(|| "image item has no blob path".to_string())?;
-        let dib_bytes = crate::blobs::read_dib_from_bmp_file(Path::new(&content_path))
+
+        // Security: Validate that the blob path is within the allowed blob directory
+        let blob_path = Path::new(&content_path);
+        let canonical_blob_path = blob_path
+            .canonicalize()
+            .map_err(|e| format!("invalid blob path: {}", e))?;
+        let canonical_blob_dir = state
+            .blob_dir
+            .canonicalize()
+            .map_err(|e| format!("invalid blob directory: {}", e))?;
+
+        if !canonical_blob_path.starts_with(&canonical_blob_dir) {
+            crate::diagnostics::error(format!(
+                "security: attempted to read blob outside allowed directory: {}",
+                content_path
+            ));
+            return Err("blob path outside allowed directory".to_string());
+        }
+
+        let dib_bytes = crate::blobs::read_dib_from_bmp_file(&canonical_blob_path)
             .map_err(|error| error.to_string())?;
         #[cfg(target_os = "windows")]
         crate::clipboard::win::write_dib_to_clipboard(&dib_bytes)
@@ -467,16 +486,24 @@ fn validate_migration_paths(old_dir: &Path, new_dir: &Path) -> Result<(), String
         .canonicalize()
         .map_err(|e| format!("解析源目录失败: {}", e))?;
 
-    // Create the new directory first to ensure it can be safely canonicalized
-    // This prevents symlink-based path traversal attacks
+    // Security: Create and validate new directory atomically to prevent TOCTOU attacks
+    // If directory doesn't exist, create it with safe permissions
     if !new_dir.exists() {
         std::fs::create_dir_all(new_dir)
             .map_err(|e| format!("创建新目录失败: {}", e))?;
     }
 
+    // Immediately canonicalize after creation to prevent symlink swap attacks
     let new_dir = new_dir
         .canonicalize()
         .map_err(|e| format!("解析新目录失败: {}", e))?;
+
+    // Verify it's a real directory, not a symlink
+    let metadata = std::fs::symlink_metadata(&new_dir)
+        .map_err(|e| format!("读取新目录元数据失败: {}", e))?;
+    if metadata.is_symlink() {
+        return Err("新目录不能是符号链接".to_string());
+    }
 
     if old_dir == new_dir {
         return Err("新目录不能与源目录相同".to_string());
@@ -565,11 +592,22 @@ pub async fn migrate_directory(
                 continue;
             }
 
-            if entry.path().is_file() {
+            // Security: Check if entry is a symlink before processing
+            let metadata = fs::symlink_metadata(&old_file)
+                .map_err(|e| format!("读取文件元数据失败: {}", e))?;
+            if metadata.is_symlink() {
+                crate::diagnostics::warn(format!(
+                    "migrate_directory: skipping symlink: {}",
+                    file_name.to_string_lossy()
+                ));
+                continue;
+            }
+
+            if metadata.is_file() {
                 fs::copy(&old_file, &new_file)
                     .map_err(|e| format!("复制文件 {} 失败: {}", file_name.to_string_lossy(), e))?;
                 crate::diagnostics::info(format!("migrated: {}", file_name.to_string_lossy()));
-            } else if entry.path().is_dir() {
+            } else if metadata.is_dir() {
                 // 递归复制目录
                 copy_dir_all(&old_file, &new_file)
                     .map_err(|e| format!("复制目录 {} 失败: {}", file_name.to_string_lossy(), e))?;

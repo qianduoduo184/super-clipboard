@@ -7,6 +7,9 @@ mod diagnostics;
 mod storage;
 mod system;
 
+#[cfg(test)]
+mod security_tests;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 

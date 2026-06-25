@@ -410,6 +410,9 @@ impl Drop for ClipboardGuard {
 }
 
 fn read_unicode_text() -> Result<Option<String>> {
+    // Security: Limit maximum clipboard text size to prevent memory exhaustion attacks
+    const MAX_CLIPBOARD_TEXT_LEN: usize = 100_000_000; // 100M UTF-16 units (~200MB)
+
     unsafe {
         if IsClipboardFormatAvailable(CF_UNICODETEXT as u32) == 0 {
             return Ok(None);
@@ -424,9 +427,19 @@ fn read_unicode_text() -> Result<Option<String>> {
         }
 
         let mut len = 0;
-        while *locked.add(len) != 0 {
+        while len < MAX_CLIPBOARD_TEXT_LEN && *locked.add(len) != 0 {
             len += 1;
         }
+
+        if len >= MAX_CLIPBOARD_TEXT_LEN {
+            GlobalUnlock(handle);
+            crate::diagnostics::warn(format!(
+                "clipboard: text exceeds size limit ({} UTF-16 units)",
+                MAX_CLIPBOARD_TEXT_LEN
+            ));
+            return Err(anyhow!("clipboard text exceeds maximum size limit"));
+        }
+
         let slice = std::slice::from_raw_parts(locked, len);
         let value = String::from_utf16_lossy(slice);
         GlobalUnlock(handle);
@@ -480,6 +493,9 @@ fn read_file_list() -> Result<Option<Vec<String>>> {
 }
 
 unsafe fn read_global_bytes(format: u32) -> Result<Option<Vec<u8>>> {
+    // Security: Limit maximum clipboard blob size to prevent memory exhaustion attacks
+    const MAX_CLIPBOARD_BLOB_SIZE: usize = 500_000_000; // 500MB
+
     let handle = GetClipboardData(format);
     if handle == Default::default() {
         return Err(anyhow!("get clipboard data"));
@@ -487,6 +503,17 @@ unsafe fn read_global_bytes(format: u32) -> Result<Option<Vec<u8>>> {
     let size = GlobalSize(handle);
     if size == 0 {
         return Ok(None);
+    }
+
+    if size > MAX_CLIPBOARD_BLOB_SIZE {
+        crate::diagnostics::warn(format!(
+            "clipboard: blob exceeds size limit ({} bytes)",
+            size
+        ));
+        return Err(anyhow!(
+            "clipboard data exceeds maximum size limit: {} bytes",
+            size
+        ));
     }
 
     let locked = GlobalLock(handle) as *const c_void;
