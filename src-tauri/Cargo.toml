@@ -1,6 +1,6 @@
 [package]
 name = "super-clipboard"
-version = "1.0.6"
+version = "1.0.7"
 description = "Windows-first high-performance clipboard manager"
 authors = ["super-clipboard contributors"]
 edition = "2021"
