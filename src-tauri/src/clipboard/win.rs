@@ -11,7 +11,7 @@ use anyhow::{anyhow, Result};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    IsClipboardFormatAvailable, OpenClipboard, SetClipboardData,
+    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
@@ -70,6 +70,16 @@ where
 
 pub fn read_current_clipboard(blob_dir: &Path) -> Result<Vec<ClipboardItemDraft>> {
     let _guard = ClipboardGuard::open()?;
+
+    // Privacy: honor the Windows clipboard-exclusion formats that password managers
+    // and other sensitive sources set to opt out of clipboard history/monitoring.
+    // If present, skip recording entirely so secrets never touch the SQLite store.
+    if is_history_excluded() {
+        crate::diagnostics::info(
+            "clipboard: content marked excluded from history, skipping capture",
+        );
+        return Ok(Vec::new());
+    }
 
     // Try reading file list - log error but continue to next format if it fails
     match read_file_list() {
@@ -266,6 +276,125 @@ pub fn write_files_to_clipboard(file_paths: &[String]) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Write HTML to the clipboard in `CF_HTML` format (preserving formatting) plus a
+/// `CF_UNICODETEXT` plain-text fallback, so both HTML-aware apps (Word, browsers,
+/// mail) and plain-text targets paste correctly.
+pub fn write_html_to_clipboard(html: &str, plain_text: &str) -> Result<()> {
+    let cf_html_format =
+        unsafe { RegisterClipboardFormatW(wide_null("HTML Format").as_ptr()) };
+    if cf_html_format == 0 {
+        return Err(anyhow!("register HTML clipboard format"));
+    }
+    let cf_html_bytes = build_cf_html(html);
+
+    let _guard = ClipboardGuard::open()?;
+    unsafe {
+        if EmptyClipboard() == 0 {
+            return Err(anyhow!("empty clipboard"));
+        }
+        set_clipboard_global(cf_html_format, &cf_html_bytes)?;
+
+        // Plain-text fallback (UTF-16LE + null terminator) as raw bytes.
+        let mut wide: Vec<u16> = plain_text.encode_utf16().collect();
+        wide.push(0);
+        let byte_len = wide.len() * size_of::<u16>();
+        let text_bytes = std::slice::from_raw_parts(wide.as_ptr() as *const u8, byte_len);
+        set_clipboard_global(CF_UNICODETEXT as u32, text_bytes)?;
+    }
+
+    Ok(())
+}
+
+/// Allocate a moveable global buffer, copy `bytes` into it, and hand it to the
+/// clipboard for `format`. Must be called between `EmptyClipboard` and closing the
+/// clipboard (caller holds the `ClipboardGuard`).
+unsafe fn set_clipboard_global(format: u32, bytes: &[u8]) -> Result<()> {
+    let handle = GlobalAlloc(GMEM_MOVEABLE, bytes.len());
+    if handle == Default::default() {
+        return Err(anyhow!("allocate clipboard memory"));
+    }
+    let locked = GlobalLock(handle) as *mut u8;
+    if locked.is_null() {
+        return Err(anyhow!("lock clipboard allocation"));
+    }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), locked, bytes.len());
+    GlobalUnlock(handle);
+    if SetClipboardData(format, handle) == Default::default() {
+        return Err(anyhow!("set clipboard data"));
+    }
+    Ok(())
+}
+
+/// Wrap an HTML fragment in the `CF_HTML` envelope with the required byte offsets.
+/// Offsets are byte counts from the start of the data; each is written as a fixed
+/// 10-digit field so the header length is constant regardless of the values.
+fn build_cf_html(fragment: &str) -> Vec<u8> {
+    let header = |start_html: usize, end_html: usize, start_frag: usize, end_frag: usize| {
+        format!(
+            "Version:0.9\r\nStartHTML:{:010}\r\nEndHTML:{:010}\r\nStartFragment:{:010}\r\nEndFragment:{:010}\r\n",
+            start_html, end_html, start_frag, end_frag
+        )
+    };
+    let header_len = header(0, 0, 0, 0).len();
+    let prefix = "<html><body>\r\n<!--StartFragment-->";
+    let suffix = "<!--EndFragment-->\r\n</body></html>";
+
+    let start_html = header_len;
+    let start_fragment = header_len + prefix.len();
+    let end_fragment = start_fragment + fragment.len();
+    let end_html = end_fragment + suffix.len();
+
+    let mut out = String::with_capacity(end_html);
+    out.push_str(&header(start_html, end_html, start_fragment, end_fragment));
+    out.push_str(prefix);
+    out.push_str(fragment);
+    out.push_str(suffix);
+    out.into_bytes()
+}
+
+/// Return true when the current clipboard carries a Windows exclusion marker that
+/// asks clipboard managers not to record it. Password managers (KeePass, 1Password,
+/// Bitwarden, …) set these. Must be called while the clipboard is open.
+fn is_history_excluded() -> bool {
+    unsafe {
+        let exclude_monitor =
+            RegisterClipboardFormatW(wide_null("ExcludeClipboardContentFromMonitorProcessing").as_ptr());
+        if exclude_monitor != 0 && IsClipboardFormatAvailable(exclude_monitor) != 0 {
+            return true;
+        }
+
+        let can_include =
+            RegisterClipboardFormatW(wide_null("CanIncludeInClipboardHistory").as_ptr());
+        if can_include != 0 && IsClipboardFormatAvailable(can_include) != 0 {
+            // Value is a DWORD; 0 means "do not include in history".
+            if let Some(0) = read_clipboard_dword(can_include) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Read a 4-byte DWORD payload for a clipboard `format`, if present. Caller holds
+/// the clipboard open.
+unsafe fn read_clipboard_dword(format: u32) -> Option<u32> {
+    let handle = GetClipboardData(format);
+    if handle == Default::default() {
+        return None;
+    }
+    if GlobalSize(handle) < 4 {
+        return None;
+    }
+    let locked = GlobalLock(handle) as *const u8;
+    if locked.is_null() {
+        return None;
+    }
+    let bytes = std::slice::from_raw_parts(locked, 4);
+    let value = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    GlobalUnlock(handle);
+    Some(value)
 }
 
 pub fn simulate_paste_shortcut() -> Result<()> {
@@ -548,4 +677,80 @@ fn keyboard_input(key: VIRTUAL_KEY, key_up: bool) -> INPUT {
 
 fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+// Runtime verification of the write-back paths against the REAL system clipboard.
+// These are #[ignore] because they clobber the user's clipboard and are racy under
+// parallel CI; run explicitly with:
+//   cargo test --manifest-path src-tauri/Cargo.toml -- --ignored --test-threads=1 clipboard_roundtrip
+#[cfg(test)]
+mod clipboard_roundtrip_tests {
+    use super::*;
+
+    fn minimal_dib() -> Vec<u8> {
+        // BITMAPINFOHEADER (40 bytes, 1x1 32bpp BI_RGB) + one BGRA pixel.
+        let mut dib = vec![0u8; 40];
+        dib[0] = 40; // biSize = 40
+        dib[4] = 1; // biWidth = 1
+        dib[8] = 1; // biHeight = 1
+        dib[12] = 1; // biPlanes = 1
+        dib[14] = 32; // biBitCount = 32
+        dib.extend_from_slice(&[0x11, 0x22, 0x33, 0xFF]); // one pixel
+        dib
+    }
+
+    #[test]
+    #[ignore]
+    fn clipboard_roundtrip_image_dib() {
+        let dib = minimal_dib();
+        write_dib_to_clipboard(&dib).expect("write dib");
+
+        let read = {
+            let _guard = ClipboardGuard::open().expect("open clipboard");
+            unsafe { read_global_bytes(CF_DIB as u32) }
+                .expect("read dib")
+                .expect("dib present")
+        };
+        // GlobalSize may pad the allocation, so compare the payload prefix.
+        assert!(read.len() >= dib.len());
+        assert_eq!(&read[..dib.len()], &dib[..]);
+    }
+
+    #[test]
+    #[ignore]
+    fn clipboard_roundtrip_files() {
+        let paths = vec!["C:\\Windows\\notepad.exe".to_string()];
+        write_files_to_clipboard(&paths).expect("write files");
+
+        let read = {
+            let _guard = ClipboardGuard::open().expect("open clipboard");
+            read_file_list().expect("read files").expect("files present")
+        };
+        assert_eq!(read, paths);
+    }
+
+    #[test]
+    #[ignore]
+    fn clipboard_roundtrip_html_with_plain_fallback() {
+        let html = "<b>hello</b>";
+        let plain = "hello";
+        write_html_to_clipboard(html, plain).expect("write html");
+
+        let text = {
+            let _guard = ClipboardGuard::open().expect("open clipboard");
+            read_unicode_text().expect("read text").expect("text present")
+        };
+        assert_eq!(text, plain);
+
+        let cf_html = unsafe { RegisterClipboardFormatW(wide_null("HTML Format").as_ptr()) };
+        let html_bytes = {
+            let _guard = ClipboardGuard::open().expect("open clipboard");
+            unsafe { read_global_bytes(cf_html) }
+                .expect("read cf_html")
+                .expect("cf_html present")
+        };
+        let rendered = String::from_utf8_lossy(&html_bytes);
+        assert!(rendered.contains("StartFragment"), "missing CF_HTML header");
+        assert!(rendered.contains(html), "fragment not preserved");
+    }
 }

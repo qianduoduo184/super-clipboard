@@ -149,6 +149,10 @@ export default function App() {
   const historyListRef = useRef<HTMLDivElement | null>(null);
   const debouncedQuery = useDebouncedValue(query, 100);
 
+  // Track the latest settingsOpen for the blur handler (registered once with []).
+  const settingsOpenRef = useRef(settingsOpen);
+  settingsOpenRef.current = settingsOpen;
+
   const filters: Array<{ key: FilterType; label: string }> = [
     ...getVisibleFilters(navFiltersConfig),
   ] as Array<{ key: FilterType; label: string }>;
@@ -233,8 +237,9 @@ export default function App() {
 
     getCurrentWindow()
       .onFocusChanged(({ payload: focused }) => {
-        if (!focused) {
-          // Window lost focus, clear search and hide
+        if (!focused && !settingsOpenRef.current) {
+          // Window lost focus (and not on the Settings screen, whose native file/
+          // folder dialogs also blur the window). Clear search and hide.
           setQuery('');
           void getCurrentWindow().hide();
         }
@@ -263,6 +268,12 @@ export default function App() {
         setBackendAvailable(true);
         setStatusMessage(nextItems.length === 0 ? '暂无剪贴板记录' : '已连接本地剪贴板服务');
         setScrollTop(0);
+        // Keep the DOM scroll position in sync with the reset state. Without this the
+        // container can stay scrolled (e.g. 800px) while the virtual window renders from
+        // the top, leaving the viewport blank after the window is hidden and reopened.
+        if (historyListRef.current) {
+          historyListRef.current.scrollTop = 0;
+        }
       })
       .catch(() => {
         if (ignore) return;
@@ -374,12 +385,12 @@ export default function App() {
     await pasteAndHideItem(selectedItem);
   }
 
-  async function pasteAndHideItem(item: ClipboardItem) {
+  async function pasteAndHideItem(item: ClipboardItem, plainText?: boolean) {
     setSelectedId(item.id);
     if (backendAvailable) {
       try {
         await getCurrentWindow().hide();
-        await pasteItem(item.id);
+        await pasteItem(item.id, plainText);
         setStatusMessage('已粘贴当前记录');
       } catch (error) {
         await getCurrentWindow().show();
@@ -745,6 +756,15 @@ export default function App() {
             <Pin size={15} />
             粘贴
           </button>
+          {contextMenu.item.type === 'html' ? (
+            <button onClick={async () => {
+              await pasteAndHideItem(contextMenu.item, true);
+              setContextMenu(null);
+            }}>
+              <FileText size={15} />
+              以纯文本粘贴
+            </button>
+          ) : null}
           <button onClick={async () => {
             await toggleFavorite(contextMenu.item.id);
             setContextMenu(null);

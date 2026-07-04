@@ -80,23 +80,44 @@ pub fn get_item_detail(
 }
 
 #[tauri::command]
-pub fn copy_item(state: State<'_, AppState>, id: String) -> Result<(), String> {
+pub fn copy_item(
+    state: State<'_, AppState>,
+    id: String,
+    plain_text: Option<bool>,
+) -> Result<(), String> {
     crate::diagnostics::info(format!("command: copy_item id={id}"));
     let repository = state.repository.lock().map_err(|error| error.to_string())?;
     let item = repository
         .get_item(&id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "clipboard item not found".to_string())?;
-    if item.item_type == "text" || item.item_type == "html" {
+    if item.item_type == "text" {
         if let Some(content) = item.content {
-            let content = if item.item_type == "html" {
-                html_to_plain_text(&content)
-            } else {
-                content
-            };
             #[cfg(target_os = "windows")]
             crate::clipboard::win::write_text_to_clipboard(&content)
                 .map_err(|error| error.to_string())?;
+            #[cfg(not(target_os = "windows"))]
+            let _ = content;
+        }
+        return Ok(());
+    }
+    if item.item_type == "html" {
+        if let Some(content) = item.content {
+            // Preserve formatting by default (CF_HTML); write plain text only when
+            // the caller explicitly asks for "paste as plain text".
+            let plain = html_to_plain_text(&content);
+            #[cfg(target_os = "windows")]
+            {
+                if plain_text.unwrap_or(false) {
+                    crate::clipboard::win::write_text_to_clipboard(&plain)
+                        .map_err(|error| error.to_string())?;
+                } else {
+                    crate::clipboard::win::write_html_to_clipboard(&content, &plain)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            let _ = (content, plain, plain_text);
         }
         return Ok(());
     }
@@ -150,9 +171,13 @@ pub fn copy_item(state: State<'_, AppState>, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn paste_item(state: State<'_, AppState>, id: String) -> Result<(), String> {
+pub fn paste_item(
+    state: State<'_, AppState>,
+    id: String,
+    plain_text: Option<bool>,
+) -> Result<(), String> {
     crate::diagnostics::info(format!("command: paste_item id={id}"));
-    copy_item(state, id)?;
+    copy_item(state, id, plain_text)?;
     #[cfg(target_os = "windows")]
     crate::clipboard::win::simulate_paste_shortcut().map_err(|error| error.to_string())?;
     Ok(())

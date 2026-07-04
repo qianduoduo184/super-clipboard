@@ -147,7 +147,7 @@
 
 ### 🔧 功能完善
 
-- [ ] **文件列表写回剪贴板**：当前只支持读取文件列表，需要实现 `copy_item` 和 `paste_item` 对文件列表的写回支持。
+- [x] **文件列表写回剪贴板**（2026-07-03 复核：**已实现**，文档此前描述过时）：`copy_item` 已支持 image（BMP blob → `CF_DIB`）与 files（JSON 路径数组 → `CF_HDROP`），`commands.rs:103-145` + `clipboard/win.rs:188-269`。捕获侧 `read_current_clipboard` 也已对应存储。**待办**：`win.rs` 写回路径为 `#[cfg(windows)]`，仅有 blob round-trip 单测，尚未在真机验证实际粘贴效果。
 - [ ] **实机大数据量测试**：连续复制 1,000+ 条记录，验证 10,000+ 条历史记录的查询性能和 UI 流畅度。
 - [ ] **托盘生命周期测试**：验证托盘图标在各种系统状态下的稳定性（屏幕缩放、DPI 变化、系统休眠恢复等）。
 - [ ] **快捷键生命周期测试**：验证全局快捷键在冲突、系统锁屏、UAC 提升等场景下的行为。
@@ -161,3 +161,48 @@
 - [ ] **OCR 集成**：图片文字识别和搜索
 - [ ] **智能分类**：自动识别和分类剪贴板内容（链接、代码、邮件等）
 - [ ] **快捷操作**：对特定类型内容提供快捷操作（如链接直接打开、代码高亮等）
+
+## 阶段 11：安装器与界面显示问题（2026-07-03）
+
+### 🌐 安装器本地化与配置记忆
+
+- [ ] **安装界面改为中文**：当前 NSIS 安装向导为英文界面，需配置为中文（简体）。定位 `src-tauri/tauri.conf.json` 的 `bundle.windows.nsis` 配置，设置 `languages: ["SimpChinese"]`（或提供 `installerLanguages`），必要时补充中文 `.nsh` 语言资源。需实机运行 `npm run tauri build` 打包后验证向导语言。
+- [ ] **安装器记忆上次勾选项**：安装向导每次都以默认值呈现复选项（如"创建桌面快捷方式"），未记忆用户上次的选择。例如用户上次取消勾选"生成快捷方式"，本次安装应默认不勾选。需在 NSIS 模板中将复选状态读写到注册表（`ReadRegStr`/`WriteRegStr`，如 `HKCU\Software\super-clipboard`），并在向导页 `.onInit` 时回填。Tauri 默认 NSIS 模板不含此逻辑，需自定义 `installerHooks` 或 `template`。
+
+### 🖥️ 界面显示问题
+
+- [x] **滚动后退出再打开内容区域空白**（2026-07-03）：界面滚动后隐藏窗口，再次打开时内容区域偶发不显示。
+  - **根因**：虚拟列表由 React `scrollTop` 状态驱动（`App.tsx:138`，`onScroll` 更新），但 `.history-list` DOM 元素的真实滚动位置从未与之同步。当搜索/刷新副作用触发 `setScrollTop(0)`（`App.tsx:265`，由 `clipboard-changed` 事件或清空搜索引发）时，只重置了 React 状态为 0，DOM 元素仍停留在旧滚动位置（如 800px）。虚拟窗口据此把条目渲染在 `translateY(0)`（长 spacer 顶部），而容器仍下滚 800px，视口落在已渲染条目下方的空白区 → 内容区空白。窗口隐藏后此错位状态保留，重开时复现。
+  - **修复**：在 `setScrollTop(0)` 处同步重置 DOM 元素滚动位置 `historyListRef.current.scrollTop = 0`，使状态与 DOM 保持一致。
+  - **验证**：`npm run ci:frontend`（typecheck）；实机滚动→触发刷新/隐藏→重开确认内容正常显示。
+
+## 阶段 12：竞品对标与功能补齐（2026-07-03）
+
+> 来源：[competitive-analysis-and-roadmap.md](./competitive-analysis-and-roadmap.md)。对照 Ditto / CopyQ / Windows 剪贴板历史 / Maccy / PasteBar 等，梳理缺陷与可借鉴方案。排序为建议值，实际排期以用户确认为准。
+
+### 🔴 P0 核心短板（竞品普遍具备，本应用缺失，削弱核心可用性）
+
+- [x] ~~**图片 / 文件粘贴写回**~~（2026-07-03 复核：**已在代码中实现**，此条基于过时文档，撤销）：`copy_item` 已支持 image/files 写回，详见阶段 10 对应条目。**仅剩真机验证**未做。
+- [x] **富文本 HTML 粘贴写回 + "以纯文本粘贴"开关**（2026-07-03 实现，后端已 `cargo build` 通过；前端 typecheck 待跑）：新增 `write_html_to_clipboard`（`CF_HTML` + `CF_UNICODETEXT` 纯文本回退，`win.rs`），`copy_item`/`paste_item` 增加 `plain_text: Option<bool>` 参数——html 条目默认写 `CF_HTML` 保留格式，`plain_text=true` 时写纯文本。前端 `api.ts` 透传 `plainText`，右键菜单对 html 条目新增"以纯文本粘贴"。**注意**：HTML 捕获在阶段 7 已移除，故富文本路径当前仅惠及历史遗留 html 条目；如需对新内容生效，需另行评估是否重启 HTML 捕获。
+- [x] **敏感来源排除**（2026-07-03 实现，后端已 `cargo build` 通过）：`read_current_clipboard` 开头调用 `is_history_excluded()`，检测到 Windows 排除格式 `ExcludeClipboardContentFromMonitorProcessing`（存在即排除）或 `CanIncludeInClipboardHistory`（DWORD=0）即跳过入库，密码管理器（KeePass/1Password/Bitwarden 等）复制的密码不再明文落库。
+- [ ] **应用排除名单**（拆自上一条，待实现）：用户可配置按前台进程名/exe 的排除名单。需捕获时取前台进程（`GetForegroundWindow`→`QueryFullProcessImageName`）、`AppSettings` 增 `excluded_apps` 字段、设置页 UI。较独立，单列。
+
+### 🟡 P1 高价值增强
+
+- [ ] **数字键快速粘贴第 N 条**（借鉴 Ditto）：面板打开后按 `1~9` 直接粘贴对应条目，键盘流核心加速器。改动集中在前端 `handleKeyboard`。
+- [ ] **片段 / 模板 / 分组（收藏板）**（借鉴 CopyQ tab、PasteBar boards）：把常用内容固定成可命名的组或带变量模板。当前只有扁平的收藏/置顶，缺分组与常驻片段库。需扩展 schema（分组表/模板表）。
+- [ ] **内容感知快捷动作**（借鉴 CopyQ command）：识别 URL/邮箱/颜色/路径/代码，提供"打开链接、生成二维码、颜色预览、代码高亮"等一键动作。（与阶段 10「智能分类」「快捷操作」合并。）
+
+### 🟢 P2 效率增强
+
+- [ ] **条目内编辑后再粘贴**（借鉴 Ditto/CopyQ）：粘贴前微调文本。
+- [ ] **合并多条粘贴 / 粘贴堆栈**（借鉴 Ditto）：多选合并为一次粘贴，或粘贴后自动指向下一条。
+- [ ] **面板贴近光标定位**（借鉴 Ditto）：面板出现在鼠标/插入符附近，当前为固定位置。
+- [ ] **多选 + 批量操作**：批量删除/收藏/导出，配合合并粘贴。
+
+### ⚪ P3 长期 / 差异化（多数已在阶段 10 长期规划，此处做对标拆分，不重复）
+
+- [ ] **局域网点对点同步**：作为「云同步」的第一步，无服务器、隐私更友好。
+- [ ] **检索增强**：按来源应用、日期范围、正则过滤。
+- [ ] **RTF 富文本格式**、**首次运行引导 / 快捷键与权限自检**。
+- [ ] 其余（端到端加密、OCR、Emoji/GIF）见阶段 10 长期规划。

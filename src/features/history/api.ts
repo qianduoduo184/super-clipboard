@@ -72,12 +72,12 @@ export async function getItemDetail(id: string) {
   return invoke<ClipboardSearchItem | null>('get_item_detail', { id });
 }
 
-export async function copyItem(id: string) {
-  return invoke<void>('copy_item', { id });
+export async function copyItem(id: string, plainText?: boolean) {
+  return invoke<void>('copy_item', { id, plainText: plainText ?? null });
 }
 
-export async function pasteItem(id: string) {
-  return invoke<void>('paste_item', { id });
+export async function pasteItem(id: string, plainText?: boolean) {
+  return invoke<void>('paste_item', { id, plainText: plainText ?? null });
 }
 
 export async function toggleFavorite(id: string) {

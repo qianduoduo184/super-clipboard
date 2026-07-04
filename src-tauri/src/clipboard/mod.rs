@@ -25,6 +25,10 @@ pub mod win {
         Ok(())
     }
 
+    pub fn write_html_to_clipboard(_html: &str, _plain_text: &str) -> Result<()> {
+        Ok(())
+    }
+
     pub fn write_dib_to_clipboard(_dib_bytes: &[u8]) -> Result<()> {
         Ok(())
     }
