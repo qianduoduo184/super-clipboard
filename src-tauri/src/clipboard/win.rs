@@ -123,30 +123,37 @@ pub fn read_current_clipboard(
     }
 
     // Try reading image - log error but continue to text if it fails
-    match read_dib_bytes() {
-        Ok(Some(dib_bytes)) => match write_dib_as_bmp(blob_dir, &dib_bytes) {
-            Ok(path) => {
-                return Ok(Some(vec![ClipboardItemDraft {
-                    item_type: ClipboardItemType::Image,
-                    size_bytes: dib_bytes.len() as i64,
-                    preview: path
-                        .file_name()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("clipboard-image.bmp")
-                        .to_string(),
-                    content: None,
-                    content_path: Some(path.to_string_lossy().to_string()),
-                    content_hash: None,
-                    source_app: None,
-                }]));
-            }
-            Err(error) => {
-                crate::diagnostics::warn(format!("clipboard: image blob write failed: {error}"));
+    match process_preferred_dib(
+        |format| unsafe {
+            if IsClipboardFormatAvailable(format) == 0 {
+                Ok(None)
+            } else {
+                read_global_bytes(format)
             }
         },
+        |_format, dib_bytes| {
+            let size_bytes = dib_bytes.len() as i64;
+            write_dib_as_bmp(blob_dir, &dib_bytes).map(|path| (path, size_bytes))
+        },
+    ) {
+        Ok(Some((path, size_bytes))) => {
+            return Ok(Some(vec![ClipboardItemDraft {
+                item_type: ClipboardItemType::Image,
+                size_bytes,
+                preview: path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("clipboard-image.bmp")
+                    .to_string(),
+                content: None,
+                content_path: Some(path.to_string_lossy().to_string()),
+                content_hash: None,
+                source_app: None,
+            }]));
+        }
         Ok(None) => {}
         Err(error) => {
-            crate::diagnostics::warn(format!("clipboard: image read failed: {error}"));
+            crate::diagnostics::warn(format!("clipboard: image capture failed: {error}"));
         }
     }
 
@@ -608,24 +615,18 @@ fn read_unicode_text() -> Result<Option<String>> {
     }
 }
 
-fn read_dib_bytes() -> Result<Option<Vec<u8>>> {
-    read_preferred_dib(|format| unsafe {
-        if IsClipboardFormatAvailable(format) == 0 {
-            Ok(None)
-        } else {
-            read_global_bytes(format)
-        }
-    })
-}
-
-fn read_preferred_dib<F>(mut read_format: F) -> Result<Option<Vec<u8>>>
+fn process_preferred_dib<T, R, P>(mut read_format: R, mut process_dib: P) -> Result<Option<T>>
 where
-    F: FnMut(u32) -> Result<Option<Vec<u8>>>,
+    R: FnMut(u32) -> Result<Option<Vec<u8>>>,
+    P: FnMut(u32, Vec<u8>) -> Result<T>,
 {
     let mut first_error = None;
     for format in [CF_DIBV5 as u32, CF_DIB as u32] {
-        match read_format(format) {
-            Ok(Some(bytes)) => return Ok(Some(bytes)),
+        match read_format(format).and_then(|bytes| match bytes {
+            Some(bytes) => process_dib(format, bytes).map(Some),
+            None => Ok(None),
+        }) {
+            Ok(Some(value)) => return Ok(Some(value)),
             Ok(None) => {}
             Err(error) => {
                 if first_error.is_none() {
@@ -732,22 +733,105 @@ fn wide_null(value: &str) -> Vec<u16> {
 }
 
 #[cfg(test)]
+mod dib_candidate_tests {
+    use super::{process_preferred_dib, CF_DIB, CF_DIBV5};
+    use anyhow::{anyhow, Result};
+
+    #[test]
+    fn malformed_v5_falls_back_to_valid_legacy_dib() {
+        let mut reads = Vec::new();
+        let mut processed = Vec::new();
+
+        let result = process_preferred_dib(
+            |format: u32| -> Result<Option<Vec<u8>>> {
+                reads.push(format);
+                Ok(Some(vec![format as u8]))
+            },
+            |format: u32, _bytes: Vec<u8>| -> Result<&'static str> {
+                processed.push(format);
+                if format == CF_DIBV5 as u32 {
+                    Err(anyhow!("malformed V5 DIB"))
+                } else {
+                    Ok("legacy DIB")
+                }
+            },
+        )
+        .expect("legacy candidate succeeds");
+
+        assert_eq!(result, Some("legacy DIB"));
+        assert_eq!(reads, vec![CF_DIBV5 as u32, CF_DIB as u32]);
+        assert_eq!(processed, vec![CF_DIBV5 as u32, CF_DIB as u32]);
+    }
+
+    #[test]
+    fn valid_v5_short_circuits_legacy_dib() {
+        let mut reads = Vec::new();
+        let mut processed = Vec::new();
+
+        let result = process_preferred_dib(
+            |format: u32| -> Result<Option<Vec<u8>>> {
+                reads.push(format);
+                Ok(Some(vec![5]))
+            },
+            |format: u32, _bytes: Vec<u8>| -> Result<&'static str> {
+                processed.push(format);
+                Ok("V5 DIB")
+            },
+        )
+        .expect("V5 candidate succeeds");
+
+        assert_eq!(result, Some("V5 DIB"));
+        assert_eq!(reads, vec![CF_DIBV5 as u32]);
+        assert_eq!(processed, vec![CF_DIBV5 as u32]);
+    }
+
+    #[test]
+    fn both_processing_failures_return_the_first_error() {
+        let mut reads = Vec::new();
+        let mut processed = Vec::new();
+
+        let error = process_preferred_dib(
+            |format: u32| -> Result<Option<Vec<u8>>> {
+                reads.push(format);
+                Ok(Some(vec![format as u8]))
+            },
+            |format: u32, _bytes: Vec<u8>| -> Result<()> {
+                processed.push(format);
+                if format == CF_DIBV5 as u32 {
+                    Err(anyhow!("malformed V5 DIB"))
+                } else {
+                    Err(anyhow!("malformed legacy DIB"))
+                }
+            },
+        )
+        .expect_err("both candidates should fail");
+
+        assert_eq!(error.to_string(), "malformed V5 DIB");
+        assert_eq!(reads, vec![CF_DIBV5 as u32, CF_DIB as u32]);
+        assert_eq!(processed, vec![CF_DIBV5 as u32, CF_DIB as u32]);
+    }
+}
+
+#[cfg(test)]
 mod dib_fallback_tests {
-    use super::{read_preferred_dib, CF_DIB, CF_DIBV5};
+    use super::{process_preferred_dib, CF_DIB, CF_DIBV5};
     use anyhow::anyhow;
 
     #[test]
     fn v5_success_does_not_read_legacy_dib() {
         let mut reads = Vec::new();
 
-        let result = read_preferred_dib(|format| {
-            reads.push(format);
-            if format == CF_DIBV5 as u32 {
-                Ok(Some(vec![5]))
-            } else {
-                panic!("legacy DIB should not be read")
-            }
-        })
+        let result = process_preferred_dib(
+            |format| {
+                reads.push(format);
+                if format == CF_DIBV5 as u32 {
+                    Ok(Some(vec![5]))
+                } else {
+                    panic!("legacy DIB should not be read")
+                }
+            },
+            |_format, bytes| Ok(bytes),
+        )
         .expect("read succeeds");
 
         assert_eq!(result, Some(vec![5]));
@@ -758,14 +842,17 @@ mod dib_fallback_tests {
     fn v5_none_falls_back_to_legacy_dib() {
         let mut reads = Vec::new();
 
-        let result = read_preferred_dib(|format| {
-            reads.push(format);
-            if format == CF_DIBV5 as u32 {
-                Ok(None)
-            } else {
-                Ok(Some(vec![4]))
-            }
-        })
+        let result = process_preferred_dib(
+            |format| {
+                reads.push(format);
+                if format == CF_DIBV5 as u32 {
+                    Ok(None)
+                } else {
+                    Ok(Some(vec![4]))
+                }
+            },
+            |_format, bytes| Ok(bytes),
+        )
         .expect("legacy read succeeds");
 
         assert_eq!(result, Some(vec![4]));
@@ -776,14 +863,17 @@ mod dib_fallback_tests {
     fn v5_error_falls_back_to_legacy_dib() {
         let mut reads = Vec::new();
 
-        let result = read_preferred_dib(|format| {
-            reads.push(format);
-            if format == CF_DIBV5 as u32 {
-                Err(anyhow!("V5 read failed"))
-            } else {
-                Ok(Some(vec![4]))
-            }
-        })
+        let result = process_preferred_dib(
+            |format| {
+                reads.push(format);
+                if format == CF_DIBV5 as u32 {
+                    Err(anyhow!("V5 read failed"))
+                } else {
+                    Ok(Some(vec![4]))
+                }
+            },
+            |_format, bytes| Ok(bytes),
+        )
         .expect("legacy read succeeds");
 
         assert_eq!(result, Some(vec![4]));
@@ -794,10 +884,13 @@ mod dib_fallback_tests {
     fn both_unavailable_returns_none() {
         let mut reads = Vec::new();
 
-        let result = read_preferred_dib(|format| {
-            reads.push(format);
-            Ok(None)
-        })
+        let result = process_preferred_dib(
+            |format| {
+                reads.push(format);
+                Ok(None)
+            },
+            |_format, bytes: Vec<u8>| Ok(bytes),
+        )
         .expect("unavailable formats are not an error");
 
         assert_eq!(result, None);
@@ -808,14 +901,17 @@ mod dib_fallback_tests {
     fn both_fail_returns_first_error() {
         let mut reads = Vec::new();
 
-        let error = read_preferred_dib(|format| {
-            reads.push(format);
-            if format == CF_DIBV5 as u32 {
-                Err(anyhow!("V5 read failed"))
-            } else {
-                Err(anyhow!("legacy DIB read failed"))
-            }
-        })
+        let error = process_preferred_dib(
+            |format| {
+                reads.push(format);
+                if format == CF_DIBV5 as u32 {
+                    Err(anyhow!("V5 read failed"))
+                } else {
+                    Err(anyhow!("legacy DIB read failed"))
+                }
+            },
+            |_format, bytes: Vec<u8>| Ok(bytes),
+        )
         .expect_err("both reads should fail");
 
         assert_eq!(error.to_string(), "V5 read failed");
