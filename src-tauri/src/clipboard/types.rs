@@ -15,6 +15,8 @@ pub struct ClipboardItemDraft {
     pub item_type: ClipboardItemType,
     pub content: Option<String>,
     pub content_path: Option<String>,
+    #[serde(default)]
+    pub content_hash: Option<String>,
     pub preview: String,
     pub source_app: Option<String>,
     pub size_bytes: i64,
@@ -22,6 +24,12 @@ pub struct ClipboardItemDraft {
 
 impl ClipboardItemDraft {
     pub fn stable_hash(&self) -> String {
+        if self.item_type == ClipboardItemType::Image {
+            if let Some(content_hash) = self.content_hash.as_deref() {
+                return format!("image:{content_hash}");
+            }
+        }
+
         let mut hasher = Sha256::new();
         hasher.update(format!("{:?}", self.item_type));
         hasher.update(self.content.as_deref().unwrap_or_default());
@@ -40,6 +48,7 @@ mod tests {
             item_type: ClipboardItemType::Text,
             content: Some("hello".to_string()),
             content_path: None,
+            content_hash: None,
             preview: "hello".to_string(),
             source_app: None,
             size_bytes: 5,
@@ -54,6 +63,7 @@ mod tests {
             item_type: ClipboardItemType::Text,
             content: Some("hello".to_string()),
             content_path: None,
+            content_hash: None,
             preview: "hello".to_string(),
             source_app: None,
             size_bytes: 5,

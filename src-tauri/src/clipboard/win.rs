@@ -102,6 +102,7 @@ pub fn read_current_clipboard(blob_dir: &Path) -> Result<Vec<ClipboardItemDraft>
                 preview,
                 content: Some(serde_json::to_string(&files)?),
                 content_path: None,
+                content_hash: None,
                 source_app: None,
             }]);
         }
@@ -126,6 +127,7 @@ pub fn read_current_clipboard(blob_dir: &Path) -> Result<Vec<ClipboardItemDraft>
                             .to_string(),
                         content: None,
                         content_path: Some(path.to_string_lossy().to_string()),
+                        content_hash: None,
                         source_app: None,
                     }]);
                 }
@@ -154,6 +156,7 @@ pub fn read_current_clipboard(blob_dir: &Path) -> Result<Vec<ClipboardItemDraft>
                 preview,
                 content: Some(text),
                 content_path: None,
+                content_hash: None,
                 source_app: None,
             }]);
         }

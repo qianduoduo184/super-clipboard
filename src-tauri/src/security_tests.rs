@@ -51,6 +51,7 @@ mod security_tests {
             item_type: crate::clipboard::types::ClipboardItemType::Text,
             content: Some("normal text content".to_string()),
             content_path: None,
+            content_hash: None,
             preview: "normal text content".to_string(),
             source_app: None,
             size_bytes: 19,

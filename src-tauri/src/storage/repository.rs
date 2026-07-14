@@ -5,7 +5,7 @@ use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExten
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::clipboard::types::ClipboardItemDraft;
+use crate::clipboard::types::{ClipboardItemDraft, ClipboardItemType};
 
 use super::schema::{INDEX_SQL, INIT_SQL};
 
@@ -16,6 +16,8 @@ pub struct ClipboardItem {
     pub item_type: String,
     pub content: Option<String>,
     pub content_path: Option<String>,
+    #[serde(default)]
+    pub content_hash: Option<String>,
     pub preview: String,
     pub source_app: Option<String>,
     pub favorite: bool,
@@ -41,12 +43,209 @@ mod tests {
             item_type: ClipboardItemType::Text,
             content: Some(content.to_string()),
             content_path: None,
+            content_hash: None,
             preview: content.to_string(),
             source_app: Some("test".to_string()),
             size_bytes: content.len() as i64,
         }
     }
 
+    fn image_draft(content_hash: &str, content_path: &str) -> ClipboardItemDraft {
+        ClipboardItemDraft {
+            item_type: ClipboardItemType::Image,
+            content: None,
+            content_path: Some(content_path.to_string()),
+            content_hash: Some(content_hash.to_string()),
+            preview: "image".to_string(),
+            source_app: Some("test".to_string()),
+            size_bytes: 128,
+        }
+    }
+
+    #[test]
+    fn open_migrates_legacy_database_with_nullable_content_hash() {
+        let path =
+            std::env::temp_dir().join(format!("super-clipboard-legacy-{}.sqlite3", Uuid::new_v4()));
+        {
+            let conn = Connection::open(&path).expect("legacy db");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE clipboard_items (
+                  id TEXT PRIMARY KEY,
+                  hash TEXT NOT NULL,
+                  item_type TEXT NOT NULL,
+                  content TEXT,
+                  content_path TEXT,
+                  preview TEXT NOT NULL,
+                  source_app TEXT,
+                  favorite INTEGER NOT NULL DEFAULT 0,
+                  size_bytes INTEGER NOT NULL DEFAULT 0,
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL,
+                  deleted_at INTEGER
+                );
+                CREATE VIRTUAL TABLE clipboard_items_fts
+                USING fts5(id UNINDEXED, preview, content);
+                INSERT INTO clipboard_items
+                (id, hash, item_type, content, preview, favorite, size_bytes, created_at, updated_at)
+                VALUES ('legacy-id', 'legacy-hash', 'text', 'legacy text', 'legacy text', 0, 11, 1, 1);
+                "#,
+            )
+            .expect("legacy schema");
+        }
+
+        let repository = ClipboardRepository::open(path).expect("open migrated db");
+        let content_hash: Option<String> = repository
+            .conn
+            .query_row(
+                "SELECT content_hash FROM clipboard_items WHERE id = 'legacy-id'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy content hash");
+
+        assert_eq!(content_hash, None);
+    }
+
+    #[test]
+    fn schema_enforces_active_image_uniqueness_and_allows_deleted_duplicate() {
+        let repository = open_test_repository();
+        let first = repository
+            .insert_or_touch_image(image_draft("same-pixels", "first.bmp"))
+            .expect("first image");
+
+        let duplicate = repository.conn.execute(
+            "INSERT INTO clipboard_items
+             (id, hash, item_type, content_path, content_hash, preview, favorite, pinned, size_bytes, created_at, updated_at)
+             VALUES ('duplicate', 'different-hash', 'image', 'second.bmp', 'same-pixels', 'image', 0, 0, 128, 2, 2)",
+            [],
+        );
+        assert!(duplicate.is_err());
+
+        repository.soft_delete(&first.id).expect("soft delete");
+        let replacement = repository
+            .insert_or_touch_image(image_draft("same-pixels", "second.bmp"))
+            .expect("replacement image");
+        assert_ne!(first.id, replacement.id);
+    }
+
+    #[test]
+    fn schema_creates_migration_state_and_cleanup_queue() {
+        let repository = open_test_repository();
+        let migration_columns = repository
+            .conn
+            .prepare("PRAGMA table_info(schema_migrations)")
+            .expect("migration schema")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("migration columns")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("migration column names");
+        let cleanup_columns = repository
+            .conn
+            .prepare("PRAGMA table_info(blob_cleanup_queue)")
+            .expect("cleanup schema")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("cleanup columns")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("cleanup column names");
+
+        assert_eq!(
+            migration_columns,
+            vec!["name", "state", "backup_path", "created_at", "updated_at"]
+        );
+        assert_eq!(cleanup_columns, vec!["path", "created_at"]);
+    }
+
+    #[test]
+    fn image_repository_uses_content_identity_and_lists_active_paths() {
+        let repository = open_test_repository();
+        let inserted = repository
+            .insert_or_touch_image(image_draft("pixel-hash", "canonical.bmp"))
+            .expect("insert image");
+        let touched = repository
+            .insert_or_touch_image(image_draft("pixel-hash", "ignored.bmp"))
+            .expect("touch image");
+
+        assert_eq!(inserted.id, touched.id);
+        assert_eq!(inserted.hash, "image:pixel-hash");
+        assert_eq!(inserted.content_hash.as_deref(), Some("pixel-hash"));
+        assert_eq!(
+            repository
+                .find_active_image("pixel-hash")
+                .expect("find image")
+                .expect("active image")
+                .id,
+            inserted.id
+        );
+        assert_eq!(
+            repository.active_blob_paths().expect("active paths"),
+            vec![PathBuf::from("canonical.bmp")]
+        );
+    }
+
+    #[test]
+    fn cleanup_queue_can_list_and_complete_paths() {
+        let repository = open_test_repository();
+        let image = repository
+            .insert_or_touch_image(image_draft("pixel-hash", "obsolete.bmp"))
+            .expect("insert image");
+        repository.soft_delete(&image.id).expect("soft delete");
+
+        assert_eq!(
+            repository.pending_cleanup_paths().expect("pending cleanup"),
+            vec![PathBuf::from("obsolete.bmp")]
+        );
+        repository
+            .complete_cleanup_path(Path::new("obsolete.bmp"))
+            .expect("complete cleanup");
+        assert!(repository
+            .pending_cleanup_paths()
+            .expect("completed cleanup")
+            .is_empty());
+    }
+
+    #[test]
+    fn reference_updates_and_cleanup_enqueue_roll_back_together() {
+        let repository = open_test_repository();
+        let first = repository
+            .insert_or_touch_image(image_draft("first-hash", "first.bmp"))
+            .expect("first image");
+        let second = repository
+            .insert_or_touch_image(image_draft("second-hash", "second.bmp"))
+            .expect("second image");
+        let updates = vec![
+            ImageReferenceUpdate {
+                item_id: first.id.clone(),
+                content_hash: "merged-hash".to_string(),
+                content_path: PathBuf::from("merged.bmp"),
+            },
+            ImageReferenceUpdate {
+                item_id: second.id.clone(),
+                content_hash: "merged-hash".to_string(),
+                content_path: PathBuf::from("merged.bmp"),
+            },
+        ];
+
+        let result = repository.update_image_references_and_enqueue_cleanup(
+            &updates,
+            &[PathBuf::from("first.bmp"), PathBuf::from("second.bmp")],
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            repository
+                .get_item(&first.id)
+                .expect("first item")
+                .expect("active first")
+                .content_hash
+                .as_deref(),
+            Some("first-hash")
+        );
+        assert!(repository
+            .pending_cleanup_paths()
+            .expect("cleanup rollback")
+            .is_empty());
+    }
     #[test]
     fn insert_or_touch_deduplicates_by_hash() {
         let repository = open_test_repository();
@@ -131,27 +330,25 @@ mod tests {
         conn.execute(
             "CREATE VIRTUAL TABLE test_fts USING fts5(content, tokenize='trigram')",
             [],
-        ).expect("create table");
+        )
+        .expect("create table");
 
         conn.execute(
             "INSERT INTO test_fts(content) VALUES (?)",
             ["同步组织排序码到云之家"],
-        ).expect("insert");
+        )
+        .expect("insert");
 
         // First, check if data is actually in the table
-        let row_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM test_fts",
-            [],
-            |row| row.get(0),
-        ).expect("count");
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM test_fts", [], |row| row.get(0))
+            .expect("count");
         println!("Total rows in FTS table: {}", row_count);
 
         // Check the actual content
-        let content: String = conn.query_row(
-            "SELECT content FROM test_fts",
-            [],
-            |row| row.get(0),
-        ).expect("get content");
+        let content: String = conn
+            .query_row("SELECT content FROM test_fts", [], |row| row.get(0))
+            .expect("get content");
         println!("Stored content: {}", content);
 
         // Test trigram tokenizer with CJK text
@@ -159,29 +356,35 @@ mod tests {
 
         // Test 1: Exact substring match (trigram should handle this)
         let q1 = r#""云之家""#;
-        let c1: i64 = conn.query_row(
+        let c1: i64 = conn
+            .query_row(
             "SELECT COUNT(*) FROM test_fts WHERE test_fts MATCH ?",
             [q1],
             |row| row.get(0),
-        ).unwrap_or(0);
+            )
+            .unwrap_or(0);
         println!("Query '{}' -> {}", q1, c1);
 
         // Test 2: Single character
         let q2 = r#""云""#;
-        let c2: i64 = conn.query_row(
+        let c2: i64 = conn
+            .query_row(
             "SELECT COUNT(*) FROM test_fts WHERE test_fts MATCH ?",
             [q2],
             |row| row.get(0),
-        ).unwrap_or(0);
+            )
+            .unwrap_or(0);
         println!("Query '{}' -> {}", q2, c2);
 
         // Test 3: Two characters
         let q3 = r#""云之""#;
-        let c3: i64 = conn.query_row(
+        let c3: i64 = conn
+            .query_row(
             "SELECT COUNT(*) FROM test_fts WHERE test_fts MATCH ?",
             [q3],
             |row| row.get(0),
-        ).unwrap_or(0);
+            )
+            .unwrap_or(0);
         println!("Query '{}' -> {}", q3, c3);
 
         assert!(c1 > 0, "Trigram tokenizer should match CJK substring");
@@ -251,12 +454,25 @@ mod tests {
                 None,
             )
             .expect("2-char search");
-        assert_eq!(results_2char.len(), 2, "Should find 'ab' substring in two items (123ab332sddsdf and test ab content)");
+        assert_eq!(
+            results_2char.len(),
+            2,
+            "Should find 'ab' substring in two items (123ab332sddsdf and test ab content)"
+        );
 
         // Verify the specific items found
-        let found_previews: Vec<&str> = results_2char.iter().map(|item| item.preview.as_str()).collect();
-        assert!(found_previews.contains(&"123ab332sddsdf"), "Should find '123ab332sddsdf'");
-        assert!(found_previews.contains(&"test ab content"), "Should find 'test ab content'");
+        let found_previews: Vec<&str> = results_2char
+            .iter()
+            .map(|item| item.preview.as_str())
+            .collect();
+        assert!(
+            found_previews.contains(&"123ab332sddsdf"),
+            "Should find '123ab332sddsdf'"
+        );
+        assert!(
+            found_previews.contains(&"test ab content"),
+            "Should find 'test ab content'"
+        );
 
         // Test 3-char query (should use FTS5 trigram)
         let results_3char = repository
@@ -270,7 +486,11 @@ mod tests {
                 None,
             )
             .expect("3-char search");
-        assert_eq!(results_3char.len(), 1, "Should find '3ab' in one item via trigram");
+        assert_eq!(
+            results_3char.len(),
+            1,
+            "Should find '3ab' in one item via trigram"
+        );
         assert_eq!(results_3char[0].preview, "123ab332sddsdf");
 
         // Test substring in middle
@@ -285,7 +505,11 @@ mod tests {
                 None,
             )
             .expect("middle substring search");
-        assert_eq!(results_middle.len(), 1, "Should find 'ab3' substring via trigram");
+        assert_eq!(
+            results_middle.len(),
+            1,
+            "Should find 'ab3' substring via trigram"
+        );
         assert_eq!(results_middle[0].preview, "123ab332sddsdf");
     }
 
@@ -448,7 +672,10 @@ mod tests {
         let start = std::time::Instant::now();
         for i in 0..1000 {
             repository
-                .insert_or_touch(text_draft(&format!("测试条目 {}: 这是一段中文内容用于测试搜索性能", i)))
+                .insert_or_touch(text_draft(&format!(
+                    "测试条目 {}: 这是一段中文内容用于测试搜索性能",
+                    i
+                )))
                 .expect("insert");
         }
         let insert_duration = start.elapsed();
@@ -471,9 +698,15 @@ mod tests {
         println!("搜索耗时: {:?}, 结果数: {}", search_duration, results.len());
 
         // Performance assertions
-        assert!(insert_duration.as_millis() < 5000, "插入 1,000 条应在 5 秒内完成");
+        assert!(
+            insert_duration.as_millis() < 5000,
+            "插入 1,000 条应在 5 秒内完成"
+        );
         assert!(search_duration.as_millis() < 100, "搜索应在 100ms 内完成");
-        assert!(results.len() >= 50, "应至少返回 50 条结果（trigram 需要 3+ 字符查询）");
+        assert!(
+            results.len() >= 50,
+            "应至少返回 50 条结果（trigram 需要 3+ 字符查询）"
+        );
     }
 
     #[test]
@@ -542,7 +775,11 @@ mod tests {
             )
             .expect("fts search");
         let fts_duration = fts_start.elapsed();
-        println!("FTS 搜索耗时: {:?}, 结果数: {}", fts_duration, search_results.len());
+        println!(
+            "FTS 搜索耗时: {:?}, 结果数: {}",
+            fts_duration,
+            search_results.len()
+        );
 
         // Performance assertions
         assert!(query_duration.as_millis() < 50, "分页查询应在 50ms 内完成");
@@ -551,6 +788,13 @@ mod tests {
         assert_eq!(page1.len(), 50, "应返回 50 条结果");
         assert_eq!(page2.len(), 50, "第二页应返回 50 条结果");
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageReferenceUpdate {
+    pub item_id: String,
+    pub content_hash: String,
+    pub content_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -601,8 +845,8 @@ impl ClipboardRepository {
         let item_type = format!("{:?}", draft.item_type).to_lowercase();
         self.conn.execute(
             "INSERT INTO clipboard_items
-            (id, hash, item_type, content, content_path, preview, source_app, favorite, size_bytes, sort_rank, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?9, ?10)",
+            (id, hash, item_type, content, content_path, preview, source_app, favorite, size_bytes, sort_rank, created_at, updated_at, content_hash)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?9, ?10, ?11)",
             params![
                 id,
                 hash,
@@ -613,12 +857,122 @@ impl ClipboardRepository {
                 draft.source_app,
                 draft.size_bytes,
                 now,
-                now
+                now,
+                draft.content_hash
             ],
         )?;
         self.rebuild_fts_for_item(&id)?;
         self.get_item(&id)?
             .ok_or_else(|| anyhow::anyhow!("inserted item missing"))
+    }
+
+    pub fn insert_or_touch_image(
+        &self,
+        draft: ClipboardItemDraft,
+    ) -> anyhow::Result<ClipboardItem> {
+        if draft.item_type != ClipboardItemType::Image {
+            return Err(anyhow::anyhow!("image draft must use image item type"));
+        }
+        if draft
+            .content_hash
+            .as_deref()
+            .is_none_or(|content_hash| content_hash.is_empty())
+        {
+            return Err(anyhow::anyhow!("image draft requires content_hash"));
+        }
+
+        self.insert_or_touch(draft)
+    }
+
+    pub fn find_active_image(&self, content_hash: &str) -> anyhow::Result<Option<ClipboardItem>> {
+        self.conn
+            .query_row(
+                "SELECT id, hash, item_type, content, content_path, preview, source_app, favorite, pinned, size_bytes, created_at, updated_at, content_hash
+                 FROM clipboard_items
+                 WHERE item_type = 'image'
+                   AND content_hash = ?1
+                   AND deleted_at IS NULL",
+                params![content_hash],
+                Self::map_item,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn active_blob_paths(&self) -> anyhow::Result<Vec<PathBuf>> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT content_path
+             FROM clipboard_items
+             WHERE item_type = 'image'
+               AND content_hash IS NOT NULL
+               AND content_path IS NOT NULL
+               AND deleted_at IS NULL
+             ORDER BY content_path",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|row| row.map(PathBuf::from))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn update_image_references_and_enqueue_cleanup(
+        &self,
+        updates: &[ImageReferenceUpdate],
+        cleanup_paths: &[PathBuf],
+    ) -> anyhow::Result<()> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let now = Utc::now().timestamp_micros();
+
+        for path in cleanup_paths {
+            transaction.execute(
+                "INSERT OR IGNORE INTO blob_cleanup_queue(path, created_at) VALUES (?1, ?2)",
+                params![path.to_string_lossy(), now],
+            )?;
+        }
+
+        for update in updates {
+            if update.content_hash.is_empty() {
+                return Err(anyhow::anyhow!("image reference requires content_hash"));
+            }
+            let changed = transaction.execute(
+                "UPDATE clipboard_items
+                 SET hash = ?1, content_hash = ?2, content_path = ?3
+                 WHERE id = ?4 AND item_type = 'image' AND deleted_at IS NULL",
+                params![
+                    format!("image:{}", update.content_hash),
+                    update.content_hash,
+                    update.content_path.to_string_lossy(),
+                    update.item_id
+                ],
+            )?;
+            if changed != 1 {
+                return Err(anyhow::anyhow!(
+                    "active image item missing: {}",
+                    update.item_id
+                ));
+            }
+        }
+
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn pending_cleanup_paths(&self) -> anyhow::Result<Vec<PathBuf>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT path FROM blob_cleanup_queue ORDER BY created_at, path")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|row| row.map(PathBuf::from))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn complete_cleanup_path(&self, path: &Path) -> anyhow::Result<()> {
+        self.conn.execute(
+            "DELETE FROM blob_cleanup_queue WHERE path = ?1",
+            params![path.to_string_lossy()],
+        )?;
+        Ok(())
     }
 
     pub fn reorder_items(&self, ids: &[String]) -> anyhow::Result<()> {
@@ -641,7 +995,7 @@ impl ClipboardRepository {
         cursor: Option<i64>,
     ) -> anyhow::Result<Vec<ClipboardItem>> {
         let mut sql = String::from(
-            "SELECT id, hash, item_type, content, content_path, preview, source_app, favorite, pinned, size_bytes, created_at, updated_at
+            "SELECT id, hash, item_type, content, content_path, preview, source_app, favorite, pinned, size_bytes, created_at, updated_at, content_hash
              FROM clipboard_items
              WHERE deleted_at IS NULL",
         );
@@ -701,7 +1055,7 @@ impl ClipboardRepository {
     pub fn get_item(&self, id: &str) -> anyhow::Result<Option<ClipboardItem>> {
         self.conn
             .query_row(
-                "SELECT id, hash, item_type, content, content_path, preview, source_app, favorite, pinned, size_bytes, created_at, updated_at
+                "SELECT id, hash, item_type, content, content_path, preview, source_app, favorite, pinned, size_bytes, created_at, updated_at, content_hash
                  FROM clipboard_items
                  WHERE id = ?1 AND deleted_at IS NULL",
                 params![id],
@@ -729,12 +1083,14 @@ impl ClipboardRepository {
 
     pub fn soft_delete(&self, id: &str) -> anyhow::Result<()> {
         let blob_paths = self.content_paths_for_ids(&[id.to_string()])?;
-        self.conn.execute(
+        let transaction = self.conn.unchecked_transaction()?;
+        enqueue_cleanup_paths(&transaction, &blob_paths)?;
+        transaction.execute(
             "UPDATE clipboard_items SET deleted_at = ?1 WHERE id = ?2",
             params![Utc::now().timestamp_micros(), id],
         )?;
-        self.remove_deleted_from_fts()?;
-        remove_blob_paths(&blob_paths)?;
+        transaction.execute("DELETE FROM clipboard_items_fts WHERE id = ?1", params![id])?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -744,7 +1100,9 @@ impl ClipboardRepository {
         if retention_days > 0 {
             let cutoff = now - retention_days.saturating_mul(24 * 60 * 60 * 1_000_000);
             let blob_paths = self.content_paths_for_retention_cutoff(cutoff)?;
-            self.conn.execute(
+            let transaction = self.conn.unchecked_transaction()?;
+            enqueue_cleanup_paths(&transaction, &blob_paths)?;
+            transaction.execute(
                 "UPDATE clipboard_items
                  SET deleted_at = ?1
                  WHERE deleted_at IS NULL
@@ -752,12 +1110,14 @@ impl ClipboardRepository {
                    AND updated_at < ?2",
                 params![now, cutoff],
             )?;
-            remove_blob_paths(&blob_paths)?;
+            transaction.commit()?;
         }
 
         if max_history_items > 0 {
             let blob_paths = self.content_paths_over_limit(max_history_items)?;
-            self.conn.execute(
+            let transaction = self.conn.unchecked_transaction()?;
+            enqueue_cleanup_paths(&transaction, &blob_paths)?;
+            transaction.execute(
                 "UPDATE clipboard_items
                  SET deleted_at = ?1
                  WHERE deleted_at IS NULL
@@ -773,7 +1133,7 @@ impl ClipboardRepository {
                    )",
                 params![now, max_history_items],
             )?;
-            remove_blob_paths(&blob_paths)?;
+            transaction.commit()?;
         }
 
         self.remove_deleted_from_fts()?;
@@ -781,15 +1141,19 @@ impl ClipboardRepository {
     }
 
     pub fn clear_history(&self) -> anyhow::Result<()> {
-        self.conn.execute("DELETE FROM clipboard_items_fts", [])?;
-        self.conn.execute("DELETE FROM clipboard_items", [])?;
+        let blob_paths = self.active_blob_paths()?;
+        let transaction = self.conn.unchecked_transaction()?;
+        enqueue_cleanup_paths(&transaction, &blob_paths)?;
+        transaction.execute("DELETE FROM clipboard_items_fts", [])?;
+        transaction.execute("DELETE FROM clipboard_items", [])?;
+        transaction.commit()?;
         Ok(())
     }
 
     pub fn find_by_hash(&self, hash: &str) -> anyhow::Result<Option<ClipboardItem>> {
         let item = self.conn
             .query_row(
-                "SELECT id, hash, item_type, content, content_path, preview, source_app, favorite, pinned, size_bytes, created_at, updated_at
+                "SELECT id, hash, item_type, content, content_path, preview, source_app, favorite, pinned, size_bytes, created_at, updated_at, content_hash
                  FROM clipboard_items WHERE hash = ?1 AND deleted_at IS NULL",
                 params![hash],
                 |row| {
@@ -806,6 +1170,7 @@ impl ClipboardRepository {
                         size_bytes: row.get(9)?,
                         created_at: row.get(10)?,
                         updated_at: row.get(11)?,
+                        content_hash: row.get(12)?,
                     })
                 },
             )
@@ -815,8 +1180,8 @@ impl ClipboardRepository {
 
     pub fn insert_imported_item(&self, item: &ClipboardItem) -> anyhow::Result<()> {
         self.conn.execute(
-            "INSERT INTO clipboard_items (id, hash, item_type, content, content_path, preview, source_app, favorite, pinned, size_bytes, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO clipboard_items (id, hash, item_type, content, content_path, preview, source_app, favorite, pinned, size_bytes, created_at, updated_at, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 item.id,
                 item.hash,
@@ -830,6 +1195,7 @@ impl ClipboardRepository {
                 item.size_bytes,
                 item.created_at,
                 item.updated_at,
+                item.content_hash,
             ],
         )?;
 
@@ -931,6 +1297,7 @@ impl ClipboardRepository {
             size_bytes: row.get(9)?,
             created_at: row.get(10)?,
             updated_at: row.get(11)?,
+            content_hash: row.get(12)?,
         })
     }
 }
@@ -976,6 +1343,13 @@ fn migrate_schema(conn: &Connection) -> anyhow::Result<()> {
     if !columns.iter().any(|name| name == "pinned") {
         conn.execute(
             "ALTER TABLE clipboard_items ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+
+    if !columns.iter().any(|name| name == "content_hash") {
+        conn.execute(
+            "ALTER TABLE clipboard_items ADD COLUMN content_hash TEXT",
             [],
         )?;
     }
@@ -1033,11 +1407,13 @@ fn migrate_schema(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn remove_blob_paths(paths: &[PathBuf]) -> anyhow::Result<()> {
+fn enqueue_cleanup_paths(conn: &Connection, paths: &[PathBuf]) -> anyhow::Result<()> {
+    let now = Utc::now().timestamp_micros();
     for path in paths {
-        crate::blobs::remove_blob_if_exists(path)?;
-        let thumbnail_path = crate::blobs::thumbnail_path_for(Path::new(path));
-        crate::blobs::remove_blob_if_exists(&thumbnail_path)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO blob_cleanup_queue(path, created_at) VALUES (?1, ?2)",
+            params![path.to_string_lossy(), now],
+        )?;
     }
     Ok(())
 }
