@@ -44,10 +44,22 @@ impl InstalledImage {
 
 impl ImageBlobStore {
     pub fn new(blob_dir: PathBuf, stage_dir: PathBuf) -> anyhow::Result<Self> {
+        ensure!(
+            blob_dir != stage_dir
+                && blob_dir.parent().is_some()
+                && blob_dir.parent() == stage_dir.parent(),
+            "image blob and stage directories must be distinct siblings"
+        );
         fs::create_dir_all(&blob_dir)
             .with_context(|| format!("create image blob directory {}", blob_dir.display()))?;
         fs::create_dir_all(&stage_dir)
             .with_context(|| format!("create image stage directory {}", stage_dir.display()))?;
+        let blob_dir = blob_dir.canonicalize()?;
+        let stage_dir = stage_dir.canonicalize()?;
+        ensure!(
+            blob_dir != stage_dir && blob_dir.parent() == stage_dir.parent(),
+            "image blob and stage directories must resolve to distinct siblings"
+        );
         Ok(Self {
             blob_dir,
             stage_dir,
@@ -76,14 +88,22 @@ impl ImageBlobStore {
         f(&self.blob_dir, &self.stage_dir)
     }
 
-    pub fn install_staged(&self, staged: StagedImage) -> anyhow::Result<InstalledImage> {
+    pub fn install_staged_with<T>(
+        &self,
+        staged: StagedImage,
+        persist: impl FnOnce(&InstalledImage) -> anyhow::Result<T>,
+        is_referenced: impl FnOnce(&InstalledImage) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<T> {
         let _lease = self.write_lease()?;
-        install_staged_locked(&self.blob_dir, &self.stage_dir, staged)
-    }
-
-    pub fn rollback_install(&self, installed: &InstalledImage) -> anyhow::Result<()> {
-        let _lease = self.write_lease()?;
-        rollback_paths(&installed.created_paths)
+        let installed = install_staged_locked(&self.blob_dir, &self.stage_dir, staged)?;
+        match persist(&installed) {
+            Ok(value) => Ok(value),
+            Err(persist_error) => Err(clean_after_persist_failure(
+                &installed,
+                persist_error,
+                is_referenced,
+            )),
+        }
     }
 
     pub fn managed_usage(&self) -> anyhow::Result<u64> {
@@ -265,6 +285,24 @@ fn clean_failed_install(
     }
 }
 
+fn clean_after_persist_failure(
+    installed: &InstalledImage,
+    persist_error: anyhow::Error,
+    is_referenced: impl FnOnce(&InstalledImage) -> anyhow::Result<bool>,
+) -> anyhow::Error {
+    match is_referenced(installed) {
+        Ok(true) => persist_error,
+        Ok(false) => match rollback_paths(&installed.created_paths) {
+            Ok(()) => persist_error,
+            Err(error) => {
+                anyhow!("{persist_error:#}; additionally failed safe rollback: {error:#}")
+            }
+        },
+        Err(error) => {
+            anyhow!("{persist_error:#}; reference check failed and files were retained: {error:#}")
+        }
+    }
+}
 fn rollback_paths(paths: &[PathBuf]) -> anyhow::Result<()> {
     let mut first_error = None;
     for path in paths.iter().rev() {
@@ -362,6 +400,20 @@ mod tests {
         (root, store)
     }
 
+    fn install_ok(store: &ImageBlobStore, staged: StagedImage) -> InstalledImage {
+        store
+            .install_staged_with(staged, |installed| Ok(installed.clone()), |_| Ok(false))
+            .expect("install")
+    }
+
+    #[test]
+    fn rejects_blob_and_stage_directories_that_are_not_siblings() {
+        let root = temp_dir("non-sibling");
+
+        assert!(ImageBlobStore::new(root.join("one/blobs"), root.join("two/stage")).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn write_lease_waits_for_read_lease() {
         let (root, store) = new_store("lease");
@@ -410,11 +462,11 @@ mod tests {
     fn valid_canonical_hit_is_verified_and_reused() {
         let (root, store) = new_store("canonical-hit");
         let first = stage_dib(store.stage_dir(), dib32([30, 20, 10, 255])).expect("first stage");
-        let first_install = store.install_staged(first).expect("first install");
+        let first_install = install_ok(&store, first);
         let second = stage_dib(store.stage_dir(), dib32([30, 20, 10, 255])).expect("second stage");
         let second_stage_dir = second.stage_dir().to_path_buf();
 
-        let second_install = store.install_staged(second).expect("reuse canonical");
+        let second_install = install_ok(&store, second);
 
         assert_eq!(second_install.content_hash(), first_install.content_hash());
         assert!(second_install.created_paths().is_empty());
@@ -430,7 +482,9 @@ mod tests {
         let stage_dir = staged.stage_dir().to_path_buf();
         fs::write(staged.thumbnail_path(), b"corrupt staged thumbnail").expect("tamper stage");
 
-        assert!(store.install_staged(staged).is_err());
+        assert!(store
+            .install_staged_with(staged, |_| Ok(()), |_| Ok(false))
+            .is_err());
         assert!(!stage_dir.exists());
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -447,7 +501,9 @@ mod tests {
         fs::write(&canonical_bmp, &wrong_bytes).expect("valid wrong BMP");
         fs::remove_dir_all(wrong.stage_dir()).expect("remove wrong stage");
 
-        assert!(store.install_staged(staged).is_err());
+        assert!(store
+            .install_staged_with(staged, |_| Ok(()), |_| Ok(false))
+            .is_err());
         assert_eq!(
             fs::read(canonical_bmp).expect("preserved wrong BMP"),
             wrong_bytes
@@ -460,7 +516,7 @@ mod tests {
     fn mismatched_decodable_thumbnail_is_rejected_without_overwrite() {
         let (root, store) = new_store("wrong-thumbnail");
         let first = stage_dib(store.stage_dir(), dib32([30, 20, 10, 255])).expect("first stage");
-        let installed = store.install_staged(first).expect("first install");
+        let installed = install_ok(&store, first);
         let wrong_thumbnail = ImageBuffer::from_pixel(1, 1, Rgba([250u8, 1, 2, 255]));
         wrong_thumbnail
             .save(installed.thumbnail_path())
@@ -469,7 +525,9 @@ mod tests {
         let staged = stage_dib(store.stage_dir(), dib32([30, 20, 10, 255])).expect("second stage");
         let stage_dir = staged.stage_dir().to_path_buf();
 
-        assert!(store.install_staged(staged).is_err());
+        assert!(store
+            .install_staged_with(staged, |_| Ok(()), |_| Ok(false))
+            .is_err());
         assert_eq!(
             fs::read(installed.thumbnail_path()).expect("preserved wrong thumbnail"),
             wrong_bytes
@@ -478,42 +536,139 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
     #[test]
-    fn second_file_install_failure_rolls_back_new_paths_and_cleans_stage() {
+    fn second_file_install_failure_rolls_back_new_bmp_and_cleans_stage() {
         let (root, store) = new_store("partial-install");
-        let first = stage_dib(store.stage_dir(), dib32([30, 20, 10, 255])).expect("first stage");
-        let installed = store.install_staged(first).expect("first install");
-        fs::remove_file(installed.thumbnail_path()).expect("remove thumbnail");
-        fs::create_dir(installed.thumbnail_path()).expect("blocking thumbnail directory");
-        let staged = stage_dib(store.stage_dir(), dib32([30, 20, 10, 255])).expect("second stage");
+        let staged = stage_dib(store.stage_dir(), dib32([30, 20, 10, 255])).expect("stage");
         let stage_dir = staged.stage_dir().to_path_buf();
+        let bmp_path =
+            canonical_bmp_path(store.blob_dir(), staged.content_hash()).expect("BMP path");
+        let thumbnail_path = canonical_thumbnail_path(store.blob_dir(), staged.content_hash())
+            .expect("thumbnail path");
+        fs::create_dir(&thumbnail_path).expect("blocking thumbnail directory");
+        assert!(!bmp_path.exists());
 
-        assert!(store.install_staged(staged).is_err());
-        assert!(installed.bmp_path().is_file());
-        assert!(installed.thumbnail_path().is_dir());
+        assert!(store
+            .install_staged_with(staged, |_| Ok(()), |_| Ok(false))
+            .is_err());
+
+        assert!(!bmp_path.exists(), "new BMP must be rolled back");
+        assert!(thumbnail_path.is_dir());
         assert!(!stage_dir.exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+    #[test]
+    fn write_lease_covers_persist_and_reference_check_callbacks() {
+        let (root, store) = new_store("transaction-lease");
+        let store = Arc::new(store);
+        let staged = stage_dib(store.stage_dir(), dib32([30, 20, 10, 255])).expect("stage");
+        let (writer_entered_tx, writer_entered_rx) = mpsc::channel();
+        let writer_store = Arc::clone(&store);
+        let mut writer = None;
+
+        let result = store.install_staged_with(
+            staged,
+            |_| {
+                writer = Some(thread::spawn(move || {
+                    writer_store.with_write(|_, _| {
+                        writer_entered_tx.send(()).expect("signal writer");
+                        Ok(())
+                    })
+                }));
+                assert!(writer_entered_rx
+                    .recv_timeout(Duration::from_millis(100))
+                    .is_err());
+                Err::<(), _>(anyhow!("persist failed"))
+            },
+            |_| {
+                assert!(writer_entered_rx
+                    .recv_timeout(Duration::from_millis(100))
+                    .is_err());
+                Ok(true)
+            },
+        );
+
+        assert!(result.is_err());
+        writer_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("writer entered after transaction");
+        writer
+            .expect("writer handle")
+            .join()
+            .expect("writer thread")
+            .expect("writer result");
         fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
-    fn rollback_removes_only_files_created_by_this_install() {
-        let (root, store) = new_store("rollback");
-        let first = stage_dib(store.stage_dir(), dib32([30, 20, 10, 255])).expect("first stage");
-        let first_install = store.install_staged(first).expect("first install");
-        fs::remove_file(first_install.thumbnail_path()).expect("remove first thumbnail");
-        let second = stage_dib(store.stage_dir(), dib32([30, 20, 10, 255])).expect("second stage");
+    fn persist_failure_keeps_new_files_when_reference_exists() {
+        use std::cell::Cell;
 
-        let second_install = store.install_staged(second).expect("second install");
-        assert_eq!(
-            second_install.created_paths(),
-            &[second_install.thumbnail_path().to_path_buf()]
+        let (root, store) = new_store("referenced-rollback");
+        let staged = stage_dib(store.stage_dir(), dib32([30, 20, 10, 255])).expect("stage");
+        let bmp_path =
+            canonical_bmp_path(store.blob_dir(), staged.content_hash()).expect("BMP path");
+        let thumbnail_path = canonical_thumbnail_path(store.blob_dir(), staged.content_hash())
+            .expect("thumbnail path");
+        let referenced = Cell::new(false);
+
+        let result = store.install_staged_with(
+            staged,
+            |installed| {
+                assert!(installed.bmp_path().is_file());
+                assert!(installed.thumbnail_path().is_file());
+                referenced.set(true);
+                Err::<(), _>(anyhow!("persist failed after competing reference"))
+            },
+            |_| Ok(referenced.get()),
         );
-        store.rollback_install(&second_install).expect("rollback");
 
-        assert!(first_install.bmp_path().is_file());
-        assert!(!second_install.thumbnail_path().exists());
+        assert!(result.is_err());
+        assert!(bmp_path.is_file());
+        assert!(thumbnail_path.is_file());
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    #[test]
+    fn persist_failure_removes_only_new_unreferenced_files() {
+        let (root, store) = new_store("unreferenced-rollback");
+        let staged = stage_dib(store.stage_dir(), dib32([30, 20, 10, 255])).expect("stage");
+        let bmp_path =
+            canonical_bmp_path(store.blob_dir(), staged.content_hash()).expect("BMP path");
+        let thumbnail_path = canonical_thumbnail_path(store.blob_dir(), staged.content_hash())
+            .expect("thumbnail path");
+
+        let result = store.install_staged_with(
+            staged,
+            |_| Err::<(), _>(anyhow!("persist failed")),
+            |_| Ok(false),
+        );
+
+        assert!(result.is_err());
+        assert!(!bmp_path.exists());
+        assert!(!thumbnail_path.exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn reference_check_failure_keeps_orphans() {
+        let (root, store) = new_store("reference-check-error");
+        let staged = stage_dib(store.stage_dir(), dib32([30, 20, 10, 255])).expect("stage");
+        let bmp_path =
+            canonical_bmp_path(store.blob_dir(), staged.content_hash()).expect("BMP path");
+        let thumbnail_path = canonical_thumbnail_path(store.blob_dir(), staged.content_hash())
+            .expect("thumbnail path");
+
+        let result = store.install_staged_with(
+            staged,
+            |_| Err::<(), _>(anyhow!("persist failed")),
+            |_| Err(anyhow!("reference query failed")),
+        );
+
+        assert!(result.is_err());
+        assert!(bmp_path.is_file());
+        assert!(thumbnail_path.is_file());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
     #[test]
     fn managed_usage_counts_regular_files_recursively() {
         let (root, store) = new_store("usage");
