@@ -609,16 +609,33 @@ fn read_unicode_text() -> Result<Option<String>> {
 }
 
 fn read_dib_bytes() -> Result<Option<Vec<u8>>> {
-    unsafe {
-        if IsClipboardFormatAvailable(CF_DIBV5 as u32) != 0 {
-            return read_global_bytes(CF_DIBV5 as u32);
+    read_preferred_dib(|format| unsafe {
+        if IsClipboardFormatAvailable(format) == 0 {
+            Ok(None)
+        } else {
+            read_global_bytes(format)
         }
-        if IsClipboardFormatAvailable(CF_DIB as u32) == 0 {
-            return Ok(None);
-        }
+    })
+}
 
-        read_global_bytes(CF_DIB as u32)
+fn read_preferred_dib<F>(mut read_format: F) -> Result<Option<Vec<u8>>>
+where
+    F: FnMut(u32) -> Result<Option<Vec<u8>>>,
+{
+    let mut first_error = None;
+    for format in [CF_DIBV5 as u32, CF_DIB as u32] {
+        match read_format(format) {
+            Ok(Some(bytes)) => return Ok(Some(bytes)),
+            Ok(None) => {}
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
     }
+
+    first_error.map_or(Ok(None), Err)
 }
 
 fn read_file_list() -> Result<Option<Vec<String>>> {
@@ -712,6 +729,98 @@ fn keyboard_input(key: VIRTUAL_KEY, key_up: bool) -> INPUT {
 
 fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod dib_fallback_tests {
+    use super::{read_preferred_dib, CF_DIB, CF_DIBV5};
+    use anyhow::anyhow;
+
+    #[test]
+    fn v5_success_does_not_read_legacy_dib() {
+        let mut reads = Vec::new();
+
+        let result = read_preferred_dib(|format| {
+            reads.push(format);
+            if format == CF_DIBV5 as u32 {
+                Ok(Some(vec![5]))
+            } else {
+                panic!("legacy DIB should not be read")
+            }
+        })
+        .expect("read succeeds");
+
+        assert_eq!(result, Some(vec![5]));
+        assert_eq!(reads, vec![CF_DIBV5 as u32]);
+    }
+
+    #[test]
+    fn v5_none_falls_back_to_legacy_dib() {
+        let mut reads = Vec::new();
+
+        let result = read_preferred_dib(|format| {
+            reads.push(format);
+            if format == CF_DIBV5 as u32 {
+                Ok(None)
+            } else {
+                Ok(Some(vec![4]))
+            }
+        })
+        .expect("legacy read succeeds");
+
+        assert_eq!(result, Some(vec![4]));
+        assert_eq!(reads, vec![CF_DIBV5 as u32, CF_DIB as u32]);
+    }
+
+    #[test]
+    fn v5_error_falls_back_to_legacy_dib() {
+        let mut reads = Vec::new();
+
+        let result = read_preferred_dib(|format| {
+            reads.push(format);
+            if format == CF_DIBV5 as u32 {
+                Err(anyhow!("V5 read failed"))
+            } else {
+                Ok(Some(vec![4]))
+            }
+        })
+        .expect("legacy read succeeds");
+
+        assert_eq!(result, Some(vec![4]));
+        assert_eq!(reads, vec![CF_DIBV5 as u32, CF_DIB as u32]);
+    }
+
+    #[test]
+    fn both_unavailable_returns_none() {
+        let mut reads = Vec::new();
+
+        let result = read_preferred_dib(|format| {
+            reads.push(format);
+            Ok(None)
+        })
+        .expect("unavailable formats are not an error");
+
+        assert_eq!(result, None);
+        assert_eq!(reads, vec![CF_DIBV5 as u32, CF_DIB as u32]);
+    }
+
+    #[test]
+    fn both_fail_returns_first_error() {
+        let mut reads = Vec::new();
+
+        let error = read_preferred_dib(|format| {
+            reads.push(format);
+            if format == CF_DIBV5 as u32 {
+                Err(anyhow!("V5 read failed"))
+            } else {
+                Err(anyhow!("legacy DIB read failed"))
+            }
+        })
+        .expect_err("both reads should fail");
+
+        assert_eq!(error.to_string(), "V5 read failed");
+        assert_eq!(reads, vec![CF_DIBV5 as u32, CF_DIB as u32]);
+    }
 }
 
 // Runtime verification of the write-back paths against the REAL system clipboard.
