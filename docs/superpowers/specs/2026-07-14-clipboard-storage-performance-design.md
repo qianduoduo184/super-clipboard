@@ -25,37 +25,43 @@ The application also decodes full BMP files in list views, returns full item con
 
 ## Clipboard Event Suppression
 
-After a successful application clipboard write, record the resulting Windows clipboard sequence number from `GetClipboardSequenceNumber`. `WM_CLIPBOARDUPDATE` reads the current sequence number and suppresses the event only when it exactly matches the recorded internal sequence. The marker is consumed on match. A later external sequence is always delivered, and a stale internal marker is replaced by the next internal write.
+Each application clipboard writer reads `GetClipboardSequenceNumber` only after every `SetClipboardData` call succeeds and while its `ClipboardGuard` still owns the open clipboard. It records that sequence in a bounded set of recent internal sequences before closing the clipboard, so an external process cannot write between the application write and sequence capture.
+
+`WM_CLIPBOARDUPDATE` immediately reads the current sequence and sends that value, rather than an unqualified unit event, to the worker. A `last_enqueued_sequence` check discards duplicate notifications for the same sequence. The worker suppresses an event only when its sequence is present in the recent-internal set; internal entries are retained until bounded eviction rather than consumed on the first notification. If the clipboard has advanced again before the worker reads it, the stale event is discarded because the newer sequence has its own notification. Sequence value `0` is treated as unavailable and fails open by capturing rather than suppressing.
 
 Sequence matching is preferred over a boolean because clipboard messages are asynchronous and a boolean could suppress an unrelated external copy.
 
 ## Content-Addressed Image Storage
 
-The SHA-256 of the raw DIB payload is the image `content_hash`. Canonical paths are:
+The image `content_hash` is semantic rather than a hash of `GlobalSize` bytes. The DIB is decoded and SHA-256 receives the domain prefix `SCIMG1`, width and height as little-endian `u32`, and row-major RGBA8 pixels. Allocation padding, DIB header variants, palettes, bit masks, and ICC metadata therefore cannot make identical pixels produce different identities. `CF_DIBV5` is attempted first and `CF_DIB` second; both formats use the same decoded-pixel hash. A malformed DIB that cannot be decoded is rejected before any persistent file is created, while clipboard reading may continue to lower-priority formats.
+
+Canonical paths are:
 
 - `<blob_dir>/<content_hash>.bmp`
 - `<blob_dir>/<content_hash>.thumb.png`
 
-Capture computes the hash before persistent file creation. If an active row already has the hash, capture only updates its recency and removes any temporary file. Otherwise it writes a temporary BMP, flushes it, atomically renames it to the canonical path, generates the thumbnail, and inserts the row. Failed database insertion removes newly created files when they are not referenced.
+Capture computes the hash before persistent file creation. If an active row already has the hash, capture only updates its recency and creates no file. Otherwise it writes the BMP and thumbnail into a sibling staging directory, flushes them, and atomically installs them at the canonical paths before inserting the row.
 
-SQLite gains a nullable `content_hash` column and a partial unique index for active image rows. Existing text and file hash behavior remains unchanged. Image draft identity uses `content_hash`, never `content_path`.
+SQLite gains a nullable `content_hash` column and a partial unique index for active image rows. The existing `hash` remains the cross-type search/import deduplication key: text and files keep their current derivation, while image rows use `hash = "image:" + content_hash`. `content_hash` is the authoritative image-blob identity used by canonical paths, the partial unique index, migration, quota accounting, and ZIP manifests. Image draft identity never includes `content_path`.
+
+All image blob access is coordinated by one application-wide `ImageBlobStore` read/write lock without holding the repository mutex during file I/O. Detail reads, paste, and export hold a read lease from before opening a blob until the read or archive copy completes. Capture, delete, prune, migration, and import hold the exclusive write lease while changing file ownership. Under the write lease an operation records which canonical files it created, performs its short repository transaction, and on failure deletes only files it created after confirming that no active row references them. Delete and prune commit database state first, then remove only paths that have no active reference. This closes both read/delete and create/delete time-of-check/time-of-use windows.
 
 ## One-Time Existing-Data Migration
 
-Migration runs during startup after opening the data directory but before starting the clipboard listener. It is guarded by a schema migration marker and performs these phases:
+Migration runs during startup after opening the data directory but before starting the clipboard listener. It holds the `ImageBlobStore` mutex exclusively and is guarded by a migration state row with `pending`, `cleanup_pending`, and `complete` states. It performs these phases:
 
 1. Checkpoint WAL and copy the SQLite database, WAL, and SHM files that exist into a timestamped backup directory.
-2. Hash every existing active image blob by its DIB payload and group equal hashes.
-3. In one SQLite transaction, retain the earliest-created row in each group and merge fields:
+2. Decode every existing active image blob, compute the semantic pixel hash, and group equal hashes. Invalid or missing blobs stop the migration and leave the database unchanged.
+3. In a sibling staging directory, prepare and flush every missing canonical BMP and thumbnail. Existing canonical files must decode to the expected hash or migration stops without changing database references. Legacy files are not deleted in this phase.
+4. In one SQLite transaction, retain the earliest-created row in each group and merge fields:
    - `favorite` and `pinned`: logical OR across the group.
    - `created_at`: earliest value.
    - `updated_at` and `sort_rank`: latest value.
    - `content_path`: canonical content-addressed BMP path.
-4. Soft-delete duplicate rows, remove their FTS rows, populate `content_hash`, and commit.
-5. After commit, move or rename the retained blob to its canonical path, generate or retain the canonical thumbnail, and delete redundant BMP and thumbnail files.
-6. Persist the migration marker only after database merge and canonical file reconciliation complete.
+5. Soft-delete duplicate rows, remove their FTS rows, populate `hash` and `content_hash`, and insert every obsolete BMP/thumbnail path into a durable `blob_cleanup_queue`. Set migration state to `cleanup_pending` and commit.
+6. After commit, process the cleanup queue one path at a time. A queue row is deleted only after the file is absent or successfully removed. Set migration state to `complete` only when the queue is empty, then remove the staging directory.
 
-Backup or transaction failure stops migration without changing history. File cleanup failures are logged with enough path information to retry on the next startup; they do not roll back a valid database transaction. The migration must be idempotent.
+Backup, scan, canonical preparation, or transaction failure stops migration without changing history. A crash before the transaction can leave only unreferenced staged/canonical files; the next run validates and reuses or removes them. A crash after commit leaves valid canonical references and a durable cleanup queue, which the next startup resumes before marking the migration complete. Cleanup failure never rolls back a valid database transaction. The backup path is stored with the migration state so retries do not create unlimited backups. These ordering rules make migration idempotent.
 
 ## Memory and UI Data Flow
 
@@ -65,7 +71,7 @@ Image list rows use the thumbnail path and native lazy loading. The detail panel
 
 Large image buffers are released as soon as their stage finishes. BMP-to-DIB paste skips the 14-byte file header without cloning the remaining payload where the Windows API boundary permits. Capture streams the BMP header and DIB bytes to disk, drops the DIB buffer, and only then decodes the on-disk image for thumbnail generation.
 
-The repository mutex is held only while fetching or mutating database records. File reads, hashing, thumbnail work, archive work, and Windows clipboard writes occur outside the lock.
+The repository mutex is held only while fetching or mutating database records. File reads, hashing, thumbnail work, archive work, and Windows clipboard writes occur outside the repository lock. Image file access and ownership are protected separately by `ImageBlobStore` read/write leases as described above.
 
 ## Backup Format
 
@@ -74,21 +80,27 @@ New exports use a ZIP archive containing:
 - `manifest.json`: backup version, timestamp, item count, and serialized history records whose `content_path` values refer to archive-relative blob entries.
 - `blobs/<content_hash>.bmp`: each referenced image blob once.
 
-ZIP entries are written sequentially to the destination file. Blob files are copied through bounded buffers; no Base64 payload or whole archive string is retained in memory. Import validates archive paths, extracts to temporary files, and commits database changes only after validation.
+ZIP entries are written sequentially to the destination file. Blob files are copied through bounded buffers; no Base64 payload or whole archive string is retained in memory.
 
-Legacy `.json` backup import remains supported. New export defaults to `.zip`; legacy JSON export is removed from the UI to avoid unsafe memory behavior.
+Import preserves the existing UI semantics: merge skips items whose cross-type `hash` already exists, while overwrite replaces the complete history. Both modes first validate manifest version, archive-relative paths, item/blob references, decoded image hashes, and free space, then extract into a sibling staging directory. Cleanup-pending files are processed before projection. The importer computes exact projected managed usage from the resulting reference set, staged canonical BMP/thumbnail sizes, and remaining managed files; if the post-cleanup result exceeds 5 GiB, the entire import is rejected even when the archive contains only favorites. Under the `ImageBlobStore` write lease, canonical files are installed without deleting existing files, followed by one repository transaction. Merge inserts only non-conflicting items. Overwrite replaces rows and FTS contents transactionally while old blobs remain available. The same transaction inserts every path made unreferenced by the new rows into `blob_cleanup_queue`; after commit the queue is processed. On transaction failure, old history, cleanup queue, and blobs remain intact and newly installed unreferenced files are removed. Overwrite also creates a complete streaming ZIP safety backup before starting; backup failure aborts import.
+
+Legacy `.json` backup import remains supported with the same merge/overwrite semantics, but its decoded contents are normalized through the same staging, hash validation, transaction, and cleanup pipeline. New export defaults to `.zip`; legacy JSON export is removed from the UI to avoid unsafe memory behavior.
 
 ## Capacity, Pruning, and Logging
 
-The maximum accepted clipboard image payload is 100 MiB. Blob storage has a default 5 GiB quota. Non-favorite history is pruned by age, count, and then byte pressure. Favorite images count toward the quota but are never deleted automatically; if favorites leave insufficient capacity, new image capture is rejected with a clear diagnostic and user-visible error event.
+The maximum accepted clipboard image allocation is 100 MiB. Managed blob usage is the sum of all regular files under `blob_dir`, including canonical BMPs, thumbnails, temporary files, orphan files, and files awaiting cleanup; database/WAL files and backup/import staging directories outside `blob_dir` are excluded. The default steady-state managed-blob quota is 5 GiB.
 
-Pruning is triggered at most once per configured interval and may also run at startup. Ordinary duplicate touches do not run a full retention scan.
+For a new image, capture checks capacity before persistent creation using the exact BMP byte count plus a 1 MiB thumbnail reservation. It prunes non-favorites by age, then count, then oldest-first byte pressure and recomputes managed usage. If the reservation still does not fit, capture is rejected before history changes. After staging produces the exact thumbnail size, capacity is checked again before canonical installation; a failed second check removes the stage. A duplicate image touch creates no bytes and bypasses capacity reservation. Favorite images count toward the quota but are never deleted automatically; pinned but non-favorite items follow the existing prune policy. Soft-deleted, orphan, and cleanup-pending files count until physically removed.
 
-The diagnostic log rotates by size using a small fixed generation count. Rotation occurs while holding the existing log mutex. Logging failure falls back to stderr and never breaks clipboard operations.
+One-time migration and user-initiated import may temporarily require both old and new blobs. They run while capture is stopped, use sibling staging directories, perform an explicit free-space preflight, and restore steady-state quota accounting before capture resumes. A failed preflight aborts without database changes.
+
+Pruning is triggered at startup and at most once every 10 minutes thereafter. Ordinary duplicate touches do not run a full retention scan. The interval and 5 GiB quota are backend constants in this release rather than new user settings.
+
+The diagnostic log rotates at 10 MiB and retains three generations (`.log.1` through `.log.3`). These values are backend constants. Rotation occurs while holding the existing log mutex. Logging failure falls back to stderr and never breaks clipboard operations.
 
 ## Error Handling and Recovery
 
-- Internal sequence suppression only occurs for an exact sequence match.
+- Internal sequence suppression only occurs for an exact recorded sequence; duplicate notifications and stale worker events are ignored separately.
 - Temporary blob and archive paths are constrained to their owned directories.
 - Canonical rename handles the case where another capture already created the same hash path.
 - Database backup is mandatory before the one-time deduplication migration.
@@ -99,14 +111,14 @@ The diagnostic log rotates by size using a small fixed generation count. Rotatio
 
 All behavior changes follow test-driven development. Tests cover:
 
-- Exact-match clipboard sequence suppression and preservation of later external events.
-- Stable DIB hashing and content-addressed paths.
+- Exact-match clipboard sequence suppression, duplicate notification handling, queued internal writes, and preservation of later external events.
+- Stable semantic pixel hashing across `GlobalSize` padding, `CF_DIB`/`CF_DIBV5` variants, and content-addressed paths.
 - Duplicate image touch without duplicate file creation.
 - Migration field merging, backup gating, idempotence, rollback, and cleanup retry.
 - Lightweight list DTO omission of full content.
 - Thumbnail path mapping and lazy image loading.
-- Streaming ZIP round trip, path validation, and legacy JSON import.
-- Image size and blob quota policy.
+- Streaming ZIP merge/overwrite round trips, transaction rollback, path validation, safety backup gating, and legacy JSON import.
+- Image size, managed-usage accounting, duplicate-touch behavior, reservation rollback, and blob quota policy.
 - Prune rate limiting and log rotation.
 - Repository lock release around slow I/O where testable through extracted units.
 
