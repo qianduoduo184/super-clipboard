@@ -1,8 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use image::ImageReader;
+use ::image::ImageReader;
 use uuid::Uuid;
+
+pub mod image;
+pub mod store;
 
 pub fn ensure_blob_dir(app_data: &Path) -> anyhow::Result<PathBuf> {
     let dir = app_data.join("blobs");
@@ -179,7 +182,7 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> anyhow::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{ImageBuffer, Rgba};
+    use ::image::{ImageBuffer, Rgba};
 
     #[test]
     fn build_blob_path_keeps_requested_extension() {
