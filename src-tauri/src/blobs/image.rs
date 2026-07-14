@@ -3,7 +3,8 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context};
+use ::image::{DynamicImage, RgbaImage};
+use anyhow::{anyhow, ensure, Context};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -16,21 +17,179 @@ pub struct ImageIdentity {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StagedImage {
-    pub content_hash: String,
-    pub bmp_path: PathBuf,
-    pub thumbnail_path: PathBuf,
-    pub bmp_size: u64,
-    pub thumbnail_size: u64,
+    content_hash: String,
+    stage_dir: PathBuf,
+    bmp_path: PathBuf,
+    thumbnail_path: PathBuf,
+    bmp_size: u64,
+    thumbnail_size: u64,
+}
+
+impl StagedImage {
+    pub fn content_hash(&self) -> &str {
+        &self.content_hash
+    }
+
+    pub fn stage_dir(&self) -> &Path {
+        &self.stage_dir
+    }
+
+    pub fn bmp_path(&self) -> &Path {
+        &self.bmp_path
+    }
+
+    pub fn thumbnail_path(&self) -> &Path {
+        &self.thumbnail_path
+    }
+
+    pub fn bmp_size(&self) -> u64 {
+        self.bmp_size
+    }
+
+    pub fn thumbnail_size(&self) -> u64 {
+        self.thumbnail_size
+    }
 }
 
 pub fn image_identity_from_dib(dib: &[u8]) -> anyhow::Result<ImageIdentity> {
     let bmp = super::bmp_file_from_dib(dib).context("wrap DIB as BMP")?;
-    let decoded = ::image::load_from_memory_with_format(&bmp, ::image::ImageFormat::Bmp)
-        .context("decode DIB pixels")?;
-    let rgba = decoded.into_rgba8();
+    let rgba = ::image::load_from_memory_with_format(&bmp, ::image::ImageFormat::Bmp)
+        .context("decode DIB pixels")?
+        .into_rgba8();
+    Ok(image_identity_from_rgba(&rgba))
+}
+
+pub fn canonical_bmp_path(blob_dir: &Path, content_hash: &str) -> anyhow::Result<PathBuf> {
+    canonical_image_path(blob_dir, content_hash, ".bmp")
+}
+
+pub fn canonical_thumbnail_path(blob_dir: &Path, content_hash: &str) -> anyhow::Result<PathBuf> {
+    canonical_image_path(blob_dir, content_hash, ".thumb.png")
+}
+
+pub fn stage_dib(stage_root: &Path, dib: Vec<u8>) -> anyhow::Result<StagedImage> {
+    fs::create_dir_all(stage_root)
+        .with_context(|| format!("create stage root {}", stage_root.display()))?;
+    let stage_id = Uuid::new_v4().to_string();
+    let stage_dir = stage_root.join(&stage_id);
+    fs::create_dir(&stage_dir)
+        .with_context(|| format!("create image stage {}", stage_dir.display()))?;
+
+    match stage_dib_in(&stage_dir, &stage_id, dib) {
+        Ok(staged) => Ok(staged),
+        Err(stage_error) => Err(clean_stage_after_error(&stage_dir, stage_error)),
+    }
+}
+
+fn stage_dib_in(stage_dir: &Path, stage_id: &str, dib: Vec<u8>) -> anyhow::Result<StagedImage> {
+    let raw_bmp_path = stage_dir.join(format!("{stage_id}.bmp"));
+    let header = bmp_header(&dib)?;
+    let mut bmp_file = File::create(&raw_bmp_path)
+        .with_context(|| format!("create staged BMP {}", raw_bmp_path.display()))?;
+    bmp_file.write_all(&header)?;
+    bmp_file.write_all(&dib)?;
+    bmp_file.flush()?;
+    bmp_file.sync_all()?;
+    let bmp_size = bmp_file.metadata()?.len();
+    drop(bmp_file);
+    drop(dib);
+
+    let rgba = decode_rgba(&raw_bmp_path)
+        .with_context(|| format!("decode staged BMP {}", raw_bmp_path.display()))?;
+    let identity = image_identity_from_rgba(&rgba);
+    let bmp_path = canonical_bmp_path(stage_dir, &identity.content_hash)?;
+    fs::rename(&raw_bmp_path, &bmp_path).with_context(|| {
+        format!(
+            "name staged BMP {} as {}",
+            raw_bmp_path.display(),
+            bmp_path.display()
+        )
+    })?;
+
+    let thumbnail_path = canonical_thumbnail_path(stage_dir, &identity.content_hash)?;
+    let thumbnail = thumbnail_from_rgba(rgba);
+    write_png_flushed(&thumbnail_path, &thumbnail)?;
+    let thumbnail_size = fs::metadata(&thumbnail_path)?.len();
+
+    Ok(StagedImage {
+        content_hash: identity.content_hash,
+        stage_dir: stage_dir.canonicalize()?,
+        bmp_path,
+        thumbnail_path,
+        bmp_size,
+        thumbnail_size,
+    })
+}
+
+pub(crate) fn decoded_thumbnail_for_hash(
+    bmp_path: &Path,
+    expected_hash: &str,
+) -> anyhow::Result<RgbaImage> {
+    validate_content_hash(expected_hash)?;
+    let rgba = decode_rgba(bmp_path)
+        .with_context(|| format!("decode BMP for validation {}", bmp_path.display()))?;
+    let actual = image_identity_from_rgba(&rgba);
+    ensure!(
+        actual.content_hash == expected_hash,
+        "BMP semantic hash mismatch for {}: expected {}, got {}",
+        bmp_path.display(),
+        expected_hash,
+        actual.content_hash
+    );
+    Ok(thumbnail_from_rgba(rgba))
+}
+
+pub(crate) fn validate_thumbnail(
+    thumbnail_path: &Path,
+    expected: &RgbaImage,
+) -> anyhow::Result<()> {
+    let actual = decode_rgba(thumbnail_path).with_context(|| {
+        format!(
+            "decode thumbnail for validation {}",
+            thumbnail_path.display()
+        )
+    })?;
+    ensure!(
+        actual.dimensions() == expected.dimensions() && actual.as_raw() == expected.as_raw(),
+        "thumbnail content mismatch for {}",
+        thumbnail_path.display()
+    );
+    Ok(())
+}
+
+fn canonical_image_path(root: &Path, content_hash: &str, suffix: &str) -> anyhow::Result<PathBuf> {
+    validate_content_hash(content_hash)?;
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("canonicalize image root {}", root.display()))?;
+    ensure!(
+        root.is_dir(),
+        "image root is not a directory: {}",
+        root.display()
+    );
+    let path = root.join(format!("{content_hash}{suffix}"));
+    ensure!(
+        path.starts_with(&root) && path.parent() == Some(root.as_path()),
+        "canonical image path escapes root {}",
+        root.display()
+    );
+    Ok(path)
+}
+
+fn validate_content_hash(content_hash: &str) -> anyhow::Result<()> {
+    ensure!(
+        content_hash.len() == 64
+            && content_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "invalid image content hash"
+    );
+    Ok(())
+}
+
+fn image_identity_from_rgba(rgba: &RgbaImage) -> ImageIdentity {
     let width = rgba.width();
     let height = rgba.height();
-
     let mut hasher = Sha256::new();
     hasher.update(b"SCIMG1");
     hasher.update(width.to_le_bytes());
@@ -41,85 +200,44 @@ pub fn image_identity_from_dib(dib: &[u8]) -> anyhow::Result<ImageIdentity> {
     for byte in digest {
         write!(&mut content_hash, "{byte:02x}").expect("writing to String cannot fail");
     }
-
-    Ok(ImageIdentity {
+    ImageIdentity {
         content_hash,
         width,
         height,
-    })
-}
-
-pub fn canonical_bmp_path(blob_dir: &Path, content_hash: &str) -> PathBuf {
-    blob_dir.join(format!("{content_hash}.bmp"))
-}
-
-pub fn canonical_thumbnail_path(blob_dir: &Path, content_hash: &str) -> PathBuf {
-    blob_dir.join(format!("{content_hash}.thumb.png"))
-}
-
-pub fn stage_dib(stage_root: &Path, dib: Vec<u8>) -> anyhow::Result<StagedImage> {
-    let identity = image_identity_from_dib(&dib)?;
-    fs::create_dir_all(stage_root)
-        .with_context(|| format!("create stage root {}", stage_root.display()))?;
-    let stage_dir = stage_root.join(Uuid::new_v4().to_string());
-    fs::create_dir(&stage_dir)
-        .with_context(|| format!("create image stage {}", stage_dir.display()))?;
-
-    match stage_dib_in(&stage_dir, dib, identity) {
-        Ok(staged) => Ok(staged),
-        Err(stage_error) => {
-            if let Err(cleanup_error) = fs::remove_dir_all(&stage_dir) {
-                return Err(cleanup_error).with_context(|| {
-                    format!(
-                        "clean failed image stage {} after: {stage_error:#}",
-                        stage_dir.display()
-                    )
-                });
-            }
-            Err(stage_error)
-        }
     }
 }
 
-fn stage_dib_in(
-    stage_dir: &Path,
-    dib: Vec<u8>,
-    identity: ImageIdentity,
-) -> anyhow::Result<StagedImage> {
-    let bmp_path = canonical_bmp_path(stage_dir, &identity.content_hash);
-    let thumbnail_path = canonical_thumbnail_path(stage_dir, &identity.content_hash);
-    let header = bmp_header(&dib)?;
-
-    let mut bmp_file = File::create(&bmp_path)
-        .with_context(|| format!("create staged BMP {}", bmp_path.display()))?;
-    bmp_file.write_all(&header)?;
-    bmp_file.write_all(&dib)?;
-    bmp_file.flush()?;
-    bmp_file.sync_all()?;
-    let bmp_size = bmp_file.metadata()?.len();
-    drop(bmp_file);
-    drop(dib);
-
-    let decoded = ::image::ImageReader::open(&bmp_path)?
+fn decode_rgba(path: &Path) -> anyhow::Result<RgbaImage> {
+    Ok(::image::ImageReader::open(path)?
         .with_guessed_format()?
-        .decode()
-        .with_context(|| format!("decode staged BMP {}", bmp_path.display()))?;
-    let thumbnail = decoded.thumbnail(320, 320);
-    let thumbnail_file = File::create(&thumbnail_path)
-        .with_context(|| format!("create thumbnail {}", thumbnail_path.display()))?;
-    let mut thumbnail_writer = BufWriter::new(thumbnail_file);
-    thumbnail.write_to(&mut thumbnail_writer, ::image::ImageFormat::Png)?;
-    thumbnail_writer.flush()?;
-    thumbnail_writer.get_ref().sync_all()?;
-    let thumbnail_size = thumbnail_writer.get_ref().metadata()?.len();
+        .decode()?
+        .into_rgba8())
+}
 
-    Ok(StagedImage {
-        content_hash: identity.content_hash,
-        bmp_path,
-        thumbnail_path,
-        bmp_size,
-        thumbnail_size,
-    })
+fn thumbnail_from_rgba(rgba: RgbaImage) -> RgbaImage {
+    DynamicImage::ImageRgba8(rgba)
+        .thumbnail(320, 320)
+        .into_rgba8()
+}
+
+fn write_png_flushed(path: &Path, rgba: &RgbaImage) -> anyhow::Result<()> {
+    let file =
+        File::create(path).with_context(|| format!("create thumbnail {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    DynamicImage::ImageRgba8(rgba.clone()).write_to(&mut writer, ::image::ImageFormat::Png)?;
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    Ok(())
+}
+
+fn clean_stage_after_error(stage_dir: &Path, stage_error: anyhow::Error) -> anyhow::Error {
+    match fs::remove_dir_all(stage_dir) {
+        Ok(()) => stage_error,
+        Err(cleanup_error) => anyhow!(
+            "{stage_error:#}; additionally failed to clean image stage {}: {cleanup_error}",
+            stage_dir.display()
+        ),
+    }
 }
 
 fn bmp_header(dib: &[u8]) -> anyhow::Result<[u8; 14]> {
@@ -143,7 +261,6 @@ fn bmp_header(dib: &[u8]) -> anyhow::Result<[u8; 14]> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::Path;
     use uuid::Uuid;
 
     fn dib32(header_size: usize, bgra: [u8; 4]) -> Vec<u8> {
@@ -158,7 +275,41 @@ mod tests {
         dib
     }
 
-    fn temp_dir(label: &str) -> std::path::PathBuf {
+    fn equivalent_2x2_dib32() -> Vec<u8> {
+        let mut dib = vec![0u8; 40];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&2i32.to_le_bytes());
+        dib[8..12].copy_from_slice(&(-2i32).to_le_bytes());
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+        dib[20..24].copy_from_slice(&16u32.to_le_bytes());
+        dib.extend_from_slice(&[
+            0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255,
+        ]);
+        dib
+    }
+
+    fn bottom_up_2x2_dib24() -> Vec<u8> {
+        let mut dib = vec![0u8; 40];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&2i32.to_le_bytes());
+        dib[8..12].copy_from_slice(&2i32.to_le_bytes());
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&24u16.to_le_bytes());
+        dib[20..24].copy_from_slice(&16u32.to_le_bytes());
+        dib.extend_from_slice(&[
+            255, 0, 0, 255, 255, 255, 0xAA, 0xBB, 0, 0, 255, 0, 255, 0, 0xCC, 0xDD,
+        ]);
+        dib
+    }
+
+    fn truncated_decodable_header() -> Vec<u8> {
+        let mut dib = dib32(40, [3, 2, 1, 255]);
+        dib.truncate(40);
+        dib
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("super-clipboard-{label}-{}", Uuid::new_v4()))
     }
 
@@ -193,6 +344,14 @@ mod tests {
     }
 
     #[test]
+    fn handles_24_bit_bottom_up_rows_with_scanline_padding() {
+        assert_eq!(
+            image_identity_from_dib(&bottom_up_2x2_dib24()).expect("24-bit identity"),
+            image_identity_from_dib(&equivalent_2x2_dib32()).expect("32-bit identity")
+        );
+    }
+
+    #[test]
     fn different_pixels_have_different_identities() {
         assert_ne!(
             image_identity_from_dib(&dib32(40, [30, 20, 10, 255])).expect("first"),
@@ -206,43 +365,67 @@ mod tests {
     }
 
     #[test]
-    fn canonical_paths_use_the_content_hash() {
-        let root = Path::new("blobs");
-        assert_eq!(canonical_bmp_path(root, "abc"), root.join("abc.bmp"));
+    fn canonical_paths_require_strict_lowercase_sha256() {
+        let root = temp_dir("canonical");
+        fs::create_dir_all(&root).expect("root");
+        let hash = "26633a34f877ab76f1a9b09be0a021cfb7fe0ed963b5132cb9c3ab910dd499f6";
+
         assert_eq!(
-            canonical_thumbnail_path(root, "abc"),
-            root.join("abc.thumb.png")
+            canonical_bmp_path(&root, hash).expect("bmp path"),
+            root.canonicalize()
+                .expect("canonical root")
+                .join(format!("{hash}.bmp"))
         );
+        assert_eq!(
+            canonical_thumbnail_path(&root, hash).expect("thumbnail path"),
+            root.canonicalize()
+                .expect("canonical root")
+                .join(format!("{hash}.thumb.png"))
+        );
+        for invalid in [
+            "../escape",
+            "26633A34F877AB76F1A9B09BE0A021CFB7FE0ED963B5132CB9C3AB910DD499F6",
+            "abc",
+            "26633a34f877ab76f1a9b09be0a021cfb7fe0ed963b5132cb9c3ab910dd499f60",
+        ] {
+            assert!(
+                canonical_bmp_path(&root, invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
     fn stages_a_flushed_bmp_and_thumbnail() {
         let root = temp_dir("stage-image");
         let staged = stage_dib(&root, dib32(40, [30, 20, 10, 255])).expect("staged image");
-        assert!(staged.bmp_path.is_file());
-        assert!(staged.thumbnail_path.is_file());
+        assert!(staged.bmp_path().is_file());
+        assert!(staged.thumbnail_path().is_file());
         assert_eq!(
-            fs::metadata(&staged.bmp_path).expect("bmp metadata").len(),
-            staged.bmp_size
+            fs::metadata(staged.bmp_path()).expect("bmp metadata").len(),
+            staged.bmp_size()
         );
         assert_eq!(
-            fs::metadata(&staged.thumbnail_path)
+            fs::metadata(staged.thumbnail_path())
                 .expect("thumbnail metadata")
                 .len(),
-            staged.thumbnail_size
+            staged.thumbnail_size()
         );
         assert_eq!(
-            staged.bmp_path.file_name().and_then(|name| name.to_str()),
-            Some(format!("{}.bmp", staged.content_hash).as_str())
+            staged.bmp_path().file_name().and_then(|name| name.to_str()),
+            Some(format!("{}.bmp", staged.content_hash()).as_str())
         );
         fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
-    fn failed_stage_removes_its_stage_directory() {
-        let root = temp_dir("stage-failure");
-        assert!(stage_dib(&root, b"invalid".to_vec()).is_err());
-        assert!(!root.exists() || fs::read_dir(&root).expect("read root").next().is_none());
-        let _ = fs::remove_dir_all(root);
+    fn decode_failure_after_stage_creation_removes_uuid_stage() {
+        let root = temp_dir("stage-decode-failure");
+        fs::create_dir_all(&root).expect("stage root");
+
+        assert!(stage_dib(&root, truncated_decodable_header()).is_err());
+        assert!(fs::read_dir(&root).expect("read root").next().is_none());
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }
