@@ -82,28 +82,33 @@ fn store_image_capture(
     image_store: &ImageBlobStore,
     dib: Vec<u8>,
 ) -> anyhow::Result<ClipboardItem> {
+    store_image_capture_with(repository, image_store, dib, || {})
+}
+
+fn store_image_capture_with(
+    repository: &Mutex<ClipboardRepository>,
+    image_store: &ImageBlobStore,
+    dib: Vec<u8>,
+    on_existing: impl FnOnce(),
+) -> anyhow::Result<ClipboardItem> {
     let size_bytes = i64::try_from(dib.len()).unwrap_or(i64::MAX);
     let identity = image_identity_from_dib(&dib)?;
-    let existing = {
-        repository
-            .lock()
-            .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?
-            .find_active_image(&identity.content_hash)?
-    };
-    if let Some(existing) = existing {
+    let repository_guard = repository
+        .lock()
+        .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?;
+    if let Some(existing) = repository_guard.find_active_image(&identity.content_hash)? {
+        on_existing();
         let content_path = existing
             .content_path
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("active image has no blob path"))?;
-        return repository
-            .lock()
-            .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?
-            .insert_or_touch_image(image_draft(
-                &identity.content_hash,
-                std::path::Path::new(content_path),
-                size_bytes,
-            ));
+        return repository_guard.insert_or_touch_image(image_draft(
+            &identity.content_hash,
+            std::path::Path::new(content_path),
+            size_bytes,
+        ));
     }
+    drop(repository_guard);
 
     let staged = stage_dib(image_store.stage_dir(), dib)?;
     anyhow::ensure!(
@@ -287,12 +292,16 @@ pub fn start_background_listener(
 
 #[cfg(test)]
 mod tests {
-    use super::{image_draft, install_image_capture, store_image_capture};
+    use super::{
+        image_draft, install_image_capture, store_image_capture, store_image_capture_with,
+    };
     use crate::blobs::image::stage_dib;
     use crate::blobs::store::ImageBlobStore;
     use crate::storage::repository::ClipboardRepository;
     use std::fs;
-    use std::sync::Mutex;
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
     use uuid::Uuid;
 
     fn dib32(header_size: u32, pixel: [u8; 4], trailing_padding: usize) -> Vec<u8> {
@@ -371,6 +380,57 @@ mod tests {
         assert!(fs::read_dir(store.stage_dir())
             .expect("stage directory")
             .next()
+            .is_none());
+        drop(repository);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn duplicate_capture_does_not_rebuild_row_after_concurrent_delete() {
+        let root = std::env::temp_dir().join(format!(
+            "super-clipboard-capture-delete-race-{}",
+            Uuid::new_v4()
+        ));
+        let repository = Arc::new(Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        ));
+        let store =
+            Arc::new(ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store"));
+        let dib = dib32(40, [30, 20, 10, 255], 0);
+        let first = store_image_capture(&repository, &store, dib.clone()).expect("first capture");
+        let content_hash = first.content_hash.clone().expect("content hash");
+        let (delete_start_tx, delete_start_rx) = mpsc::channel();
+        let (delete_done_tx, delete_done_rx) = mpsc::channel();
+        let delete_repository = Arc::clone(&repository);
+        let delete_store = Arc::clone(&store);
+        let first_id = first.id.clone();
+        let delete_worker = thread::spawn(move || {
+            delete_start_rx.recv().expect("delete start");
+            crate::commands::mutate_and_cleanup_blobs(
+                &delete_repository,
+                &delete_store,
+                |repository| repository.soft_delete(&first_id),
+            )
+            .expect("delete image");
+            delete_done_tx.send(()).expect("delete done");
+        });
+
+        store_image_capture_with(&repository, &store, dib, || {
+            delete_start_tx.send(()).expect("start delete");
+            thread::sleep(Duration::from_millis(100));
+        })
+        .expect("duplicate capture");
+        delete_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("delete completed");
+        delete_worker.join().expect("delete worker");
+
+        assert!(repository
+            .lock()
+            .expect("repository lock")
+            .find_active_image(&content_hash)
+            .expect("active image")
             .is_none());
         drop(repository);
         drop(store);

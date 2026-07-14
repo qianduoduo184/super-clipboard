@@ -4,6 +4,7 @@ use tauri_plugin_updater::UpdaterExt;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
@@ -97,33 +98,45 @@ fn cleanup_pending_blobs(
         })
         .collect::<HashSet<_>>();
 
+    let mut first_error = None;
     for path in pending_paths {
         if active_paths.contains(&path) {
             continue;
         }
-        anyhow::ensure!(
-            path.is_absolute() && path.parent() == Some(blob_dir),
-            "cleanup path outside allowed directory: {}",
-            path.display()
-        );
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) => {
-                anyhow::ensure!(
-                    metadata.file_type().is_file() || metadata.file_type().is_symlink(),
-                    "cleanup path is not a file: {}",
-                    path.display()
-                );
-                fs::remove_file(&path)?;
+        let cleanup_result = (|| {
+            anyhow::ensure!(
+                path.is_absolute() && path.parent() == Some(blob_dir),
+                "cleanup path outside allowed directory: {}",
+                path.display()
+            );
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    anyhow::ensure!(
+                        metadata.file_type().is_file() || metadata.file_type().is_symlink(),
+                        "cleanup path is not a file: {}",
+                        path.display()
+                    );
+                    fs::remove_file(&path)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+            repository
+                .lock()
+                .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?
+                .complete_cleanup_path(&path)?;
+            Ok::<(), anyhow::Error>(())
+        })();
+        if let Err(error) = cleanup_result {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
         }
-        repository
-            .lock()
-            .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?
-            .complete_cleanup_path(&path)?;
     }
-    Ok(())
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -651,6 +664,9 @@ fn safe_backup_blob_filename(filename: &str) -> Result<String, String> {
             if name.is_empty() {
                 return Err("blob 文件名不能为空".to_string());
             }
+            if name.ends_with('.') || name.ends_with(' ') {
+                return Err("blob 文件名不能以空格或点结尾".to_string());
+            }
             Ok(name.to_string())
         }
         _ => Err("blob 文件名不能包含路径分隔符或上级目录".to_string()),
@@ -929,17 +945,7 @@ fn import_backup_data_with(
     merge: bool,
 ) -> Result<usize, String> {
     image_store
-        .with_write(|blob_dir, _| {
-            if !merge {
-                repository
-                    .lock()
-                    .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?
-                    .clear_history()
-                    .map_err(|error| anyhow::anyhow!("清空历史失败: {error}"))?;
-                cleanup_pending_blobs(repository, blob_dir)
-                    .map_err(|error| anyhow::anyhow!("清空 blob 目录失败: {error}"))?;
-            }
-
+        .with_write(|blob_dir, stage_root| {
             let items = if merge {
                 let repository = repository
                     .lock()
@@ -961,23 +967,33 @@ fn import_backup_data_with(
                 .filter_map(|item| item.content_path.clone())
                 .collect::<HashSet<_>>();
 
-            let mut prepared_blobs = HashMap::new();
+            struct PreparedBlob {
+                target_path: PathBuf,
+                data: Vec<u8>,
+                original_names: Vec<String>,
+                should_write: bool,
+                staged_path: Option<PathBuf>,
+            }
+
+            let mut prepared_blobs: HashMap<String, PreparedBlob> = HashMap::new();
             for blob in &backup.blobs {
                 if merge && !referenced_blob_names.contains(&blob.filename) {
                     continue;
                 }
                 let filename = safe_backup_blob_filename(&blob.filename)
                     .map_err(|error| anyhow::anyhow!(error))?;
+                let target_identity = filename.to_ascii_lowercase();
                 let blob_path = blob_dir.join(&filename);
                 let data = base64_decode(&blob.data_base64).map_err(|error| {
                     anyhow::anyhow!("解码 blob {} 失败: {error}", blob.filename)
                 })?;
-                if let Some((_, existing_data, _)) = prepared_blobs.get(&blob.filename) {
+                if let Some(existing) = prepared_blobs.get_mut(&target_identity) {
                     anyhow::ensure!(
-                        existing_data == &data,
-                        "merge blob conflict: {}",
+                        existing.data == data,
+                        "backup blob target conflict: {}",
                         blob.filename
                     );
+                    existing.original_names.push(blob.filename.clone());
                     continue;
                 }
                 let should_write = match fs::read(&blob_path) {
@@ -993,17 +1009,76 @@ fn import_backup_data_with(
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
                     Err(error) => return Err(error.into()),
                 };
-                prepared_blobs.insert(blob.filename.clone(), (blob_path, data, should_write));
+                prepared_blobs.insert(
+                    target_identity,
+                    PreparedBlob {
+                        target_path: blob_path,
+                        data,
+                        original_names: vec![blob.filename.clone()],
+                        should_write,
+                        staged_path: None,
+                    },
+                );
+            }
+
+            let stage_dir = if prepared_blobs.values().any(|blob| blob.should_write) {
+                let stage_dir = stage_root.join(format!("import-{}", uuid::Uuid::new_v4()));
+                fs::create_dir(&stage_dir)?;
+                let stage_result = (|| {
+                    for (index, blob) in prepared_blobs.values_mut().enumerate() {
+                        if !blob.should_write {
+                            continue;
+                        }
+                        let staged_path = stage_dir.join(format!("{index}.blob"));
+                        let mut staged_file = fs::File::create(&staged_path)?;
+                        staged_file.write_all(&blob.data)?;
+                        staged_file.flush()?;
+                        staged_file.sync_all()?;
+                        blob.staged_path = Some(staged_path);
+                    }
+                    Ok::<(), anyhow::Error>(())
+                })();
+                if let Err(error) = stage_result {
+                    let _ = fs::remove_dir_all(&stage_dir);
+                    return Err(error);
+                }
+                Some(stage_dir)
+            } else {
+                None
+            };
+
+            if !merge {
+                repository
+                    .lock()
+                    .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?
+                    .clear_history()
+                    .map_err(|error| anyhow::anyhow!("清空历史失败: {error}"))?;
+                cleanup_pending_blobs(repository, blob_dir)
+                    .map_err(|error| anyhow::anyhow!("清空 blob 目录失败: {error}"))?;
             }
 
             let mut restored_blob_map = HashMap::new();
-            for (filename, (blob_path, data, should_write)) in prepared_blobs {
-                if should_write {
-                    fs::write(&blob_path, data)
-                        .map_err(|error| anyhow::anyhow!("写入 blob {} 失败: {error}", filename))?;
+            let install_result = (|| {
+                for blob in prepared_blobs.values_mut() {
+                    if let Some(staged_path) = blob.staged_path.take() {
+                        if blob.target_path.exists() {
+                            fs::remove_file(&blob.target_path)?;
+                        }
+                        fs::rename(staged_path, &blob.target_path)?;
+                    }
+                    for original_name in &blob.original_names {
+                        restored_blob_map.insert(
+                            original_name.clone(),
+                            blob.target_path.to_string_lossy().to_string(),
+                        );
+                    }
                 }
-                restored_blob_map.insert(filename, blob_path.to_string_lossy().to_string());
+                Ok::<(), anyhow::Error>(())
+            })();
+            if let Some(stage_dir) = &stage_dir {
+                let _ = fs::remove_dir_all(stage_dir);
             }
+            install_result?;
 
             let mut imported_count = 0;
             for mut item in items {
@@ -1130,13 +1205,13 @@ mod tests {
 
     use super::{
         clear_history_with, copy_image_blob_with, delete_item_with, html_to_plain_text,
-        import_backup_data_with, prune_history_with, safe_backup_blob_filename,
-        validate_migration_paths, BackupData, BackupMetadata, BlobData,
+        import_backup_data_with, mutate_and_cleanup_blobs, prune_history_with,
+        safe_backup_blob_filename, validate_migration_paths, BackupData, BackupMetadata, BlobData,
     };
     use crate::blobs::image::stage_dib;
     use crate::blobs::store::ImageBlobStore;
     use crate::clipboard::types::{ClipboardItemDraft, ClipboardItemType};
-    use crate::storage::repository::ClipboardRepository;
+    use crate::storage::repository::{ClipboardItem, ClipboardRepository};
 
     fn dib32() -> Vec<u8> {
         let mut dib = vec![0u8; 40];
@@ -1148,6 +1223,150 @@ mod tests {
         dib[20..24].copy_from_slice(&4u32.to_le_bytes());
         dib.extend_from_slice(&[30, 20, 10, 255]);
         dib
+    }
+
+    fn imported_image_item(id: &str, hash: &str, filename: &str) -> ClipboardItem {
+        ClipboardItem {
+            id: id.to_string(),
+            hash: hash.to_string(),
+            item_type: "image".to_string(),
+            content: None,
+            content_path: Some(filename.to_string()),
+            content_hash: Some(format!("content-{hash}")),
+            preview: filename.to_string(),
+            source_app: None,
+            favorite: false,
+            pinned: false,
+            size_bytes: 4,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    fn assert_overwrite_preflight_preserves_existing(label: &str, backup: BackupData) {
+        let root = std::env::temp_dir().join(format!(
+            "super-clipboard-overwrite-preflight-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let staged = stage_dib(store.stage_dir(), dib32()).expect("stage old image");
+        let installed = store
+            .install_staged_with(staged, |installed| Ok(installed.clone()), |_| Ok(false))
+            .expect("install old image");
+        let original_bmp = std::fs::read(installed.bmp_path()).expect("old bmp");
+        let original_thumbnail = std::fs::read(installed.thumbnail_path()).expect("old thumbnail");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let old_item = repository
+            .lock()
+            .expect("repository lock")
+            .insert_or_touch_image(ClipboardItemDraft {
+                item_type: ClipboardItemType::Image,
+                content: None,
+                content_path: Some(installed.bmp_path().to_string_lossy().to_string()),
+                content_hash: Some(installed.content_hash().to_string()),
+                preview: "old image".to_string(),
+                source_app: None,
+                size_bytes: i64::try_from(original_bmp.len()).expect("bmp size"),
+            })
+            .expect("insert old image");
+
+        import_backup_data_with(&repository, &store, backup, false)
+            .expect_err("overwrite preflight must fail");
+
+        assert_eq!(
+            std::fs::read(installed.bmp_path()).expect("old bmp after failure"),
+            original_bmp
+        );
+        assert_eq!(
+            std::fs::read(installed.thumbnail_path()).expect("old thumbnail after failure"),
+            original_thumbnail
+        );
+        let repository_guard = repository.lock().expect("repository lock");
+        assert!(repository_guard
+            .get_item(&old_item.id)
+            .expect("old item")
+            .is_some());
+        assert!(repository_guard
+            .pending_cleanup_paths()
+            .expect("cleanup queue")
+            .is_empty());
+        drop(repository_guard);
+        assert!(std::fs::read_dir(store.stage_dir())
+            .expect("stage directory")
+            .next()
+            .is_none());
+        drop(repository);
+        drop(store);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn overwrite_invalid_base64_preserves_existing_history_and_blobs() {
+        assert_overwrite_preflight_preserves_existing(
+            "base64",
+            BackupData {
+                metadata: BackupMetadata {
+                    version: "1.0".to_string(),
+                    created_at: "test".to_string(),
+                    item_count: 0,
+                },
+                items: Vec::new(),
+                blobs: vec![BlobData {
+                    item_id: "invalid".to_string(),
+                    filename: "invalid.bmp".to_string(),
+                    data_base64: "%%%not-base64%%%".to_string(),
+                }],
+            },
+        );
+    }
+
+    #[test]
+    fn overwrite_escaping_filename_preserves_existing_history_and_blobs() {
+        assert_overwrite_preflight_preserves_existing(
+            "filename",
+            BackupData {
+                metadata: BackupMetadata {
+                    version: "1.0".to_string(),
+                    created_at: "test".to_string(),
+                    item_count: 0,
+                },
+                items: Vec::new(),
+                blobs: vec![BlobData {
+                    item_id: "escape".to_string(),
+                    filename: "../escape.bmp".to_string(),
+                    data_base64: super::base64_encode(b"escape"),
+                }],
+            },
+        );
+    }
+
+    #[test]
+    fn overwrite_windows_alias_conflict_preserves_existing_history_and_blobs() {
+        assert_overwrite_preflight_preserves_existing(
+            "alias",
+            BackupData {
+                metadata: BackupMetadata {
+                    version: "1.0".to_string(),
+                    created_at: "test".to_string(),
+                    item_count: 0,
+                },
+                items: Vec::new(),
+                blobs: vec![
+                    BlobData {
+                        item_id: "lower".to_string(),
+                        filename: "image.bmp".to_string(),
+                        data_base64: super::base64_encode(b"lower"),
+                    },
+                    BlobData {
+                        item_id: "upper".to_string(),
+                        filename: "IMAGE.bmp".to_string(),
+                        data_base64: super::base64_encode(b"upper"),
+                    },
+                ],
+            },
+        );
     }
 
     #[test]
@@ -1376,6 +1595,56 @@ mod tests {
             .pending_cleanup_paths()
             .expect("cleanup queue")
             .is_empty());
+        drop(repository);
+        drop(store);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn image_cleanup_continues_after_invalid_queue_path() {
+        let root = std::env::temp_dir().join(format!(
+            "super-clipboard-cleanup-poison-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let outside_path = root.join("outside.bmp");
+        std::fs::write(&outside_path, b"outside").expect("outside file");
+        repository
+            .lock()
+            .expect("repository lock")
+            .update_image_references_and_enqueue_cleanup(&[], &[outside_path.clone()])
+            .expect("enqueue invalid path");
+        thread::sleep(Duration::from_millis(2));
+        let valid_path = store.blob_dir().join("valid.bmp");
+        let valid_thumbnail = crate::blobs::thumbnail_path_for(&valid_path);
+        std::fs::write(&valid_path, b"valid").expect("valid file");
+        std::fs::write(&valid_thumbnail, b"thumbnail").expect("valid thumbnail");
+        repository
+            .lock()
+            .expect("repository lock")
+            .update_image_references_and_enqueue_cleanup(&[], &[valid_path.clone()])
+            .expect("enqueue valid path");
+
+        mutate_and_cleanup_blobs(&repository, &store, |_| Ok(()))
+            .expect_err("invalid cleanup path must be reported");
+
+        assert!(outside_path.exists());
+        assert!(!valid_path.exists());
+        assert!(!valid_thumbnail.exists());
+        assert_eq!(
+            repository
+                .lock()
+                .expect("repository lock")
+                .pending_cleanup_paths()
+                .expect("remaining queue"),
+            vec![
+                outside_path.clone(),
+                crate::blobs::thumbnail_path_for(&outside_path),
+            ]
+        );
         drop(repository);
         drop(store);
         std::fs::remove_dir_all(root).expect("cleanup");
@@ -1848,6 +2117,132 @@ mod tests {
     }
 
     #[test]
+    fn merge_rejects_windows_case_alias_conflict_before_mutation() {
+        let root = std::env::temp_dir().join(format!(
+            "super-clipboard-merge-alias-conflict-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let lower_id = uuid::Uuid::new_v4().to_string();
+        let upper_id = uuid::Uuid::new_v4().to_string();
+        let backup = BackupData {
+            metadata: BackupMetadata {
+                version: "1.0".to_string(),
+                created_at: "test".to_string(),
+                item_count: 2,
+            },
+            items: vec![
+                imported_image_item(&lower_id, "lower-hash", "image.bmp"),
+                imported_image_item(&upper_id, "upper-hash", "IMAGE.bmp"),
+            ],
+            blobs: vec![
+                BlobData {
+                    item_id: lower_id.clone(),
+                    filename: "image.bmp".to_string(),
+                    data_base64: super::base64_encode(b"lower"),
+                },
+                BlobData {
+                    item_id: upper_id.clone(),
+                    filename: "IMAGE.bmp".to_string(),
+                    data_base64: super::base64_encode(b"upper"),
+                },
+            ],
+        };
+
+        import_backup_data_with(&repository, &store, backup, true)
+            .expect_err("Windows alias conflict must fail");
+
+        assert!(std::fs::read_dir(store.blob_dir())
+            .expect("blob directory")
+            .next()
+            .is_none());
+        let repository_guard = repository.lock().expect("repository lock");
+        assert!(repository_guard
+            .get_item(&lower_id)
+            .expect("lower item")
+            .is_none());
+        assert!(repository_guard
+            .get_item(&upper_id)
+            .expect("upper item")
+            .is_none());
+        drop(repository_guard);
+        drop(repository);
+        drop(store);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn merge_windows_case_alias_with_same_bytes_uses_one_target() {
+        let root = std::env::temp_dir().join(format!(
+            "super-clipboard-merge-alias-reuse-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let lower_id = uuid::Uuid::new_v4().to_string();
+        let upper_id = uuid::Uuid::new_v4().to_string();
+        let backup = BackupData {
+            metadata: BackupMetadata {
+                version: "1.0".to_string(),
+                created_at: "test".to_string(),
+                item_count: 2,
+            },
+            items: vec![
+                imported_image_item(&lower_id, "lower-hash", "image.bmp"),
+                imported_image_item(&upper_id, "upper-hash", "IMAGE.bmp"),
+            ],
+            blobs: vec![
+                BlobData {
+                    item_id: lower_id.clone(),
+                    filename: "image.bmp".to_string(),
+                    data_base64: super::base64_encode(b"same"),
+                },
+                BlobData {
+                    item_id: upper_id.clone(),
+                    filename: "IMAGE.bmp".to_string(),
+                    data_base64: super::base64_encode(b"same"),
+                },
+            ],
+        };
+
+        assert_eq!(
+            import_backup_data_with(&repository, &store, backup, true).expect("merge aliases"),
+            2
+        );
+
+        assert_eq!(
+            std::fs::read_dir(store.blob_dir())
+                .expect("blob directory")
+                .count(),
+            1
+        );
+        let repository_guard = repository.lock().expect("repository lock");
+        let lower_path = repository_guard
+            .get_item(&lower_id)
+            .expect("lower item")
+            .expect("active lower")
+            .content_path
+            .expect("lower path");
+        let upper_path = repository_guard
+            .get_item(&upper_id)
+            .expect("upper item")
+            .expect("active upper")
+            .content_path
+            .expect("upper path");
+        assert_eq!(lower_path, upper_path);
+        assert_eq!(std::fs::read(lower_path).expect("shared blob"), b"same");
+        drop(repository_guard);
+        drop(repository);
+        drop(store);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn html_to_plain_text_removes_tags_and_decodes_common_entities() {
         assert_eq!(
             html_to_plain_text("<p>Hello&nbsp;<strong>world</strong> &amp; clipboard</p>"),
@@ -1865,6 +2260,8 @@ mod tests {
         assert!(safe_backup_blob_filename("../escape.bmp").is_err());
         assert!(safe_backup_blob_filename("nested/file.bmp").is_err());
         assert!(safe_backup_blob_filename("C:\\temp\\escape.bmp").is_err());
+        assert!(safe_backup_blob_filename("image.bmp.").is_err());
+        assert!(safe_backup_blob_filename("image.bmp ").is_err());
         assert_eq!(
             safe_backup_blob_filename("image.bmp").expect("safe filename"),
             "image.bmp"
