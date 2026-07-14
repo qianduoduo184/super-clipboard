@@ -75,4 +75,20 @@ mod tests {
 
         assert_ne!(text.stable_hash(), html.stable_hash());
     }
+
+    #[test]
+    fn image_capture_keeps_owned_dib_deferred() {
+        let capture = ClipboardCapture::ImageDib(vec![1, 2, 3, 4]);
+
+        match capture {
+            ClipboardCapture::ImageDib(dib) => assert_eq!(dib, vec![1, 2, 3, 4]),
+            ClipboardCapture::Draft(_) => panic!("image must not be persisted by the adapter"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ClipboardCapture {
+    Draft(ClipboardItemDraft),
+    ImageDib(Vec<u8>),
 }

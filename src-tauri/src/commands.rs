@@ -2,12 +2,129 @@ use tauri::{AppHandle, State};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_updater::UpdaterExt;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::storage::repository::{ClipboardItem, SearchFilters};
 use crate::system::settings::AppSettings;
 use crate::AppState;
+
+fn copy_image_blob_with<T>(
+    image_store: &crate::blobs::store::ImageBlobStore,
+    content_path: &Path,
+    write_clipboard: impl FnOnce(&[u8]) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    image_store.with_read(|blob_dir| {
+        let blob_path = content_path
+            .canonicalize()
+            .map_err(|error| anyhow::anyhow!("invalid blob path: {error}"))?;
+        anyhow::ensure!(
+            blob_path.parent() == Some(blob_dir),
+            "blob path outside allowed directory"
+        );
+        let dib = crate::blobs::read_dib_from_bmp_file(&blob_path)?;
+        write_clipboard(&dib)
+    })
+}
+
+pub(crate) fn mutate_and_cleanup_blobs<T>(
+    repository: &Mutex<crate::storage::repository::ClipboardRepository>,
+    image_store: &crate::blobs::store::ImageBlobStore,
+    mutate: impl FnOnce(&crate::storage::repository::ClipboardRepository) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    image_store.with_write(|blob_dir, _| {
+        let value = {
+            let repository = repository
+                .lock()
+                .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?;
+            mutate(&repository)?
+        };
+        cleanup_pending_blobs(repository, blob_dir)?;
+        Ok(value)
+    })
+}
+
+fn delete_item_with(
+    repository: &Mutex<crate::storage::repository::ClipboardRepository>,
+    image_store: &crate::blobs::store::ImageBlobStore,
+    id: &str,
+) -> anyhow::Result<()> {
+    mutate_and_cleanup_blobs(repository, image_store, |repository| {
+        repository.soft_delete(id)
+    })
+}
+
+fn clear_history_with(
+    repository: &Mutex<crate::storage::repository::ClipboardRepository>,
+    image_store: &crate::blobs::store::ImageBlobStore,
+) -> anyhow::Result<()> {
+    mutate_and_cleanup_blobs(repository, image_store, |repository| {
+        repository.clear_history()
+    })
+}
+
+pub(crate) fn prune_history_with(
+    repository: &Mutex<crate::storage::repository::ClipboardRepository>,
+    image_store: &crate::blobs::store::ImageBlobStore,
+    max_history_items: i64,
+    retention_days: i64,
+) -> anyhow::Result<()> {
+    mutate_and_cleanup_blobs(repository, image_store, |repository| {
+        repository.prune_history(max_history_items, retention_days)
+    })
+}
+
+fn cleanup_pending_blobs(
+    repository: &Mutex<crate::storage::repository::ClipboardRepository>,
+    blob_dir: &Path,
+) -> anyhow::Result<()> {
+    let (pending_paths, active_paths) = {
+        let repository = repository
+            .lock()
+            .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?;
+        (
+            repository.pending_cleanup_paths()?,
+            repository.active_blob_paths()?,
+        )
+    };
+    let active_paths = active_paths
+        .into_iter()
+        .flat_map(|path| {
+            let thumbnail = crate::blobs::thumbnail_path_for(&path);
+            [path, thumbnail]
+        })
+        .collect::<HashSet<_>>();
+
+    for path in pending_paths {
+        if active_paths.contains(&path) {
+            continue;
+        }
+        anyhow::ensure!(
+            path.is_absolute() && path.parent() == Some(blob_dir),
+            "cleanup path outside allowed directory: {}",
+            path.display()
+        );
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                anyhow::ensure!(
+                    metadata.file_type().is_file() || metadata.file_type().is_symlink(),
+                    "cleanup path is not a file: {}",
+                    path.display()
+                );
+                fs::remove_file(&path)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        repository
+            .lock()
+            .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?
+            .complete_cleanup_path(&path)?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DiagnosticsInfo {
@@ -86,11 +203,15 @@ pub fn copy_item(
     plain_text: Option<bool>,
 ) -> Result<(), String> {
     crate::diagnostics::info(format!("command: copy_item id={id}"));
-    let repository = state.repository.lock().map_err(|error| error.to_string())?;
-    let item = repository
-        .get_item(&id)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "clipboard item not found".to_string())?;
+    let item = {
+        state
+            .repository
+            .lock()
+            .map_err(|error| error.to_string())?
+            .get_item(&id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "clipboard item not found".to_string())?
+    };
     if item.item_type == "text" {
         if let Some(content) = item.content {
             #[cfg(target_os = "windows")]
@@ -126,28 +247,13 @@ pub fn copy_item(
             .content_path
             .ok_or_else(|| "image item has no blob path".to_string())?;
 
-        // Security: Validate that the blob path is within the allowed blob directory
-        let blob_path = Path::new(&content_path);
-        let canonical_blob_path = blob_path
-            .canonicalize()
-            .map_err(|e| format!("invalid blob path: {}", e))?;
-        let canonical_blob_dir = state
-            .blob_dir
-            .canonicalize()
-            .map_err(|e| format!("invalid blob directory: {}", e))?;
-
-        if !canonical_blob_path.starts_with(&canonical_blob_dir) {
-            crate::diagnostics::error(format!(
-                "security: attempted to read blob outside allowed directory: {}",
-                content_path
-            ));
-            return Err("blob path outside allowed directory".to_string());
-        }
-
-        let dib_bytes = crate::blobs::read_dib_from_bmp_file(&canonical_blob_path)
-            .map_err(|error| error.to_string())?;
         #[cfg(target_os = "windows")]
-        crate::clipboard::win::write_dib_to_clipboard(&dib_bytes)
+        copy_image_blob_with(&state.image_store, Path::new(&content_path), |dib| {
+            crate::clipboard::win::write_dib_to_clipboard(dib)
+        })
+        .map_err(|error| error.to_string())?;
+        #[cfg(not(target_os = "windows"))]
+        copy_image_blob_with(&state.image_store, Path::new(&content_path), |_dib| Ok(()))
             .map_err(|error| error.to_string())?;
         return Ok(());
     }
@@ -204,10 +310,7 @@ pub fn toggle_pin(state: State<'_, AppState>, id: String) -> Result<(), String> 
 #[tauri::command]
 pub fn delete_item(state: State<'_, AppState>, id: String) -> Result<(), String> {
     crate::diagnostics::info(format!("command: delete_item id={id}"));
-    let repository = state.repository.lock().map_err(|error| error.to_string())?;
-    repository
-        .soft_delete(&id)
-        .map_err(|error| error.to_string())
+    delete_item_with(&state.repository, &state.image_store, &id).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -263,15 +366,13 @@ pub fn update_settings(
         let mut settings = state.settings.lock().map_err(|error| error.to_string())?;
         *settings = next_settings.clone();
     }
-    {
-        let repository = state.repository.lock().map_err(|error| error.to_string())?;
-        repository
-            .prune_history(
-                next_settings.max_history_items,
-                next_settings.retention_days,
-            )
-            .map_err(|error| error.to_string())?;
-    }
+    prune_history_with(
+        &state.repository,
+        &state.image_store,
+        next_settings.max_history_items,
+        next_settings.retention_days,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(next_settings)
 }
 
@@ -419,12 +520,7 @@ pub fn set_global_shortcut(
 #[tauri::command]
 pub fn clear_history(state: State<'_, AppState>) -> Result<(), String> {
     crate::diagnostics::warn("command: clear_history");
-    let repository = state.repository.lock().map_err(|error| error.to_string())?;
-    repository
-        .clear_history()
-        .map_err(|error| error.to_string())?;
-    crate::blobs::clear_blob_dir(&state.blob_dir).map_err(|error| error.to_string())?;
-    Ok(())
+    clear_history_with(&state.repository, &state.image_store).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -514,8 +610,7 @@ fn validate_migration_paths(old_dir: &Path, new_dir: &Path) -> Result<(), String
     // Security: Create and validate new directory atomically to prevent TOCTOU attacks
     // If directory doesn't exist, create it with safe permissions
     if !new_dir.exists() {
-        std::fs::create_dir_all(new_dir)
-            .map_err(|e| format!("创建新目录失败: {}", e))?;
+        std::fs::create_dir_all(new_dir).map_err(|e| format!("创建新目录失败: {}", e))?;
     }
 
     // Immediately canonicalize after creation to prevent symlink swap attacks
@@ -524,8 +619,8 @@ fn validate_migration_paths(old_dir: &Path, new_dir: &Path) -> Result<(), String
         .map_err(|e| format!("解析新目录失败: {}", e))?;
 
     // Verify it's a real directory, not a symlink
-    let metadata = std::fs::symlink_metadata(&new_dir)
-        .map_err(|e| format!("读取新目录元数据失败: {}", e))?;
+    let metadata =
+        std::fs::symlink_metadata(&new_dir).map_err(|e| format!("读取新目录元数据失败: {}", e))?;
     if metadata.is_symlink() {
         return Err("新目录不能是符号链接".to_string());
     }
@@ -916,7 +1011,10 @@ pub async fn import_backup(
             .map_err(|e| format!("写入 blob {} 失败: {}", blob.filename, e))?;
 
         // Use filename as key to avoid confusion with ID conflicts in merge mode
-        restored_blob_map.insert(blob.filename.clone(), blob_path.to_string_lossy().to_string());
+        restored_blob_map.insert(
+            blob.filename.clone(),
+            blob_path.to_string_lossy().to_string(),
+        );
     }
 
     // 导入数据到数据库
@@ -970,8 +1068,360 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
 
-    use super::{html_to_plain_text, safe_backup_blob_filename, validate_migration_paths};
+    use super::{
+        clear_history_with, copy_image_blob_with, delete_item_with, html_to_plain_text,
+        prune_history_with, safe_backup_blob_filename, validate_migration_paths,
+    };
+    use crate::blobs::image::stage_dib;
+    use crate::blobs::store::ImageBlobStore;
+    use crate::clipboard::types::{ClipboardItemDraft, ClipboardItemType};
+    use crate::storage::repository::ClipboardRepository;
+
+    fn dib32() -> Vec<u8> {
+        let mut dib = vec![0u8; 40];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&1i32.to_le_bytes());
+        dib[8..12].copy_from_slice(&(-1i32).to_le_bytes());
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+        dib[20..24].copy_from_slice(&4u32.to_le_bytes());
+        dib.extend_from_slice(&[30, 20, 10, 255]);
+        dib
+    }
+
+    #[test]
+    fn image_copy_holds_read_lease_through_write_callback() {
+        let root = std::env::temp_dir().join(format!(
+            "super-clipboard-copy-image-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store =
+            Arc::new(ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store"));
+        let staged = stage_dib(store.stage_dir(), dib32()).expect("stage");
+        let image_path = store
+            .install_staged_with(
+                staged,
+                |installed| Ok(installed.bmp_path().to_path_buf()),
+                |_| Ok(false),
+            )
+            .expect("install");
+        let (write_started_tx, write_started_rx) = mpsc::channel();
+        let (release_copy_tx, release_copy_rx) = mpsc::channel();
+        let (lease_entered_tx, lease_entered_rx) = mpsc::channel();
+
+        let reader_store = Arc::clone(&store);
+        let reader = thread::spawn(move || {
+            copy_image_blob_with(&reader_store, &image_path, |_dib| {
+                write_started_tx.send(()).expect("write started");
+                release_copy_rx.recv().expect("release copy");
+                Ok(())
+            })
+        });
+        write_started_rx.recv().expect("copy callback entered");
+        let writer_store = Arc::clone(&store);
+        let writer = thread::spawn(move || {
+            writer_store.with_write(|_, _| {
+                lease_entered_tx.send(()).expect("write lease entered");
+                Ok(())
+            })
+        });
+
+        assert!(lease_entered_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+        release_copy_tx.send(()).expect("release copy");
+        lease_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("writer entered after copy");
+        reader.join().expect("reader thread").expect("copy result");
+        writer
+            .join()
+            .expect("writer thread")
+            .expect("writer result");
+        drop(store);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn image_delete_waits_for_read_lease_then_removes_files_and_queue_row() {
+        let root = std::env::temp_dir().join(format!(
+            "super-clipboard-delete-image-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store =
+            Arc::new(ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store"));
+        let staged = stage_dib(store.stage_dir(), dib32()).expect("stage");
+        let installed = store
+            .install_staged_with(staged, |installed| Ok(installed.clone()), |_| Ok(false))
+            .expect("install");
+        let image_path = installed.bmp_path().to_path_buf();
+        let thumbnail_path = installed.thumbnail_path().to_path_buf();
+        let repository = Arc::new(Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        ));
+        let item = repository
+            .lock()
+            .expect("repository lock")
+            .insert_or_touch_image(ClipboardItemDraft {
+                item_type: ClipboardItemType::Image,
+                content: None,
+                content_path: Some(image_path.to_string_lossy().to_string()),
+                content_hash: Some(installed.content_hash().to_string()),
+                preview: "image".to_string(),
+                source_app: None,
+                size_bytes: 44,
+            })
+            .expect("insert image");
+        let (read_started_tx, read_started_rx) = mpsc::channel();
+        let (release_read_tx, release_read_rx) = mpsc::channel();
+        let reader_store = Arc::clone(&store);
+        let reader = thread::spawn(move || {
+            reader_store.with_read(|_| {
+                read_started_tx.send(()).expect("read started");
+                release_read_rx.recv().expect("release read");
+                Ok(())
+            })
+        });
+        read_started_rx.recv().expect("reader entered");
+
+        let worker_store = Arc::clone(&store);
+        let worker_repository = Arc::clone(&repository);
+        let item_id = item.id.clone();
+        let (delete_finished_tx, delete_finished_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = delete_item_with(&worker_repository, &worker_store, &item_id);
+            delete_finished_tx.send(()).expect("delete finished");
+            result
+        });
+
+        assert!(delete_finished_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+        assert!(repository
+            .lock()
+            .expect("repository lock")
+            .get_item(&item.id)
+            .expect("item before release")
+            .is_some());
+        assert!(image_path.exists());
+        assert!(thumbnail_path.exists());
+
+        release_read_tx.send(()).expect("release reader");
+        delete_finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("delete after read");
+        reader.join().expect("reader thread").expect("read result");
+        worker
+            .join()
+            .expect("delete thread")
+            .expect("delete result");
+
+        assert!(!image_path.exists());
+        assert!(!thumbnail_path.exists());
+        assert!(repository
+            .lock()
+            .expect("repository lock")
+            .pending_cleanup_paths()
+            .expect("cleanup queue")
+            .is_empty());
+        drop(repository);
+        drop(store);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn image_cleanup_keeps_files_and_queue_while_path_is_still_active() {
+        let root = std::env::temp_dir().join(format!(
+            "super-clipboard-shared-image-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let staged = stage_dib(store.stage_dir(), dib32()).expect("stage");
+        let installed = store
+            .install_staged_with(staged, |installed| Ok(installed.clone()), |_| Ok(false))
+            .expect("install");
+        let image_path = installed.bmp_path().to_path_buf();
+        let thumbnail_path = installed.thumbnail_path().to_path_buf();
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let image_draft = |content_hash: &str| ClipboardItemDraft {
+            item_type: ClipboardItemType::Image,
+            content: None,
+            content_path: Some(image_path.to_string_lossy().to_string()),
+            content_hash: Some(content_hash.to_string()),
+            preview: "image".to_string(),
+            source_app: None,
+            size_bytes: 44,
+        };
+        let deleted = repository
+            .lock()
+            .expect("repository lock")
+            .insert_or_touch_image(image_draft(installed.content_hash()))
+            .expect("insert deleted image");
+        repository
+            .lock()
+            .expect("repository lock")
+            .insert_or_touch_image(image_draft("legacy-second-reference"))
+            .expect("insert shared image");
+
+        delete_item_with(&repository, &store, &deleted.id).expect("delete one reference");
+
+        assert!(image_path.exists());
+        assert!(thumbnail_path.exists());
+        assert_eq!(
+            repository
+                .lock()
+                .expect("repository lock")
+                .pending_cleanup_paths()
+                .expect("cleanup queue"),
+            vec![image_path.clone(), thumbnail_path.clone()]
+        );
+        drop(repository);
+        drop(store);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn image_cleanup_completes_queue_when_files_are_already_absent() {
+        let root = std::env::temp_dir().join(format!(
+            "super-clipboard-absent-image-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let image_path = store.blob_dir().join("missing.bmp");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let item = repository
+            .lock()
+            .expect("repository lock")
+            .insert_or_touch_image(ClipboardItemDraft {
+                item_type: ClipboardItemType::Image,
+                content: None,
+                content_path: Some(image_path.to_string_lossy().to_string()),
+                content_hash: Some("missing-image".to_string()),
+                preview: "image".to_string(),
+                source_app: None,
+                size_bytes: 44,
+            })
+            .expect("insert image");
+
+        delete_item_with(&repository, &store, &item.id).expect("delete absent image");
+
+        assert!(repository
+            .lock()
+            .expect("repository lock")
+            .pending_cleanup_paths()
+            .expect("cleanup queue")
+            .is_empty());
+        drop(repository);
+        drop(store);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn clear_history_cleans_queued_image_paths_under_blob_lease() {
+        let root = std::env::temp_dir().join(format!(
+            "super-clipboard-clear-image-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let image_path = store.blob_dir().join("missing.bmp");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let item = repository
+            .lock()
+            .expect("repository lock")
+            .insert_or_touch_image(ClipboardItemDraft {
+                item_type: ClipboardItemType::Image,
+                content: None,
+                content_path: Some(image_path.to_string_lossy().to_string()),
+                content_hash: Some("clear-image".to_string()),
+                preview: "image".to_string(),
+                source_app: None,
+                size_bytes: 44,
+            })
+            .expect("insert image");
+
+        clear_history_with(&repository, &store).expect("clear history");
+
+        {
+            let repository = repository.lock().expect("repository lock");
+            assert!(repository
+                .get_item(&item.id)
+                .expect("cleared item")
+                .is_none());
+            assert!(repository
+                .pending_cleanup_paths()
+                .expect("cleanup queue")
+                .is_empty());
+        }
+        drop(repository);
+        drop(store);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn prune_history_cleans_queued_image_paths_under_blob_lease() {
+        let root = std::env::temp_dir().join(format!(
+            "super-clipboard-prune-image-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let image_path = store.blob_dir().join("missing.bmp");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let image = repository
+            .lock()
+            .expect("repository lock")
+            .insert_or_touch_image(ClipboardItemDraft {
+                item_type: ClipboardItemType::Image,
+                content: None,
+                content_path: Some(image_path.to_string_lossy().to_string()),
+                content_hash: Some("prune-image".to_string()),
+                preview: "image".to_string(),
+                source_app: None,
+                size_bytes: 44,
+            })
+            .expect("insert image");
+        repository
+            .lock()
+            .expect("repository lock")
+            .insert_or_touch(ClipboardItemDraft {
+                item_type: ClipboardItemType::Text,
+                content: Some("keep".to_string()),
+                content_path: None,
+                content_hash: None,
+                preview: "keep".to_string(),
+                source_app: None,
+                size_bytes: 4,
+            })
+            .expect("insert recent text");
+
+        prune_history_with(&repository, &store, 1, 0).expect("prune history");
+
+        {
+            let repository = repository.lock().expect("repository lock");
+            assert!(repository
+                .get_item(&image.id)
+                .expect("pruned image")
+                .is_none());
+            assert!(repository
+                .pending_cleanup_paths()
+                .expect("cleanup queue")
+                .is_empty());
+        }
+        drop(repository);
+        drop(store);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
 
     #[test]
     fn html_to_plain_text_removes_tags_and_decodes_common_entities() {

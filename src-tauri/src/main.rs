@@ -13,6 +13,7 @@ mod security_tests;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use blobs::store::ImageBlobStore;
 use storage::repository::ClipboardRepository;
 use system::settings::AppSettings;
 use tauri::{Manager, WindowEvent};
@@ -24,6 +25,7 @@ pub struct AppState {
     pub app_data_dir: PathBuf,
     pub settings_path: PathBuf,
     pub blob_dir: PathBuf,
+    pub image_store: Arc<ImageBlobStore>,
     pub log_path: PathBuf,
 }
 
@@ -55,6 +57,10 @@ fn main() {
 
             let blob_dir = blobs::ensure_blob_dir(&app_data)?;
             diagnostics::info(format!("setup: blob_dir={}", blob_dir.display()));
+            let image_store = Arc::new(ImageBlobStore::new(
+                blob_dir.clone(),
+                app_data.join("blob-stage"),
+            )?);
 
             let database_path = app_data.join("super-clipboard.sqlite3");
             diagnostics::info(format!("setup: database_path={}", database_path.display()));
@@ -97,6 +103,7 @@ fn main() {
                 app_data_dir: app_data.clone(),
                 settings_path: settings_path.clone(),
                 blob_dir: blob_dir.clone(),
+                image_store: image_store.clone(),
                 log_path,
             });
 
@@ -104,7 +111,7 @@ fn main() {
                 app.handle().clone(),
                 repository,
                 settings.clone(),
-                blob_dir,
+                image_store,
             ) {
                 diagnostics::error(format!("setup: clipboard listener failed: {error}"));
             } else {

@@ -28,9 +28,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     RegisterClassW, HWND_MESSAGE, MSG, WM_CLIPBOARDUPDATE, WM_DESTROY, WNDCLASSW,
 };
 
-use crate::blobs::write_dib_as_bmp;
+use crate::blobs::image::image_identity_from_dib;
 use crate::clipboard::sequence::{is_stale_worker_event, ClipboardSequenceState, SequenceDecision};
-use crate::clipboard::types::{ClipboardItemDraft, ClipboardItemType};
+use crate::clipboard::types::{ClipboardCapture, ClipboardItemDraft, ClipboardItemType};
 
 // DROPFILES structure for CF_HDROP
 #[repr(C)]
@@ -71,10 +71,7 @@ where
     Ok(())
 }
 
-pub fn read_current_clipboard(
-    blob_dir: &Path,
-    event_sequence: u32,
-) -> Result<Option<Vec<ClipboardItemDraft>>> {
+pub fn read_current_clipboard(event_sequence: u32) -> Result<Option<Vec<ClipboardCapture>>> {
     let _guard = ClipboardGuard::open()?;
     let current_sequence = unsafe { GetClipboardSequenceNumber() };
     if is_stale_worker_event(event_sequence, current_sequence) {
@@ -106,7 +103,7 @@ pub fn read_current_clipboard(
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Ok(Some(vec![ClipboardItemDraft {
+            return Ok(Some(vec![ClipboardCapture::Draft(ClipboardItemDraft {
                 item_type: ClipboardItemType::Files,
                 size_bytes: files.len() as i64,
                 preview,
@@ -114,7 +111,7 @@ pub fn read_current_clipboard(
                 content_path: None,
                 content_hash: None,
                 source_app: None,
-            }]));
+            })]));
         }
         Ok(None) => {}
         Err(error) => {
@@ -132,24 +129,12 @@ pub fn read_current_clipboard(
             }
         },
         |_format, dib_bytes| {
-            let size_bytes = dib_bytes.len() as i64;
-            write_dib_as_bmp(blob_dir, &dib_bytes).map(|path| (path, size_bytes))
+            image_identity_from_dib(&dib_bytes)?;
+            Ok(dib_bytes)
         },
     ) {
-        Ok(Some((path, size_bytes))) => {
-            return Ok(Some(vec![ClipboardItemDraft {
-                item_type: ClipboardItemType::Image,
-                size_bytes,
-                preview: path
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("clipboard-image.bmp")
-                    .to_string(),
-                content: None,
-                content_path: Some(path.to_string_lossy().to_string()),
-                content_hash: None,
-                source_app: None,
-            }]));
+        Ok(Some(dib)) => {
+            return Ok(Some(vec![ClipboardCapture::ImageDib(dib)]));
         }
         Ok(None) => {}
         Err(error) => {
@@ -163,7 +148,7 @@ pub fn read_current_clipboard(
             // Compress all whitespace (newlines, tabs, multiple spaces) into single spaces for preview
             // The original multi-line content is preserved in 'content' field
             let preview = text.split_whitespace().collect::<Vec<_>>().join(" ");
-            return Ok(Some(vec![ClipboardItemDraft {
+            return Ok(Some(vec![ClipboardCapture::Draft(ClipboardItemDraft {
                 item_type: ClipboardItemType::Text,
                 size_bytes: text.len() as i64,
                 preview,
@@ -171,7 +156,7 @@ pub fn read_current_clipboard(
                 content_path: None,
                 content_hash: None,
                 source_app: None,
-            }]));
+            })]));
         }
         Ok(_) => {}
         Err(error) => {
