@@ -11,12 +11,13 @@ use anyhow::{anyhow, Result};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
+    RegisterClipboardFormatW, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
-use windows_sys::Win32::System::Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT};
+use windows_sys::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
     VK_CONTROL, VK_V,
@@ -28,6 +29,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::blobs::write_dib_as_bmp;
+use crate::clipboard::sequence::{is_stale_worker_event, ClipboardSequenceState, SequenceDecision};
 use crate::clipboard::types::{ClipboardItemDraft, ClipboardItemType};
 
 // DROPFILES structure for CF_HDROP
@@ -40,13 +42,14 @@ struct DROPFILES {
     fWide: i32,
 }
 
-static CLIPBOARD_EVENT_TX: OnceLock<Mutex<Option<Sender<()>>>> = OnceLock::new();
+static CLIPBOARD_EVENT_TX: OnceLock<Mutex<Option<Sender<u32>>>> = OnceLock::new();
+static CLIPBOARD_SEQUENCE_STATE: OnceLock<Mutex<ClipboardSequenceState>> = OnceLock::new();
 
 pub fn start_listener<F>(on_change: F) -> Result<()>
 where
-    F: Fn() + Send + 'static,
+    F: Fn(u32) + Send + 'static,
 {
-    let (tx, rx) = mpsc::channel::<()>();
+    let (tx, rx) = mpsc::channel::<u32>();
     CLIPBOARD_EVENT_TX
         .get_or_init(|| Mutex::new(None))
         .lock()
@@ -54,8 +57,8 @@ where
         .replace(tx);
 
     thread::spawn(move || {
-        for _ in rx {
-            on_change();
+        for sequence in rx {
+            on_change(sequence);
         }
     });
 
@@ -68,8 +71,15 @@ where
     Ok(())
 }
 
-pub fn read_current_clipboard(blob_dir: &Path) -> Result<Vec<ClipboardItemDraft>> {
+pub fn read_current_clipboard(
+    blob_dir: &Path,
+    event_sequence: u32,
+) -> Result<Option<Vec<ClipboardItemDraft>>> {
     let _guard = ClipboardGuard::open()?;
+    let current_sequence = unsafe { GetClipboardSequenceNumber() };
+    if is_stale_worker_event(event_sequence, current_sequence) {
+        return Ok(None);
+    }
 
     // Privacy: honor the Windows clipboard-exclusion formats that password managers
     // and other sensitive sources set to opt out of clipboard history/monitoring.
@@ -78,7 +88,7 @@ pub fn read_current_clipboard(blob_dir: &Path) -> Result<Vec<ClipboardItemDraft>
         crate::diagnostics::info(
             "clipboard: content marked excluded from history, skipping capture",
         );
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     }
 
     // Try reading file list - log error but continue to next format if it fails
@@ -96,7 +106,7 @@ pub fn read_current_clipboard(blob_dir: &Path) -> Result<Vec<ClipboardItemDraft>
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Ok(vec![ClipboardItemDraft {
+            return Ok(Some(vec![ClipboardItemDraft {
                 item_type: ClipboardItemType::Files,
                 size_bytes: files.len() as i64,
                 preview,
@@ -104,7 +114,7 @@ pub fn read_current_clipboard(blob_dir: &Path) -> Result<Vec<ClipboardItemDraft>
                 content_path: None,
                 content_hash: None,
                 source_app: None,
-            }]);
+            }]));
         }
         Ok(None) => {}
         Err(error) => {
@@ -114,30 +124,26 @@ pub fn read_current_clipboard(blob_dir: &Path) -> Result<Vec<ClipboardItemDraft>
 
     // Try reading image - log error but continue to text if it fails
     match read_dib_bytes() {
-        Ok(Some(dib_bytes)) => {
-            match write_dib_as_bmp(blob_dir, &dib_bytes) {
-                Ok(path) => {
-                    return Ok(vec![ClipboardItemDraft {
-                        item_type: ClipboardItemType::Image,
-                        size_bytes: dib_bytes.len() as i64,
-                        preview: path
-                            .file_name()
-                            .and_then(|value| value.to_str())
-                            .unwrap_or("clipboard-image.bmp")
-                            .to_string(),
-                        content: None,
-                        content_path: Some(path.to_string_lossy().to_string()),
-                        content_hash: None,
-                        source_app: None,
-                    }]);
-                }
-                Err(error) => {
-                    crate::diagnostics::warn(format!(
-                        "clipboard: image blob write failed: {error}"
-                    ));
-                }
+        Ok(Some(dib_bytes)) => match write_dib_as_bmp(blob_dir, &dib_bytes) {
+            Ok(path) => {
+                return Ok(Some(vec![ClipboardItemDraft {
+                    item_type: ClipboardItemType::Image,
+                    size_bytes: dib_bytes.len() as i64,
+                    preview: path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("clipboard-image.bmp")
+                        .to_string(),
+                    content: None,
+                    content_path: Some(path.to_string_lossy().to_string()),
+                    content_hash: None,
+                    source_app: None,
+                }]));
             }
-        }
+            Err(error) => {
+                crate::diagnostics::warn(format!("clipboard: image blob write failed: {error}"));
+            }
+        },
         Ok(None) => {}
         Err(error) => {
             crate::diagnostics::warn(format!("clipboard: image read failed: {error}"));
@@ -150,7 +156,7 @@ pub fn read_current_clipboard(blob_dir: &Path) -> Result<Vec<ClipboardItemDraft>
             // Compress all whitespace (newlines, tabs, multiple spaces) into single spaces for preview
             // The original multi-line content is preserved in 'content' field
             let preview = text.split_whitespace().collect::<Vec<_>>().join(" ");
-            return Ok(vec![ClipboardItemDraft {
+            return Ok(Some(vec![ClipboardItemDraft {
                 item_type: ClipboardItemType::Text,
                 size_bytes: text.len() as i64,
                 preview,
@@ -158,7 +164,7 @@ pub fn read_current_clipboard(blob_dir: &Path) -> Result<Vec<ClipboardItemDraft>
                 content_path: None,
                 content_hash: None,
                 source_app: None,
-            }]);
+            }]));
         }
         Ok(_) => {}
         Err(error) => {
@@ -166,7 +172,7 @@ pub fn read_current_clipboard(blob_dir: &Path) -> Result<Vec<ClipboardItemDraft>
         }
     }
 
-    Ok(Vec::new())
+    Ok(Some(Vec::new()))
 }
 
 pub fn write_text_to_clipboard(text: &str) -> Result<()> {
@@ -194,6 +200,7 @@ pub fn write_text_to_clipboard(text: &str) -> Result<()> {
             return Err(anyhow!("set unicode text"));
         }
     }
+    register_current_internal_sequence();
 
     Ok(())
 }
@@ -220,6 +227,7 @@ pub fn write_dib_to_clipboard(dib_bytes: &[u8]) -> Result<()> {
             return Err(anyhow!("set DIB image"));
         }
     }
+    register_current_internal_sequence();
 
     Ok(())
 }
@@ -277,6 +285,7 @@ pub fn write_files_to_clipboard(file_paths: &[String]) -> Result<()> {
             return Err(anyhow!("set file list"));
         }
     }
+    register_current_internal_sequence();
 
     Ok(())
 }
@@ -285,8 +294,7 @@ pub fn write_files_to_clipboard(file_paths: &[String]) -> Result<()> {
 /// `CF_UNICODETEXT` plain-text fallback, so both HTML-aware apps (Word, browsers,
 /// mail) and plain-text targets paste correctly.
 pub fn write_html_to_clipboard(html: &str, plain_text: &str) -> Result<()> {
-    let cf_html_format =
-        unsafe { RegisterClipboardFormatW(wide_null("HTML Format").as_ptr()) };
+    let cf_html_format = unsafe { RegisterClipboardFormatW(wide_null("HTML Format").as_ptr()) };
     if cf_html_format == 0 {
         return Err(anyhow!("register HTML clipboard format"));
     }
@@ -306,8 +314,21 @@ pub fn write_html_to_clipboard(html: &str, plain_text: &str) -> Result<()> {
         let text_bytes = std::slice::from_raw_parts(wide.as_ptr() as *const u8, byte_len);
         set_clipboard_global(CF_UNICODETEXT as u32, text_bytes)?;
     }
+    register_current_internal_sequence();
 
     Ok(())
+}
+
+fn sequence_state() -> &'static Mutex<ClipboardSequenceState> {
+    CLIPBOARD_SEQUENCE_STATE.get_or_init(|| Mutex::new(ClipboardSequenceState::default()))
+}
+
+fn register_current_internal_sequence() {
+    let sequence = unsafe { GetClipboardSequenceNumber() };
+    let mut state = sequence_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.register_internal(sequence);
 }
 
 /// Allocate a moveable global buffer, copy `bytes` into it, and hand it to the
@@ -362,8 +383,9 @@ fn build_cf_html(fragment: &str) -> Vec<u8> {
 /// Bitwarden, …) set these. Must be called while the clipboard is open.
 fn is_history_excluded() -> bool {
     unsafe {
-        let exclude_monitor =
-            RegisterClipboardFormatW(wide_null("ExcludeClipboardContentFromMonitorProcessing").as_ptr());
+        let exclude_monitor = RegisterClipboardFormatW(
+            wide_null("ExcludeClipboardContentFromMonitorProcessing").as_ptr(),
+        );
         if exclude_monitor != 0 && IsClipboardFormatAvailable(exclude_monitor) != 0 {
             return true;
         }
@@ -485,10 +507,17 @@ extern "system" fn window_proc(
 ) -> LRESULT {
     match message {
         WM_CLIPBOARDUPDATE => {
-            if let Some(lock) = CLIPBOARD_EVENT_TX.get() {
-                if let Ok(guard) = lock.lock() {
-                    if let Some(tx) = guard.as_ref() {
-                        let _ = tx.send(());
+            let sequence = unsafe { GetClipboardSequenceNumber() };
+            let decision = sequence_state()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .classify_notification(sequence);
+            if decision == SequenceDecision::Capture {
+                if let Some(lock) = CLIPBOARD_EVENT_TX.get() {
+                    if let Ok(guard) = lock.lock() {
+                        if let Some(tx) = guard.as_ref() {
+                            let _ = tx.send(sequence);
+                        }
                     }
                 }
             }
@@ -581,6 +610,9 @@ fn read_unicode_text() -> Result<Option<String>> {
 
 fn read_dib_bytes() -> Result<Option<Vec<u8>>> {
     unsafe {
+        if IsClipboardFormatAvailable(CF_DIBV5 as u32) != 0 {
+            return read_global_bytes(CF_DIBV5 as u32);
+        }
         if IsClipboardFormatAvailable(CF_DIB as u32) == 0 {
             return Ok(None);
         }
@@ -727,7 +759,9 @@ mod clipboard_roundtrip_tests {
 
         let read = {
             let _guard = ClipboardGuard::open().expect("open clipboard");
-            read_file_list().expect("read files").expect("files present")
+            read_file_list()
+                .expect("read files")
+                .expect("files present")
         };
         assert_eq!(read, paths);
     }
@@ -741,7 +775,9 @@ mod clipboard_roundtrip_tests {
 
         let text = {
             let _guard = ClipboardGuard::open().expect("open clipboard");
-            read_unicode_text().expect("read text").expect("text present")
+            read_unicode_text()
+                .expect("read text")
+                .expect("text present")
         };
         assert_eq!(text, plain);
 

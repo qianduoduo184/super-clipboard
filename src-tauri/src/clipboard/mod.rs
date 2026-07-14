@@ -1,3 +1,4 @@
+pub mod sequence;
 pub mod types;
 
 #[cfg(target_os = "windows")]
@@ -12,13 +13,16 @@ pub mod win {
 
     pub fn start_listener<F>(_on_change: F) -> Result<()>
     where
-        F: Fn() + Send + 'static,
+        F: Fn(u32) + Send + 'static,
     {
         Ok(())
     }
 
-    pub fn read_current_clipboard(_blob_dir: &Path) -> Result<Vec<ClipboardItemDraft>> {
-        Ok(Vec::new())
+    pub fn read_current_clipboard(
+        _blob_dir: &Path,
+        _event_sequence: u32,
+    ) -> Result<Option<Vec<ClipboardItemDraft>>> {
+        Ok(Some(Vec::new()))
     }
 
     pub fn write_text_to_clipboard(_text: &str) -> Result<()> {
@@ -63,7 +67,7 @@ pub fn start_background_listener(
         blob_dir.display()
     ));
 
-    win::start_listener(move || {
+    win::start_listener(move |event_sequence| {
         crate::diagnostics::info("clipboard: change event received");
         let app_settings = settings
             .lock()
@@ -86,14 +90,20 @@ pub fn start_background_listener(
         let mut drafts = None;
         for (attempt, delay) in retry_delays.iter().enumerate() {
             thread::sleep(*delay);
-            match win::read_current_clipboard(&blob_dir) {
-                Ok(next_drafts) => {
+            match win::read_current_clipboard(&blob_dir, event_sequence) {
+                Ok(Some(next_drafts)) => {
                     crate::diagnostics::info(format!(
                         "clipboard: read succeeded on attempt {}",
                         attempt + 1
                     ));
                     drafts = Some(next_drafts);
                     break;
+                }
+                Ok(None) => {
+                    crate::diagnostics::info(format!(
+                        "clipboard: stale sequence {event_sequence} ignored"
+                    ));
+                    return;
                 }
                 Err(error) => {
                     crate::diagnostics::warn(format!(
