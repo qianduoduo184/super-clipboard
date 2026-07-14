@@ -184,6 +184,25 @@ mod tests {
     }
 
     #[test]
+    fn active_blob_paths_includes_legacy_image_without_content_hash() {
+        let repository = open_test_repository();
+        repository
+            .conn
+            .execute(
+                "INSERT INTO clipboard_items
+                 (id, hash, item_type, content_path, content_hash, preview, favorite, pinned, size_bytes, created_at, updated_at)
+                 VALUES ('legacy-image', 'legacy-image-hash', 'image', 'legacy.bmp', NULL, 'legacy image', 0, 0, 128, 1, 1)",
+                [],
+            )
+            .expect("insert legacy image");
+
+        assert_eq!(
+            repository.active_blob_paths().expect("active paths"),
+            vec![PathBuf::from("legacy.bmp")]
+        );
+    }
+
+    #[test]
     fn cleanup_queue_can_list_and_complete_paths() {
         let repository = open_test_repository();
         let image = repository
@@ -904,7 +923,6 @@ impl ClipboardRepository {
             "SELECT DISTINCT content_path
              FROM clipboard_items
              WHERE item_type = 'image'
-               AND content_hash IS NOT NULL
                AND content_path IS NOT NULL
                AND deleted_at IS NULL
              ORDER BY content_path",
