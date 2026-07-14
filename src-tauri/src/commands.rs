@@ -922,6 +922,68 @@ pub async fn parse_backup_info(backup_path: String) -> Result<BackupInfo, String
     })
 }
 
+fn import_backup_data_with(
+    repository: &Mutex<crate::storage::repository::ClipboardRepository>,
+    image_store: &crate::blobs::store::ImageBlobStore,
+    backup: BackupData,
+    merge: bool,
+) -> Result<usize, String> {
+    image_store
+        .with_write(|blob_dir, _| {
+            if !merge {
+                repository
+                    .lock()
+                    .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?
+                    .clear_history()
+                    .map_err(|error| anyhow::anyhow!("清空历史失败: {error}"))?;
+                cleanup_pending_blobs(repository, blob_dir)
+                    .map_err(|error| anyhow::anyhow!("清空 blob 目录失败: {error}"))?;
+            }
+
+            let mut restored_blob_map = HashMap::new();
+            for blob in &backup.blobs {
+                let filename = safe_backup_blob_filename(&blob.filename)
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                let blob_path = blob_dir.join(&filename);
+                let data = base64_decode(&blob.data_base64).map_err(|error| {
+                    anyhow::anyhow!("解码 blob {} 失败: {error}", blob.filename)
+                })?;
+                fs::write(&blob_path, data).map_err(|error| {
+                    anyhow::anyhow!("写入 blob {} 失败: {error}", blob.filename)
+                })?;
+                restored_blob_map.insert(
+                    blob.filename.clone(),
+                    blob_path.to_string_lossy().to_string(),
+                );
+            }
+
+            let mut imported_count = 0;
+            for mut item in backup.items {
+                if let Some(original_filename) = &item.content_path {
+                    item.content_path = restored_blob_map.get(original_filename).cloned();
+                }
+                if merge {
+                    let duplicate = repository
+                        .lock()
+                        .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?
+                        .find_by_hash(&item.hash)
+                        .is_ok_and(|existing| existing.is_some());
+                    if duplicate {
+                        continue;
+                    }
+                }
+                repository
+                    .lock()
+                    .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?
+                    .insert_imported_item(&item)
+                    .map_err(|error| anyhow::anyhow!("导入记录失败: {error}"))?;
+                imported_count += 1;
+            }
+            Ok(imported_count)
+        })
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 pub async fn import_backup(
     state: State<'_, AppState>,
@@ -985,65 +1047,11 @@ pub async fn import_backup(
         ));
     }
 
-    // 如果是覆盖模式，清空现有数据
+    let imported_count =
+        import_backup_data_with(&state.repository, &state.image_store, backup, merge)?;
     if !merge {
-        let repository = state.repository.lock().map_err(|e| e.to_string())?;
-        repository
-            .clear_history()
-            .map_err(|e| format!("清空历史失败: {}", e))?;
-        drop(repository);
-
-        crate::blobs::clear_blob_dir(&state.blob_dir)
-            .map_err(|e| format!("清空 blob 目录失败: {}", e))?;
-
         crate::diagnostics::info("import_backup: existing data cleared");
     }
-
-    // 恢复 blob 文件
-    let mut restored_blob_map: HashMap<String, String> = HashMap::new();
-    for blob in &backup.blobs {
-        let filename = safe_backup_blob_filename(&blob.filename)?;
-        let blob_path = state.blob_dir.join(&filename);
-        let data = base64_decode(&blob.data_base64)
-            .map_err(|e| format!("解码 blob {} 失败: {}", blob.filename, e))?;
-
-        fs::write(&blob_path, data)
-            .map_err(|e| format!("写入 blob {} 失败: {}", blob.filename, e))?;
-
-        // Use filename as key to avoid confusion with ID conflicts in merge mode
-        restored_blob_map.insert(
-            blob.filename.clone(),
-            blob_path.to_string_lossy().to_string(),
-        );
-    }
-
-    // 导入数据到数据库
-    let repository = state.repository.lock().map_err(|e| e.to_string())?;
-    let mut imported_count = 0;
-
-    for mut item in backup.items {
-        // Restore blob path using the original filename from backup
-        if let Some(original_filename) = &item.content_path {
-            item.content_path = restored_blob_map.get(original_filename).cloned();
-        }
-
-        // 在合并模式下，检查是否已存在相同 hash 的记录
-        if merge {
-            if let Ok(Some(_)) = repository.find_by_hash(&item.hash) {
-                continue; // 跳过重复项
-            }
-        }
-
-        // 插入记录（需要实现 insert_item 方法）
-        // 注意：这里需要修改 repository 以支持直接插入完整的 ClipboardItem
-        repository
-            .insert_imported_item(&item)
-            .map_err(|e| format!("导入记录失败: {}", e))?;
-
-        imported_count += 1;
-    }
-
-    drop(repository);
 
     crate::diagnostics::info(format!(
         "import_backup: success, imported {} items",
@@ -1074,7 +1082,8 @@ mod tests {
 
     use super::{
         clear_history_with, copy_image_blob_with, delete_item_with, html_to_plain_text,
-        prune_history_with, safe_backup_blob_filename, validate_migration_paths,
+        import_backup_data_with, prune_history_with, safe_backup_blob_filename,
+        validate_migration_paths, BackupData, BackupMetadata, BlobData,
     };
     use crate::blobs::image::stage_dib;
     use crate::blobs::store::ImageBlobStore;
@@ -1418,6 +1427,190 @@ mod tests {
                 .expect("cleanup queue")
                 .is_empty());
         }
+        drop(repository);
+        drop(store);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn overwrite_import_waits_for_read_lease_then_cleans_and_restores() {
+        let root = std::env::temp_dir().join(format!(
+            "super-clipboard-overwrite-import-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store =
+            Arc::new(ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store"));
+        let staged = stage_dib(store.stage_dir(), dib32()).expect("stage old image");
+        let installed = store
+            .install_staged_with(staged, |installed| Ok(installed.clone()), |_| Ok(false))
+            .expect("install old image");
+        let old_image_path = installed.bmp_path().to_path_buf();
+        let old_thumbnail_path = installed.thumbnail_path().to_path_buf();
+        let repository = Arc::new(Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        ));
+        let old_item = repository
+            .lock()
+            .expect("repository lock")
+            .insert_or_touch_image(ClipboardItemDraft {
+                item_type: ClipboardItemType::Image,
+                content: None,
+                content_path: Some(old_image_path.to_string_lossy().to_string()),
+                content_hash: Some(installed.content_hash().to_string()),
+                preview: "old image".to_string(),
+                source_app: None,
+                size_bytes: 44,
+            })
+            .expect("insert old image");
+        let restored_id = uuid::Uuid::new_v4().to_string();
+        let backup = BackupData {
+            metadata: BackupMetadata {
+                version: "1.0".to_string(),
+                created_at: "test".to_string(),
+                item_count: 1,
+            },
+            items: vec![crate::storage::repository::ClipboardItem {
+                id: restored_id.clone(),
+                hash: "restored-hash".to_string(),
+                item_type: "image".to_string(),
+                content: None,
+                content_path: Some("restored.bmp".to_string()),
+                content_hash: Some("restored-content-hash".to_string()),
+                preview: "restored image".to_string(),
+                source_app: None,
+                favorite: false,
+                pinned: false,
+                size_bytes: 8,
+                created_at: 1,
+                updated_at: 1,
+            }],
+            blobs: vec![BlobData {
+                item_id: restored_id.clone(),
+                filename: "restored.bmp".to_string(),
+                data_base64: super::base64_encode(b"restored"),
+            }],
+        };
+        let (read_started_tx, read_started_rx) = mpsc::channel();
+        let (release_read_tx, release_read_rx) = mpsc::channel();
+        let reader_store = Arc::clone(&store);
+        let reader = thread::spawn(move || {
+            reader_store.with_read(|_| {
+                read_started_tx.send(()).expect("read started");
+                release_read_rx.recv().expect("release read");
+                Ok(())
+            })
+        });
+        read_started_rx.recv().expect("reader entered");
+
+        let worker_store = Arc::clone(&store);
+        let worker_repository = Arc::clone(&repository);
+        let (import_finished_tx, import_finished_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = import_backup_data_with(&worker_repository, &worker_store, backup, false);
+            import_finished_tx.send(()).expect("import finished");
+            result
+        });
+
+        assert!(import_finished_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+        assert!(repository
+            .lock()
+            .expect("repository lock")
+            .get_item(&old_item.id)
+            .expect("old item before release")
+            .is_some());
+        assert!(old_image_path.exists());
+        assert!(old_thumbnail_path.exists());
+
+        release_read_tx.send(()).expect("release reader");
+        import_finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("import after read");
+        reader.join().expect("reader thread").expect("read result");
+        assert_eq!(
+            worker
+                .join()
+                .expect("import thread")
+                .expect("import result"),
+            1
+        );
+
+        assert!(!old_image_path.exists());
+        assert!(!old_thumbnail_path.exists());
+        assert_eq!(
+            std::fs::read(store.blob_dir().join("restored.bmp")).expect("restored blob"),
+            b"restored"
+        );
+        let repository_guard = repository.lock().expect("repository lock");
+        assert!(repository_guard
+            .get_item(&old_item.id)
+            .expect("old item after import")
+            .is_none());
+        assert!(repository_guard
+            .get_item(&restored_id)
+            .expect("restored item")
+            .is_some());
+        assert!(repository_guard
+            .pending_cleanup_paths()
+            .expect("cleanup queue")
+            .is_empty());
+        drop(repository_guard);
+        drop(repository);
+        drop(store);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn merge_import_keeps_existing_image_files() {
+        let root = std::env::temp_dir().join(format!(
+            "super-clipboard-merge-import-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let staged = stage_dib(store.stage_dir(), dib32()).expect("stage old image");
+        let installed = store
+            .install_staged_with(staged, |installed| Ok(installed.clone()), |_| Ok(false))
+            .expect("install old image");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let old_item = repository
+            .lock()
+            .expect("repository lock")
+            .insert_or_touch_image(ClipboardItemDraft {
+                item_type: ClipboardItemType::Image,
+                content: None,
+                content_path: Some(installed.bmp_path().to_string_lossy().to_string()),
+                content_hash: Some(installed.content_hash().to_string()),
+                preview: "old image".to_string(),
+                source_app: None,
+                size_bytes: 44,
+            })
+            .expect("insert old image");
+        let backup = BackupData {
+            metadata: BackupMetadata {
+                version: "1.0".to_string(),
+                created_at: "test".to_string(),
+                item_count: 0,
+            },
+            items: Vec::new(),
+            blobs: Vec::new(),
+        };
+
+        assert_eq!(
+            import_backup_data_with(&repository, &store, backup, true).expect("merge import"),
+            0
+        );
+
+        assert!(installed.bmp_path().exists());
+        assert!(installed.thumbnail_path().exists());
+        assert!(repository
+            .lock()
+            .expect("repository lock")
+            .get_item(&old_item.id)
+            .expect("existing item")
+            .is_some());
         drop(repository);
         drop(store);
         std::fs::remove_dir_all(root).expect("cleanup");

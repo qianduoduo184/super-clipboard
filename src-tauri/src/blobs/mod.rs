@@ -10,29 +10,6 @@ pub fn ensure_blob_dir(app_data: &Path) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-pub fn remove_blob_if_exists(path: &Path) -> anyhow::Result<()> {
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    Ok(())
-}
-
-pub fn clear_blob_dir(blob_dir: &Path) -> anyhow::Result<()> {
-    if !blob_dir.exists() {
-        return Ok(());
-    }
-
-    for entry in fs::read_dir(blob_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file() {
-            remove_blob_if_exists(&path)?;
-        }
-    }
-
-    Ok(())
-}
-
 pub fn read_dib_from_bmp_file(path: &Path) -> anyhow::Result<Vec<u8>> {
     let bytes = fs::read(path)?;
     bmp_file_to_dib(&bytes)
