@@ -49,7 +49,10 @@ pub fn clear_blob_dir(blob_dir: &Path) -> anyhow::Result<()> {
 pub fn write_dib_as_bmp(blob_dir: &Path, dib_bytes: &[u8]) -> anyhow::Result<PathBuf> {
     let path = build_blob_path(blob_dir, "bmp");
     let bmp_bytes = bmp_file_from_dib(dib_bytes)?;
-    fs::write(&path, bmp_bytes)?;
+    write_file_with_cleanup(&path, |target| {
+        fs::write(target, &bmp_bytes)?;
+        Ok(())
+    })?;
     if let Err(e) = create_thumbnail(&path) {
         crate::diagnostics::warn(format!(
             "blobs: thumbnail creation failed for {}: {}",
@@ -58,6 +61,17 @@ pub fn write_dib_as_bmp(blob_dir: &Path, dib_bytes: &[u8]) -> anyhow::Result<Pat
         ));
     }
     Ok(path)
+}
+
+fn write_file_with_cleanup<F>(target: &Path, writer: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&Path) -> anyhow::Result<()>,
+{
+    if let Err(error) = writer(target) {
+        let _ = remove_blob_if_exists(target);
+        return Err(error);
+    }
+    Ok(())
 }
 
 pub fn read_dib_from_bmp_file(path: &Path) -> anyhow::Result<Vec<u8>> {
@@ -177,6 +191,61 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> anyhow::Result<u32> {
         .get(offset..offset + 4)
         .ok_or_else(|| anyhow::anyhow!("DIB u32 field is out of bounds"))?;
     Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+#[cfg(test)]
+mod write_cleanup_tests {
+    use super::write_file_with_cleanup;
+    use anyhow::anyhow;
+    use std::fs;
+    use uuid::Uuid;
+
+    #[test]
+    fn partial_file_is_removed_when_writer_fails() {
+        let dir = std::env::temp_dir().join(format!("super-clipboard-write-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let target = dir.join("partial.bmp");
+
+        let error = write_file_with_cleanup(&target, |path| {
+            fs::write(path, b"partial")?;
+            Err(anyhow!("simulated write failure"))
+        })
+        .expect_err("writer should fail");
+
+        assert_eq!(error.to_string(), "simulated write failure");
+        assert!(!target.exists());
+        fs::remove_dir_all(dir).expect("clean temp dir");
+    }
+
+    #[test]
+    fn successful_file_is_preserved() {
+        let dir = std::env::temp_dir().join(format!("super-clipboard-write-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let target = dir.join("complete.bmp");
+
+        write_file_with_cleanup(&target, |path| {
+            fs::write(path, b"complete")?;
+            Ok(())
+        })
+        .expect("writer succeeds");
+
+        assert_eq!(fs::read(&target).expect("read target"), b"complete");
+        fs::remove_dir_all(dir).expect("clean temp dir");
+    }
+
+    #[test]
+    fn cleanup_failure_preserves_the_writer_error() {
+        let target = std::env::temp_dir().join(format!("super-clipboard-write-{}", Uuid::new_v4()));
+        fs::create_dir_all(&target).expect("temp dir target");
+
+        let error =
+            write_file_with_cleanup(&target, |_path| Err(anyhow!("original write failure")))
+                .expect_err("writer should fail");
+
+        assert_eq!(error.to_string(), "original write failure");
+        assert!(target.exists());
+        fs::remove_dir_all(target).expect("clean temp dir");
+    }
 }
 
 #[cfg(test)]
