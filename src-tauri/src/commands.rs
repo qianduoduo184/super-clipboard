@@ -940,25 +940,73 @@ fn import_backup_data_with(
                     .map_err(|error| anyhow::anyhow!("清空 blob 目录失败: {error}"))?;
             }
 
-            let mut restored_blob_map = HashMap::new();
+            let items = if merge {
+                let repository = repository
+                    .lock()
+                    .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?;
+                backup
+                    .items
+                    .into_iter()
+                    .filter(|item| {
+                        !repository
+                            .find_by_hash(&item.hash)
+                            .is_ok_and(|existing| existing.is_some())
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                backup.items
+            };
+            let referenced_blob_names = items
+                .iter()
+                .filter_map(|item| item.content_path.clone())
+                .collect::<HashSet<_>>();
+
+            let mut prepared_blobs = HashMap::new();
             for blob in &backup.blobs {
+                if merge && !referenced_blob_names.contains(&blob.filename) {
+                    continue;
+                }
                 let filename = safe_backup_blob_filename(&blob.filename)
                     .map_err(|error| anyhow::anyhow!(error))?;
                 let blob_path = blob_dir.join(&filename);
                 let data = base64_decode(&blob.data_base64).map_err(|error| {
                     anyhow::anyhow!("解码 blob {} 失败: {error}", blob.filename)
                 })?;
-                fs::write(&blob_path, data).map_err(|error| {
-                    anyhow::anyhow!("写入 blob {} 失败: {error}", blob.filename)
-                })?;
-                restored_blob_map.insert(
-                    blob.filename.clone(),
-                    blob_path.to_string_lossy().to_string(),
-                );
+                if let Some((_, existing_data, _)) = prepared_blobs.get(&blob.filename) {
+                    anyhow::ensure!(
+                        existing_data == &data,
+                        "merge blob conflict: {}",
+                        blob.filename
+                    );
+                    continue;
+                }
+                let should_write = match fs::read(&blob_path) {
+                    Ok(existing_data) if merge => {
+                        anyhow::ensure!(
+                            existing_data == data,
+                            "merge blob conflict: {}",
+                            blob.filename
+                        );
+                        false
+                    }
+                    Ok(_) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(error) => return Err(error.into()),
+                };
+                prepared_blobs.insert(blob.filename.clone(), (blob_path, data, should_write));
+            }
+
+            let mut restored_blob_map = HashMap::new();
+            for (filename, (blob_path, data, should_write)) in prepared_blobs {
+                if should_write {
+                    fs::write(&blob_path, data)
+                        .map_err(|error| anyhow::anyhow!("写入 blob {} 失败: {error}", filename))?;
+                }
+                restored_blob_map.insert(filename, blob_path.to_string_lossy().to_string());
             }
 
             let mut imported_count = 0;
-            for mut item in backup.items {
+            for mut item in items {
                 if let Some(original_filename) = &item.content_path {
                     item.content_path = restored_blob_map.get(original_filename).cloned();
                 }
@@ -1562,7 +1610,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_import_keeps_existing_image_files() {
+    fn merge_duplicate_item_does_not_overwrite_existing_blob() {
         let root = std::env::temp_dir().join(format!(
             "super-clipboard-merge-import-{}",
             uuid::Uuid::new_v4()
@@ -1588,14 +1636,39 @@ mod tests {
                 size_bytes: 44,
             })
             .expect("insert old image");
+        let original_bytes = std::fs::read(installed.bmp_path()).expect("existing blob");
+        let filename = installed
+            .bmp_path()
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("blob filename")
+            .to_string();
         let backup = BackupData {
             metadata: BackupMetadata {
                 version: "1.0".to_string(),
                 created_at: "test".to_string(),
-                item_count: 0,
+                item_count: 1,
             },
-            items: Vec::new(),
-            blobs: Vec::new(),
+            items: vec![crate::storage::repository::ClipboardItem {
+                id: uuid::Uuid::new_v4().to_string(),
+                hash: old_item.hash.clone(),
+                item_type: "image".to_string(),
+                content: None,
+                content_path: Some(filename.clone()),
+                content_hash: Some("duplicate-content-hash".to_string()),
+                preview: "duplicate image".to_string(),
+                source_app: None,
+                favorite: false,
+                pinned: false,
+                size_bytes: 9,
+                created_at: 1,
+                updated_at: 1,
+            }],
+            blobs: vec![BlobData {
+                item_id: "duplicate".to_string(),
+                filename,
+                data_base64: super::base64_encode(b"different"),
+            }],
         };
 
         assert_eq!(
@@ -1603,13 +1676,171 @@ mod tests {
             0
         );
 
-        assert!(installed.bmp_path().exists());
+        assert_eq!(
+            std::fs::read(installed.bmp_path()).expect("existing blob after merge"),
+            original_bytes
+        );
         assert!(installed.thumbnail_path().exists());
         assert!(repository
             .lock()
             .expect("repository lock")
             .get_item(&old_item.id)
             .expect("existing item")
+            .is_some());
+        drop(repository);
+        drop(store);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn merge_new_item_rejects_conflicting_existing_blob_before_mutation() {
+        let root = std::env::temp_dir().join(format!(
+            "super-clipboard-merge-conflict-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let staged = stage_dib(store.stage_dir(), dib32()).expect("stage old image");
+        let installed = store
+            .install_staged_with(staged, |installed| Ok(installed.clone()), |_| Ok(false))
+            .expect("install old image");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let old_item = repository
+            .lock()
+            .expect("repository lock")
+            .insert_or_touch_image(ClipboardItemDraft {
+                item_type: ClipboardItemType::Image,
+                content: None,
+                content_path: Some(installed.bmp_path().to_string_lossy().to_string()),
+                content_hash: Some(installed.content_hash().to_string()),
+                preview: "old image".to_string(),
+                source_app: None,
+                size_bytes: 44,
+            })
+            .expect("insert old image");
+        let original_bytes = std::fs::read(installed.bmp_path()).expect("existing blob");
+        let filename = installed
+            .bmp_path()
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("blob filename")
+            .to_string();
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let backup = BackupData {
+            metadata: BackupMetadata {
+                version: "1.0".to_string(),
+                created_at: "test".to_string(),
+                item_count: 1,
+            },
+            items: vec![crate::storage::repository::ClipboardItem {
+                id: new_id.clone(),
+                hash: "new-item-hash".to_string(),
+                item_type: "image".to_string(),
+                content: None,
+                content_path: Some(filename.clone()),
+                content_hash: Some("new-content-hash".to_string()),
+                preview: "new image".to_string(),
+                source_app: None,
+                favorite: false,
+                pinned: false,
+                size_bytes: 9,
+                created_at: 1,
+                updated_at: 1,
+            }],
+            blobs: vec![BlobData {
+                item_id: new_id.clone(),
+                filename,
+                data_base64: super::base64_encode(b"different"),
+            }],
+        };
+
+        let error = import_backup_data_with(&repository, &store, backup, true)
+            .expect_err("merge conflict must fail");
+
+        assert!(error.contains("conflict"), "unexpected error: {error}");
+        assert_eq!(
+            std::fs::read(installed.bmp_path()).expect("existing blob after merge"),
+            original_bytes
+        );
+        let repository_guard = repository.lock().expect("repository lock");
+        assert!(repository_guard
+            .get_item(&old_item.id)
+            .expect("old item")
+            .is_some());
+        assert!(repository_guard
+            .get_item(&new_id)
+            .expect("new item")
+            .is_none());
+        drop(repository_guard);
+        drop(repository);
+        drop(store);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn merge_reuses_readonly_existing_blob_when_bytes_match() {
+        let root = std::env::temp_dir().join(format!(
+            "super-clipboard-merge-reuse-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let blob_path = store.blob_dir().join("reuse.bmp");
+        std::fs::write(&blob_path, b"same bytes").expect("existing blob");
+        let mut permissions = std::fs::metadata(&blob_path)
+            .expect("blob metadata")
+            .permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&blob_path, permissions).expect("readonly blob");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let backup = BackupData {
+            metadata: BackupMetadata {
+                version: "1.0".to_string(),
+                created_at: "test".to_string(),
+                item_count: 1,
+            },
+            items: vec![crate::storage::repository::ClipboardItem {
+                id: new_id.clone(),
+                hash: "reuse-item-hash".to_string(),
+                item_type: "image".to_string(),
+                content: None,
+                content_path: Some("reuse.bmp".to_string()),
+                content_hash: Some("reuse-content-hash".to_string()),
+                preview: "reused image".to_string(),
+                source_app: None,
+                favorite: false,
+                pinned: false,
+                size_bytes: 10,
+                created_at: 1,
+                updated_at: 1,
+            }],
+            blobs: vec![BlobData {
+                item_id: new_id.clone(),
+                filename: "reuse.bmp".to_string(),
+                data_base64: super::base64_encode(b"same bytes"),
+            }],
+        };
+
+        let result = import_backup_data_with(&repository, &store, backup, true);
+
+        let mut permissions = std::fs::metadata(&blob_path)
+            .expect("blob metadata after merge")
+            .permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&blob_path, permissions).expect("writable cleanup");
+        assert_eq!(result.expect("reuse existing blob"), 1);
+        assert_eq!(
+            std::fs::read(&blob_path).expect("reused blob"),
+            b"same bytes"
+        );
+        assert!(repository
+            .lock()
+            .expect("repository lock")
+            .get_item(&new_id)
+            .expect("reused item")
             .is_some());
         drop(repository);
         drop(store);
