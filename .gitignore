@@ -37,3 +37,4 @@ CLAUDE.md
 *.db-shm
 /blobs/
 .tmp/
+.worktrees/
