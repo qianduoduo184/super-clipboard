@@ -1,6 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { formatBytes, mapBackendItemToViewItem } from './clipboard-adapter.js';
+import * as clipboardAdapter from './clipboard-adapter.js';
+
+const {
+  beginDetailRequest,
+  cacheItemDetailById,
+  formatBytes,
+  getDetailDisplayContent,
+  isDetailResponseCurrent,
+  mapBackendItemDetailToViewItem,
+  mapBackendItemToViewItem,
+} = clipboardAdapter;
 
 test('formatBytes renders compact byte labels', () => {
   assert.equal(formatBytes(12), '12 B');
@@ -29,6 +39,7 @@ test('mapBackendItemToViewItem maps backend fields to UI fields', () => {
     type: 'text',
     preview: 'hello',
     contentPath: null,
+    thumbnailPath: null,
     favorite: true,
     pinned: false,
     updatedAt: 200,
@@ -89,4 +100,76 @@ test('mapBackendItemToViewItem keeps image content path for previews', () => {
 
   assert.equal(item.contentPath, 'C:\\blob\\image.bmp');
   assert.equal(item.size, '2.0 KB');
+});
+
+test('mapBackendItemToViewItem maps summary image paths without inventing full content', () => {
+  const item = mapBackendItemToViewItem({
+    id: 'summary-image',
+    hash: 'hash',
+    item_type: 'image',
+    content_path: 'C:\\blob\\image.bmp',
+    thumbnail_path: 'C:\\blob\\image.thumb.png',
+    preview: 'image.bmp',
+    source_app: 'Snipping Tool',
+    favorite: false,
+    pinned: false,
+    size_bytes: 2048,
+    created_at: 100_000,
+    updated_at: 200_000,
+  });
+
+  assert.equal(item.thumbnailPath, 'C:\\blob\\image.thumb.png');
+  assert.equal(item.contentPath, 'C:\\blob\\image.bmp');
+  assert.equal(Object.hasOwn(item, 'content'), false);
+});
+
+test('mapBackendItemDetailToViewItem maps full content from item detail', () => {
+  const item = mapBackendItemDetailToViewItem({
+    id: 'detail-text',
+    hash: 'hash',
+    item_type: 'text',
+    content: '完整的多行正文\n第二行',
+    content_path: null,
+    preview: '完整的多行正文...',
+    source_app: 'VS Code',
+    favorite: false,
+    pinned: false,
+    size_bytes: 30,
+    created_at: 100_000,
+    updated_at: 200_000,
+  });
+
+  assert.equal(item.content, '完整的多行正文\n第二行');
+  assert.equal(item.contentPath, null);
+});
+
+test('cacheItemDetailById enriches only the matching cache entry without changing list order', () => {
+  const items = [{ id: 'a' }, { id: 'b' }];
+  const cachedA = { id: 'a', content: 'A' };
+  const detailB = { id: 'b', content: '完整 B' };
+  const detailsById = { a: cachedA };
+
+  const nextDetails = cacheItemDetailById(detailsById, detailB);
+
+  assert.deepEqual(items.map((item) => item.id), ['a', 'b']);
+  assert.equal(nextDetails.a, cachedA);
+  assert.equal(nextDetails.b, detailB);
+  assert.equal(detailsById.b, undefined);
+});
+
+test('detail request generation rejects a late response after selection changes', () => {
+  const requestA = beginDetailRequest({ itemId: null, generation: 0 }, 'a');
+  const requestB = beginDetailRequest(requestA, 'b');
+
+  assert.equal(isDetailResponseCurrent(requestB, requestA, 'b'), false);
+  assert.equal(isDetailResponseCurrent(requestB, requestB, 'b'), true);
+});
+
+test('getDetailDisplayContent prefers fetched full text or HTML over summary preview', () => {
+  const summary = { id: 'html-1', preview: '<p>截断...</p>' };
+  const detail = { id: 'html-1', content: '<p>完整 HTML 正文</p>' };
+
+  assert.equal(getDetailDisplayContent(summary, detail), '<p>完整 HTML 正文</p>');
+  assert.equal(getDetailDisplayContent(summary, undefined), '<p>截断...</p>');
+  assert.equal(getDetailDisplayContent(summary, { id: 'other', content: '错误内容' }), '<p>截断...</p>');
 });

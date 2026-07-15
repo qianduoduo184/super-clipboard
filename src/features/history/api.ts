@@ -1,21 +1,17 @@
 import { invoke } from '@tauri-apps/api/core';
+import {
+  mapBackendItemDetailToViewItem,
+  mapBackendItemToViewItem,
+  type BackendClipboardItemDetail,
+  type BackendClipboardItemSummary,
+  type ViewClipboardItem,
+  type ViewClipboardItemDetail,
+} from '../../lib/clipboard-adapter';
 
 export type ClipboardFilter = 'all' | 'favorites' | 'text' | 'html' | 'image' | 'files';
 
-export type ClipboardSearchItem = {
-  id: string;
-  hash: string;
-  item_type: string;
-  content?: string | null;
-  content_path?: string | null;
-  preview: string;
-  source_app?: string | null;
-  favorite: boolean;
-  pinned: boolean;
-  size_bytes: number;
-  created_at: number;
-  updated_at: number;
-};
+export type ClipboardSearchItem = BackendClipboardItemSummary;
+export type ClipboardItemDetail = BackendClipboardItemDetail;
 
 export type SearchFilters = {
   item_type?: string | null;
@@ -59,17 +55,19 @@ export function toSearchFilters(filter: ClipboardFilter): SearchFilters {
   };
 }
 
-export async function searchItems(query: string, filter: ClipboardFilter, cursor?: number) {
-  return invoke<ClipboardSearchItem[]>('search_items', {
+export async function searchItems(query: string, filter: ClipboardFilter, cursor?: number): Promise<ViewClipboardItem[]> {
+  const items = await invoke<ClipboardSearchItem[]>('search_items', {
     query,
     filters: toSearchFilters(filter),
     limit: 50,
     cursor: cursor ?? null,
   });
+  return items.map(mapBackendItemToViewItem);
 }
 
-export async function getItemDetail(id: string) {
-  return invoke<ClipboardSearchItem | null>('get_item_detail', { id });
+export async function getItemDetail(id: string): Promise<ViewClipboardItemDetail | null> {
+  const item = await invoke<ClipboardItemDetail | null>('get_item_detail', { id });
+  return item ? mapBackendItemDetailToViewItem(item) : null;
 }
 
 export async function copyItem(id: string, plainText?: boolean) {
@@ -163,4 +161,3 @@ export async function parseBackupInfo(backupPath: string) {
 export async function importBackup(backupPath: string, merge: boolean) {
   return invoke<number>('import_backup', { backupPath, merge });
 }
-

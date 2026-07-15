@@ -22,11 +22,20 @@ import { filterItems, getTypeLabel, getVisibleFilters, getVisualPreview, reorder
 import { calculateVirtualWindow, moveSelection } from './lib/history-ui';
 import { applyThemeMode, getErrorMessage, mergeSettings, shouldCheckForUpdatesToday, toLocalDateString } from './lib/settings-model';
 import SettingsView from './features/settings/SettingsView';
-import { mapBackendItemToViewItem } from './lib/clipboard-adapter';
+import {
+  beginDetailRequest,
+  cacheItemDetailById,
+  getDetailDisplayContent,
+  isDetailResponseCurrent,
+  type DetailRequest,
+  type ViewClipboardItem,
+  type ViewClipboardItemDetail,
+} from './lib/clipboard-adapter';
 import {
   copyItem,
   checkForUpdates,
   deleteItem as deleteBackendItem,
+  getItemDetail,
   getSettings,
   installUpdate,
   pasteItem,
@@ -41,17 +50,7 @@ import {
 type ClipboardType = 'text' | 'html' | 'image' | 'files';
 type FilterType = 'all' | 'favorites' | ClipboardType;
 
-type ClipboardItem = {
-  id: string;
-  type: ClipboardType;
-  preview: string;
-  contentPath: string | null;
-  favorite: boolean;
-  pinned: boolean;
-  updatedAt: number;
-  size: string;
-  source: string;
-};
+type ClipboardItem = ViewClipboardItem;
 
 const seedItems: ClipboardItem[] = [
   {
@@ -59,6 +58,7 @@ const seedItems: ClipboardItem[] = [
     type: 'text',
     preview: 'SQLite WAL 模式 + FTS5 搜索，保证大量历史记录下仍能快速返回首屏。',
     contentPath: null,
+    thumbnailPath: null,
     favorite: true,
     pinned: false,
     updatedAt: Date.now() - 1000 * 60 * 2,
@@ -70,6 +70,7 @@ const seedItems: ClipboardItem[] = [
     type: 'image',
     preview: 'screenshot-2026-06-08.png',
     contentPath: null,
+    thumbnailPath: null,
     favorite: false,
     pinned: false,
     updatedAt: Date.now() - 1000 * 60 * 18,
@@ -81,6 +82,7 @@ const seedItems: ClipboardItem[] = [
     type: 'files',
     preview: '需求说明.docx, 架构草图.png',
     contentPath: null,
+    thumbnailPath: null,
     favorite: false,
     pinned: false,
     updatedAt: Date.now() - 1000 * 60 * 42,
@@ -92,6 +94,7 @@ const seedItems: ClipboardItem[] = [
     type: 'html',
     preview: '<table><tr><td>CopyQ / Ditto / PasteBar 功能对比</td></tr></table>',
     contentPath: null,
+    thumbnailPath: null,
     favorite: false,
     pinned: false,
     updatedAt: Date.now() - 1000 * 60 * 85,
@@ -135,6 +138,9 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [items, setItems] = useState(seedItems);
   const [selectedId, setSelectedId] = useState<string | undefined>(seedItems[0]?.id);
+  const [detailsById, setDetailsById] = useState<Record<string, ViewClipboardItemDetail>>({});
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [backendAvailable, setBackendAvailable] = useState(true);
   const [statusMessage, setStatusMessage] = useState('正在连接本地剪贴板服务');
@@ -147,6 +153,7 @@ export default function App() {
   const [previewPaneWidth, setPreviewPaneWidth] = useState(0.47);
   const [isResizing, setIsResizing] = useState(false);
   const historyListRef = useRef<HTMLDivElement | null>(null);
+  const detailRequestRef = useRef<DetailRequest>({ itemId: null, generation: 0 });
   const debouncedQuery = useDebouncedValue(query, 100);
 
   // Track the latest settingsOpen for the blur handler (registered once with []).
@@ -263,7 +270,7 @@ export default function App() {
     searchItems(debouncedQuery, activeFilter)
       .then((backendItems) => {
         if (ignore) return;
-        const nextItems = backendItems.map(mapBackendItemToViewItem);
+        const nextItems = backendItems;
         setItems(nextItems);
         setBackendAvailable(true);
         setStatusMessage(nextItems.length === 0 ? '暂无剪贴板记录' : '已连接本地剪贴板服务');
@@ -334,6 +341,56 @@ export default function App() {
 
   const virtualItems = visibleItems.slice(virtualWindow.startIndex, virtualWindow.endIndex);
   const selectedItem = visibleItems.find((item) => item.id === selectedId) ?? visibleItems[0];
+  const selectedDetail = selectedItem ? detailsById[selectedItem.id] : undefined;
+  const selectedItemIdRef = useRef<string | undefined>(selectedItem?.id);
+  selectedItemIdRef.current = selectedItem?.id;
+  const detailDisplayContent = selectedItem
+    ? getDetailDisplayContent(selectedItem, selectedDetail)
+    : '';
+  const detailImagePath = selectedDetail?.contentPath ?? selectedItem?.contentPath ?? null;
+
+  useEffect(() => {
+    const selectedItemId = selectedItem?.id;
+    if (!previewEnabled || !backendAvailable || !selectedItemId) {
+      detailRequestRef.current = beginDetailRequest(detailRequestRef.current, null);
+      setDetailLoading(false);
+      setDetailError(null);
+      return;
+    }
+    if (selectedDetail) {
+      setDetailLoading(false);
+      setDetailError(null);
+      return;
+    }
+
+    const request = beginDetailRequest(detailRequestRef.current, selectedItemId);
+    detailRequestRef.current = request;
+    setDetailLoading(true);
+    setDetailError(null);
+
+    getItemDetail(selectedItemId)
+      .then((detail) => {
+        if (!isDetailResponseCurrent(detailRequestRef.current, request, selectedItemIdRef.current)) return;
+        if (!detail) {
+          setDetailLoading(false);
+          setDetailError('详情加载失败');
+          return;
+        }
+        setDetailsById((current) => cacheItemDetailById(current, detail));
+        setDetailLoading(false);
+      })
+      .catch(() => {
+        if (!isDetailResponseCurrent(detailRequestRef.current, request, selectedItemIdRef.current)) return;
+        setDetailLoading(false);
+        setDetailError('详情加载失败');
+      });
+
+    return () => {
+      if (detailRequestRef.current.generation === request.generation) {
+        detailRequestRef.current = beginDetailRequest(detailRequestRef.current, null);
+      }
+    };
+  }, [backendAvailable, previewEnabled, selectedDetail, selectedItem?.id]);
 
   useEffect(() => {
     if (!selectedItem && visibleItems[0]) {
@@ -807,6 +864,7 @@ export default function App() {
             const actualIndex = virtualWindow.startIndex + idx;
             const itemHeight = itemHeights[actualIndex];
             const isDraggingDisabled = false;
+            const imageListPath = item.type === 'image' ? item.thumbnailPath ?? item.contentPath : null;
             return (
             <button
               key={item.id}
@@ -853,9 +911,14 @@ export default function App() {
               <span className="drag-handle-icon">
                 <GripVertical size={16} />
               </span>
-              <span className={item.type === 'image' && item.contentPath ? 'type-icon image-thumb' : 'type-icon'}>
-                {item.type === 'image' && item.contentPath ? (
-                  <img src={convertFileSrc(item.contentPath)} alt="" />
+              <span className={imageListPath ? 'type-icon image-thumb' : 'type-icon'}>
+                {imageListPath ? (
+                  <img
+                    src={convertFileSrc(imageListPath)}
+                    alt=""
+                    loading="lazy"
+                    decoding="async"
+                  />
                 ) : (
                   iconForType(item.type)
                 )}
@@ -889,14 +952,16 @@ export default function App() {
               <>
                 <div className="detail-header">
                   <span className="detail-type">{getTypeLabel(selectedItem.type)}</span>
-                  <span>{selectedItem.size}</span>
+                  <span role={detailLoading ? 'status' : undefined}>
+                    {detailLoading ? '正在加载完整内容…' : detailError ?? selectedItem.size}
+                  </span>
                 </div>
-                {selectedItem.type === 'image' && selectedItem.contentPath ? (
+                {selectedItem.type === 'image' && detailImagePath ? (
                   <div className="image-preview">
-                    <img src={convertFileSrc(selectedItem.contentPath)} alt="剪贴板图片预览" />
+                    <img src={convertFileSrc(detailImagePath)} alt="剪贴板图片预览" />
                   </div>
                 ) : (
-                  <pre>{selectedItem.preview}</pre>
+                  <pre aria-busy={detailLoading}>{detailDisplayContent}</pre>
                 )}
                 <div className="detail-actions">
                   <button onClick={() => void pasteSelectedItem()}>
