@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::storage::repository::{ClipboardItem, SearchFilters};
+use crate::storage::repository::{ClipboardItem, ClipboardItemSummary, SearchFilters};
 use crate::system::settings::AppSettings;
 use crate::AppState;
 
@@ -187,7 +187,7 @@ pub fn search_items(
     filters: SearchFilters,
     limit: i64,
     cursor: Option<i64>,
-) -> Result<Vec<ClipboardItem>, String> {
+) -> Result<Vec<ClipboardItemSummary>, String> {
     crate::diagnostics::info(format!(
         "command: search_items query_len={} limit={} cursor={cursor:?}",
         query.len(),
@@ -826,15 +826,7 @@ pub async fn export_backup(state: State<'_, AppState>) -> Result<String, String>
     // 读取所有数据
     let repository = state.repository.lock().map_err(|e| e.to_string())?;
     let mut all_items = repository
-        .search(
-            "".to_string(),
-            SearchFilters {
-                item_type: None,
-                favorites_only: false,
-            },
-            100000,
-            None,
-        )
+        .list_items_for_backup(100000)
         .map_err(|e| format!("读取数据失败: {}", e))?;
 
     drop(repository);
@@ -1137,15 +1129,7 @@ pub async fn import_backup(
 
         let repository = state.repository.lock().map_err(|e| e.to_string())?;
         let current_items = repository
-            .search(
-                "".to_string(),
-                SearchFilters {
-                    item_type: None,
-                    favorites_only: false,
-                },
-                100000,
-                None,
-            )
+            .list_items_for_backup(100000)
             .map_err(|e| format!("创建临时备份失败: {}", e))?;
         drop(repository);
 

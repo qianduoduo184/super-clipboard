@@ -27,6 +27,22 @@ pub struct ClipboardItem {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipboardItemSummary {
+    pub id: String,
+    pub hash: String,
+    pub item_type: String,
+    pub preview: String,
+    pub source_app: Option<String>,
+    pub favorite: bool,
+    pub pinned: bool,
+    pub size_bytes: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub content_path: Option<String>,
+    pub thumbnail_path: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use crate::clipboard::types::{ClipboardItemDraft, ClipboardItemType};
@@ -452,6 +468,224 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].preview, "sqlite clipboard history");
+    }
+
+    #[test]
+    fn lightweight_summary_search_serialization_omits_full_content_fields() {
+        let repository = open_test_repository();
+        repository
+            .insert_or_touch(text_draft("large clipboard payload"))
+            .expect("insert");
+
+        let summary = repository
+            .search(
+                String::new(),
+                SearchFilters {
+                    item_type: None,
+                    favorites_only: false,
+                },
+                10,
+                None,
+            )
+            .expect("summary search")
+            .into_iter()
+            .next()
+            .expect("summary");
+        let json = serde_json::to_value(summary).expect("serialize summary");
+        let object = json.as_object().expect("summary object");
+
+        assert!(!object.contains_key("content"));
+        assert!(!object.contains_key("content_hash"));
+    }
+
+    #[test]
+    fn lightweight_summary_projection_does_not_read_content() {
+        let repository = open_test_repository();
+        repository
+            .conn
+            .execute(
+                "INSERT INTO clipboard_items
+                 (id, hash, item_type, content, preview, source_app, favorite, pinned, size_bytes, created_at, updated_at, sort_rank)
+                 VALUES ('poison-content', 'poison-hash', 'text', X'80FF', 'safe preview', 'fixture', 0, 0, 2, 10, 20, 20)",
+                [],
+            )
+            .expect("insert non-text content fixture");
+
+        let summaries = repository
+            .search(
+                String::new(),
+                SearchFilters {
+                    item_type: None,
+                    favorites_only: false,
+                },
+                10,
+                None,
+            )
+            .expect("summary projection must not decode content");
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].preview, "safe preview");
+    }
+
+    #[test]
+    fn lightweight_summary_derives_only_image_thumbnail_path() {
+        let repository = open_test_repository();
+        let image = repository
+            .insert_or_touch_image(image_draft("pixels", "legacy/images/original.bmp"))
+            .expect("insert image");
+        let text = repository
+            .insert_or_touch(text_draft("plain text"))
+            .expect("insert text");
+
+        let summaries = repository
+            .search(
+                String::new(),
+                SearchFilters {
+                    item_type: None,
+                    favorites_only: false,
+                },
+                10,
+                None,
+            )
+            .expect("summary search");
+        let image_json = summaries
+            .iter()
+            .find(|item| item.id == image.id)
+            .map(serde_json::to_value)
+            .expect("image summary")
+            .expect("serialize image summary");
+        let text_json = summaries
+            .iter()
+            .find(|item| item.id == text.id)
+            .map(serde_json::to_value)
+            .expect("text summary")
+            .expect("serialize text summary");
+
+        assert_eq!(image_json["content_path"], "legacy/images/original.bmp");
+        assert_eq!(
+            image_json["thumbnail_path"],
+            crate::blobs::thumbnail_path_for(Path::new("legacy/images/original.bmp"))
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(text_json["content_path"], serde_json::Value::Null);
+        assert_eq!(text_json["thumbnail_path"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn lightweight_summary_get_item_preserves_text_and_html_content() {
+        let repository = open_test_repository();
+        let text = repository
+            .insert_or_touch(text_draft("full text content"))
+            .expect("insert text");
+        let html = repository
+            .insert_or_touch(ClipboardItemDraft {
+                item_type: ClipboardItemType::Html,
+                content: Some("<p>full <strong>HTML</strong></p>".to_string()),
+                content_path: None,
+                content_hash: None,
+                preview: "full HTML".to_string(),
+                source_app: Some("browser".to_string()),
+                size_bytes: 33,
+            })
+            .expect("insert HTML");
+
+        assert_eq!(
+            repository
+                .get_item(&text.id)
+                .expect("get text")
+                .expect("text item")
+                .content
+                .as_deref(),
+            Some("full text content")
+        );
+        assert_eq!(
+            repository
+                .get_item(&html.id)
+                .expect("get HTML")
+                .expect("HTML item")
+                .content
+                .as_deref(),
+            Some("<p>full <strong>HTML</strong></p>")
+        );
+    }
+
+    #[test]
+    fn lightweight_summary_preserves_filters_pagination_and_metadata() {
+        let repository = open_test_repository();
+        let newest = repository
+            .insert_or_touch(text_draft("newest favorite"))
+            .expect("insert newest");
+        let older = repository
+            .insert_or_touch(text_draft("older favorite"))
+            .expect("insert older");
+        let excluded = repository
+            .insert_or_touch(text_draft("excluded non-favorite"))
+            .expect("insert excluded");
+        repository
+            .conn
+            .execute(
+                "UPDATE clipboard_items
+                 SET source_app = 'editor', favorite = 1, pinned = 1,
+                     size_bytes = 111, created_at = 30, updated_at = 300, sort_rank = 300
+                 WHERE id = ?1",
+                params![newest.id],
+            )
+            .expect("update newest metadata");
+        repository
+            .conn
+            .execute(
+                "UPDATE clipboard_items
+                 SET source_app = 'terminal', favorite = 1, pinned = 0,
+                     size_bytes = 222, created_at = 20, updated_at = 200, sort_rank = 200
+                 WHERE id = ?1",
+                params![older.id],
+            )
+            .expect("update older metadata");
+        repository
+            .conn
+            .execute(
+                "UPDATE clipboard_items
+                 SET favorite = 0, created_at = 10, updated_at = 100, sort_rank = 100
+                 WHERE id = ?1",
+                params![excluded.id],
+            )
+            .expect("update excluded metadata");
+
+        let first_page = repository
+            .search(
+                String::new(),
+                SearchFilters {
+                    item_type: Some("text".to_string()),
+                    favorites_only: true,
+                },
+                1,
+                None,
+            )
+            .expect("first page");
+        let second_page = repository
+            .search(
+                String::new(),
+                SearchFilters {
+                    item_type: Some("text".to_string()),
+                    favorites_only: true,
+                },
+                1,
+                Some(first_page[0].updated_at),
+            )
+            .expect("second page");
+
+        assert_eq!(first_page.len(), 1);
+        assert_eq!(first_page[0].id, newest.id);
+        assert_eq!(first_page[0].source_app.as_deref(), Some("editor"));
+        assert!(first_page[0].favorite);
+        assert!(first_page[0].pinned);
+        assert_eq!(first_page[0].size_bytes, 111);
+        assert_eq!(first_page[0].created_at, 30);
+        assert_eq!(first_page[0].updated_at, 300);
+        assert_eq!(second_page.len(), 1);
+        assert_eq!(second_page[0].id, older.id);
+        assert_ne!(second_page[0].id, excluded.id);
     }
 
     #[test]
@@ -1368,9 +1602,9 @@ impl ClipboardRepository {
         filters: SearchFilters,
         limit: i64,
         cursor: Option<i64>,
-    ) -> anyhow::Result<Vec<ClipboardItem>> {
+    ) -> anyhow::Result<Vec<ClipboardItemSummary>> {
         let mut sql = String::from(
-            "SELECT id, hash, item_type, content, content_path, preview, source_app, favorite, pinned, size_bytes, created_at, updated_at, content_hash
+            "SELECT id, hash, item_type, content_path, preview, source_app, favorite, pinned, size_bytes, created_at, updated_at
              FROM clipboard_items
              WHERE deleted_at IS NULL",
         );
@@ -1422,7 +1656,20 @@ impl ClipboardRepository {
         sql_params.push(Value::Integer(limit));
 
         let mut statement = self.conn.prepare(&sql)?;
-        let rows = statement.query_map(params_from_iter(sql_params), Self::map_item)?;
+        let rows = statement.query_map(params_from_iter(sql_params), Self::map_summary)?;
+
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_items_for_backup(&self, limit: i64) -> anyhow::Result<Vec<ClipboardItem>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, hash, item_type, content, content_path, preview, source_app, favorite, pinned, size_bytes, created_at, updated_at, content_hash
+             FROM clipboard_items
+             WHERE deleted_at IS NULL
+             ORDER BY pinned DESC, COALESCE(sort_rank, updated_at) DESC, updated_at DESC
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit], Self::map_item)?;
 
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
@@ -1679,6 +1926,35 @@ impl ClipboardRepository {
             created_at: row.get(10)?,
             updated_at: row.get(11)?,
             content_hash: row.get(12)?,
+        })
+    }
+
+    fn map_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClipboardItemSummary> {
+        let item_type: String = row.get(2)?;
+        let content_path: Option<String> = row.get(3)?;
+        let thumbnail_path = if item_type == "image" {
+            content_path.as_deref().map(|path| {
+                crate::blobs::thumbnail_path_for(Path::new(path))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        } else {
+            None
+        };
+
+        Ok(ClipboardItemSummary {
+            id: row.get(0)?,
+            hash: row.get(1)?,
+            item_type,
+            preview: row.get(4)?,
+            source_app: row.get(5)?,
+            favorite: row.get::<_, i64>(6)? == 1,
+            pinned: row.get::<_, i64>(7)? == 1,
+            size_bytes: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
+            content_path,
+            thumbnail_path,
         })
     }
 }
