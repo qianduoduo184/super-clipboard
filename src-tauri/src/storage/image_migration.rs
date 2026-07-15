@@ -15,6 +15,7 @@ const IMAGE_MIGRATION_NAME: &str = "legacy-image-content-dedup-v1";
 const IMAGE_QUOTA_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const THUMBNAIL_RESERVATION_BYTES: u64 = 1024 * 1024;
 const BACKUP_COMPLETE_MARKER: &str = ".complete";
+const BACKUP_MANIFEST_VERSION: &str = "super-clipboard-image-backup-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MigrationOutcome {
@@ -183,16 +184,18 @@ fn scan_images(
         let first = images
             .first()
             .ok_or_else(|| anyhow!("image migration group is empty"))?;
-        if canonical_bmp.exists() {
+        let canonical_bmp_exists = managed_regular_file_exists(blob_dir, &canonical_bmp)?;
+        let canonical_thumbnail_exists =
+            managed_regular_file_exists(blob_dir, &canonical_thumbnail)?;
+        if canonical_bmp_exists {
             validate_canonical_bmp(blob_dir, &canonical_bmp, content_hash)?;
         }
-        if canonical_thumbnail.exists() {
-            validate_regular_managed_file(blob_dir, &canonical_thumbnail)?;
+        if canonical_thumbnail_exists {
             let expected =
                 crate::blobs::image::decoded_thumbnail_for_hash(&first.source_path, content_hash)?;
             crate::blobs::image::validate_thumbnail(&canonical_thumbnail, &expected)?;
         }
-        if !canonical_bmp.exists() || !canonical_thumbnail.exists() {
+        if !canonical_bmp_exists || !canonical_thumbnail_exists {
             temporary_bytes = temporary_bytes
                 .checked_add(first.staged_bmp_bytes)
                 .and_then(|value| value.checked_add(THUMBNAIL_RESERVATION_BYTES))
@@ -257,7 +260,10 @@ fn prepare_canonical_images(
         let canonical_bmp = crate::blobs::image::canonical_bmp_path(blob_dir, &content_hash)?;
         let canonical_thumbnail =
             crate::blobs::image::canonical_thumbnail_path(blob_dir, &content_hash)?;
-        if !canonical_bmp.exists() || !canonical_thumbnail.exists() {
+        let canonical_bmp_exists = managed_regular_file_exists(blob_dir, &canonical_bmp)?;
+        let canonical_thumbnail_exists =
+            managed_regular_file_exists(blob_dir, &canonical_thumbnail)?;
+        if !canonical_bmp_exists || !canonical_thumbnail_exists {
             let dib = crate::blobs::read_dib_from_bmp_file(&first.source_path)?;
             let staged = crate::blobs::image::stage_dib(migration_stage, dib)?;
             ensure!(
@@ -426,9 +432,21 @@ fn validate_canonical_bmp(blob_dir: &Path, path: &Path, expected_hash: &str) -> 
 }
 
 fn validate_regular_managed_file(managed_dir: &Path, path: &Path) -> anyhow::Result<()> {
+    ensure!(
+        managed_regular_file_exists(managed_dir, path)?,
+        "managed regular file is missing: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn managed_regular_file_exists(managed_dir: &Path, path: &Path) -> anyhow::Result<bool> {
     managed_path_identity(managed_dir, path)?;
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("read managed file metadata {}", path.display()))?;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
     ensure!(
         metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
         "managed path is not a regular file: {}",
@@ -445,7 +463,7 @@ fn validate_regular_managed_file(managed_dir: &Path, path: &Path) -> anyhow::Res
             path.display()
         );
     }
-    Ok(())
+    Ok(true)
 }
 
 fn repository_lock(
@@ -490,7 +508,7 @@ fn ensure_backup(
         .with_context(|| format!("create migration backup {}", backup_path.display()))?;
     validate_backup_directory(database_path, backup_path)?;
     let marker_path = backup_path.join(BACKUP_COMPLETE_MARKER);
-    if backup_marker_is_complete(&marker_path)? {
+    if backup_marker_is_complete(database_path, backup_path, &marker_path)? {
         return Ok(());
     }
     clear_incomplete_backup(database_path, backup_path, &marker_path)?;
@@ -503,7 +521,13 @@ fn ensure_backup(
             sources.push(sidecar);
         }
     }
+    let mut published_names = Vec::with_capacity(sources.len());
     for source in sources {
+        let source_name = source
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow!("backup source has no UTF-8 filename"))?
+            .to_string();
         let destination = backup_path.join(
             source
                 .file_name()
@@ -532,6 +556,7 @@ fn ensure_backup(
                 destination.display()
             )
         })?;
+        published_names.push(source_name);
     }
     let marker_temporary = temporary_backup_path(&marker_path)?;
     let mut marker = OpenOptions::new()
@@ -539,7 +564,8 @@ fn ensure_backup(
         .create_new(true)
         .open(&marker_temporary)
         .with_context(|| format!("create backup marker {}", marker_temporary.display()))?;
-    marker.write_all(b"complete\n")?;
+    let manifest = backup_manifest(&published_names)?;
+    marker.write_all(manifest.as_bytes())?;
     marker.sync_all()?;
     drop(marker);
     fs::rename(&marker_temporary, &marker_path).with_context(|| {
@@ -581,15 +607,128 @@ fn validate_backup_directory(database_path: &Path, backup_path: &Path) -> anyhow
     Ok(())
 }
 
-fn backup_marker_is_complete(marker_path: &Path) -> anyhow::Result<bool> {
+fn backup_marker_is_complete(
+    database_path: &Path,
+    backup_path: &Path,
+    marker_path: &Path,
+) -> anyhow::Result<bool> {
     match fs::symlink_metadata(marker_path) {
         Ok(_) => {
             validate_regular_backup_file(marker_path)?;
-            Ok(fs::read(marker_path)? == b"complete\n")
+            let manifest = fs::read_to_string(marker_path)
+                .with_context(|| format!("read backup manifest {}", marker_path.display()))?;
+            validate_backup_manifest(database_path, backup_path, marker_path, &manifest)?;
+            Ok(true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
+}
+
+fn backup_manifest(published_names: &[String]) -> anyhow::Result<String> {
+    ensure!(!published_names.is_empty(), "backup manifest has no files");
+    let mut manifest = String::from(BACKUP_MANIFEST_VERSION);
+    manifest.push('\n');
+    for name in published_names {
+        ensure!(
+            !name.is_empty() && !name.contains(['\r', '\n']),
+            "backup filename is invalid"
+        );
+        manifest.push_str(name);
+        manifest.push('\n');
+    }
+    Ok(manifest)
+}
+
+fn validate_backup_manifest(
+    database_path: &Path,
+    backup_path: &Path,
+    marker_path: &Path,
+    manifest: &str,
+) -> anyhow::Result<()> {
+    ensure!(manifest.ends_with('\n'), "backup manifest is truncated");
+    let mut lines = manifest.lines();
+    ensure!(
+        lines.next() == Some(BACKUP_MANIFEST_VERSION),
+        "unsupported backup manifest version"
+    );
+    let managed_names = managed_backup_names(database_path)?;
+    let allowed = managed_names.iter().cloned().collect::<HashSet<_>>();
+    let database_name = database_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("database path has no UTF-8 filename"))?;
+    let mut listed = HashSet::new();
+    for name in lines {
+        ensure!(
+            allowed.contains(name),
+            "backup manifest lists unmanaged file"
+        );
+        ensure!(
+            listed.insert(name.to_string()),
+            "backup manifest has duplicate file"
+        );
+        let path = backup_path.join(name);
+        ensure!(
+            path.parent() == Some(backup_path),
+            "backup manifest file escapes backup directory"
+        );
+        validate_regular_backup_file(&path)?;
+    }
+    ensure!(
+        listed.contains(database_name),
+        "backup manifest does not list the database"
+    );
+    for name in managed_names {
+        let path = backup_path.join(&name);
+        if !listed.contains(&name) {
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    return Err(anyhow!(
+                        "unlisted managed backup file exists: {}",
+                        path.display()
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let temporary = temporary_backup_path(&path)?;
+        ensure!(
+            matches!(
+                fs::symlink_metadata(&temporary),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ),
+            "temporary backup file remains: {}",
+            temporary.display()
+        );
+    }
+    let marker_temporary = temporary_backup_path(marker_path)?;
+    ensure!(
+        matches!(
+            fs::symlink_metadata(&marker_temporary),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ),
+        "temporary backup marker remains: {}",
+        marker_temporary.display()
+    );
+    Ok(())
+}
+
+fn managed_backup_names(database_path: &Path) -> anyhow::Result<Vec<String>> {
+    [
+        database_path.to_path_buf(),
+        sidecar_path(database_path, "-wal"),
+        sidecar_path(database_path, "-shm"),
+    ]
+    .into_iter()
+    .map(|path| {
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("managed backup path has no UTF-8 filename"))
+    })
+    .collect()
 }
 
 fn clear_incomplete_backup(
@@ -1038,6 +1177,24 @@ mod tests {
         }
     }
 
+    fn leave_pending_after_complete_backup(
+        fixture: &Fixture,
+    ) -> (PathBuf, (String, Option<String>, String)) {
+        let dib = Fixture::dib32(40, [2, 4, 6, 255]);
+        let legacy = fixture.write_legacy_bmp("legacy.bmp", dib);
+        fixture.insert_image_row("legacy", &legacy, 1, 2, 2, false, false);
+        let before = fixture.row_reference("legacy");
+        fixture.install_merge_failure_trigger();
+        let error = run_image_migration_with(&fixture.repository, &fixture.store, &TestIo::real())
+            .expect_err("transaction failure after backup");
+        assert!(format!("{error:#}").contains("injected migration transaction failure"));
+        fixture.remove_merge_failure_trigger();
+        let (state, backup_path) = fixture.migration_state();
+        assert_eq!(state, "pending");
+        assert!(backup_path.join(BACKUP_COMPLETE_MARKER).is_file());
+        (backup_path, before)
+    }
+
     #[test]
     fn backs_up_database_and_existing_wal_and_shm_before_completing() {
         let fixture = Fixture::new("backup");
@@ -1148,6 +1305,45 @@ mod tests {
             .expect("external target entries")
             .next()
             .is_none());
+    }
+
+    #[test]
+    fn complete_backup_marker_rejects_missing_listed_database_before_retry() {
+        let fixture = Fixture::new("complete-marker-missing-db");
+        let (backup_path, before) = leave_pending_after_complete_backup(&fixture);
+        let backup_database = backup_path.join(
+            fixture
+                .database_path
+                .file_name()
+                .expect("database filename"),
+        );
+        fs::remove_file(&backup_database).expect("remove published backup database");
+
+        let error = run_image_migration_with(&fixture.repository, &fixture.store, &TestIo::real())
+            .expect_err("complete marker must not accept missing database");
+
+        assert!(format!("{error:#}").contains("backup"));
+        assert_eq!(fixture.row_reference("legacy"), before);
+        assert_eq!(fixture.migration_state().0, "pending");
+    }
+
+    #[test]
+    fn complete_backup_marker_rejects_listed_sidecar_directory_before_retry() {
+        let fixture = Fixture::new("complete-marker-sidecar-dir");
+        let (backup_path, before) = leave_pending_after_complete_backup(&fixture);
+        let wal_source = PathBuf::from(format!("{}-wal", fixture.database_path.display()));
+        let backup_wal = backup_path.join(wal_source.file_name().expect("WAL filename"));
+        assert!(backup_wal.is_file(), "production backup must publish WAL");
+        fs::remove_file(&backup_wal).expect("remove backup WAL");
+        fs::create_dir(&backup_wal).expect("replace backup WAL with directory");
+
+        let error = run_image_migration_with(&fixture.repository, &fixture.store, &TestIo::real())
+            .expect_err("complete marker must not accept sidecar directory");
+
+        assert!(format!("{error:#}").contains("backup"));
+        assert_eq!(fixture.row_reference("legacy"), before);
+        assert_eq!(fixture.migration_state().0, "pending");
+        assert!(backup_wal.is_dir());
     }
 
     #[test]
@@ -1387,6 +1583,81 @@ mod tests {
             fs::read(&external_thumbnail).expect("external target after migration"),
             external_before
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn broken_canonical_bmp_symlink_is_rejected_before_staging() {
+        use std::os::windows::fs::symlink_file;
+
+        let fixture = Fixture::new("broken-canonical-bmp");
+        let dib = Fixture::dib32(40, [3, 4, 5, 255]);
+        let content_hash = image_identity_from_dib(&dib)
+            .expect("identity")
+            .content_hash;
+        let legacy = fixture.write_legacy_bmp("legacy.bmp", dib);
+        fixture.insert_image_row("legacy", &legacy, 1, 2, 2, false, false);
+        let before = fixture.row_reference("legacy");
+        let missing_target = fixture.root.join("outside-missing.bmp");
+        let canonical = fixture.store.blob_dir().join(format!("{content_hash}.bmp"));
+        symlink_file(&missing_target, &canonical).expect("broken BMP symlink");
+
+        let error = run_image_migration_with(&fixture.repository, &fixture.store, &TestIo::real())
+            .expect_err("broken canonical BMP symlink must stop migration");
+
+        assert!(format!("{error:#}").contains("regular file"));
+        assert_eq!(fixture.row_reference("legacy"), before);
+        assert_eq!(fixture.migration_state().0, "pending");
+        assert!(fs::symlink_metadata(&canonical)
+            .expect("BMP symlink metadata")
+            .file_type()
+            .is_symlink());
+        assert!(!missing_target.exists());
+        assert!(!fixture
+            .store
+            .stage_dir()
+            .join("legacy-image-dedup-v1")
+            .exists());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn broken_canonical_thumbnail_symlink_is_rejected_before_staging() {
+        use std::os::windows::fs::symlink_file;
+
+        let fixture = Fixture::new("broken-canonical-thumbnail");
+        let dib = Fixture::dib32(40, [6, 5, 4, 255]);
+        let content_hash = image_identity_from_dib(&dib)
+            .expect("identity")
+            .content_hash;
+        let legacy = fixture.write_legacy_bmp("legacy.bmp", dib);
+        fixture.insert_image_row("legacy", &legacy, 1, 2, 2, false, false);
+        let before = fixture.row_reference("legacy");
+        let canonical_bmp = fixture.store.blob_dir().join(format!("{content_hash}.bmp"));
+        fs::copy(&legacy, &canonical_bmp).expect("canonical BMP");
+        let missing_target = fixture.root.join("outside-missing.png");
+        let canonical_thumbnail = fixture
+            .store
+            .blob_dir()
+            .join(format!("{content_hash}.thumb.png"));
+        symlink_file(&missing_target, &canonical_thumbnail).expect("broken thumbnail symlink");
+
+        let error = run_image_migration_with(&fixture.repository, &fixture.store, &TestIo::real())
+            .expect_err("broken canonical thumbnail symlink must stop migration");
+
+        assert!(format!("{error:#}").contains("regular file"));
+        assert_eq!(fixture.row_reference("legacy"), before);
+        assert_eq!(fixture.migration_state().0, "pending");
+        assert!(fs::symlink_metadata(&canonical_thumbnail)
+            .expect("thumbnail symlink metadata")
+            .file_type()
+            .is_symlink());
+        assert!(!missing_target.exists());
+        assert!(!fixture
+            .store
+            .stage_dir()
+            .join("legacy-image-dedup-v1")
+            .exists());
     }
 
     #[test]
