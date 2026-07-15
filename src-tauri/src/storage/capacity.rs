@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -5,9 +6,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
+use chrono::Utc;
 
 use crate::blobs::store::ImageBlobStore;
-use crate::storage::repository::ClipboardRepository;
+use crate::storage::repository::{ClipboardItem, ClipboardRepository};
 
 pub const MAX_IMAGE_ALLOCATION: u64 = 100 * 1024 * 1024;
 pub const MANAGED_BLOB_QUOTA: u64 = 5 * 1024 * 1024 * 1024;
@@ -139,42 +141,242 @@ pub(crate) fn prune_for_capacity_locked(
     additional: u64,
     quota: u64,
 ) -> anyhow::Result<u64> {
-    {
+    let items = {
         let repository = repository
             .lock()
             .map_err(|error| anyhow!("repository lock poisoned: {error}"))?;
-        repository.prune_history(max_history_items, retention_days)?;
-    }
-    crate::commands::cleanup_pending_blobs(repository, blob_dir)?;
-
-    loop {
-        let usage = managed_usage(blob_dir)?;
-        let requested = usage
-            .checked_add(additional)
-            .ok_or_else(|| anyhow!("managed blob capacity arithmetic overflow"))?;
-        if requested <= quota {
-            return Ok(usage);
-        }
-
-        let candidate = repository
-            .lock()
-            .map_err(|error| anyhow!("repository lock poisoned: {error}"))?
-            .oldest_capacity_candidate_id()?;
-        let Some(candidate) = candidate else {
-            return Err(CapacityError {
-                usage,
-                additional,
-                quota,
-            }
-            .into());
-        };
+        repository.capacity_items()?
+    };
+    let usage = managed_usage(blob_dir)?;
+    let plan = build_capacity_prune_plan(
+        &items,
+        blob_dir,
+        usage,
+        max_history_items,
+        retention_days,
+        Utc::now().timestamp_micros(),
+        additional,
+        quota,
+    )?;
+    if !plan.candidate_ids.is_empty() {
         {
             let repository = repository
                 .lock()
                 .map_err(|error| anyhow!("repository lock poisoned: {error}"))?;
-            repository.soft_delete(&candidate)?;
+            repository.soft_delete_batch(&plan.candidate_ids)?;
         }
-        crate::commands::cleanup_pending_blobs(repository, blob_dir)?;
+    }
+    crate::commands::cleanup_pending_blobs(repository, blob_dir)?;
+    let usage = managed_usage(blob_dir)?;
+    ensure_capacity(usage, additional, quota)?;
+    Ok(usage)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapacityPrunePlan {
+    candidate_ids: Vec<String>,
+    projected_usage: u64,
+}
+
+fn build_capacity_prune_plan(
+    items: &[ClipboardItem],
+    blob_dir: &Path,
+    usage: u64,
+    max_history_items: i64,
+    retention_days: i64,
+    now: i64,
+    additional: u64,
+    quota: u64,
+) -> anyhow::Result<CapacityPrunePlan> {
+    let mut active_refs = HashMap::<std::path::PathBuf, usize>::new();
+    for item in items {
+        if item.item_type == "image" {
+            if let Some(path) = item.content_path.as_deref() {
+                *active_refs.entry(path.into()).or_default() += 1;
+            }
+        }
+    }
+    let mut selected_refs = HashMap::<std::path::PathBuf, usize>::new();
+    let mut selected_ids = HashSet::<String>::new();
+    let mut candidate_ids = Vec::new();
+    let mut reclaimable = 0_u64;
+
+    let mut age_candidates = Vec::new();
+    if retention_days > 0 {
+        let retention_micros = retention_days.saturating_mul(24 * 60 * 60 * 1_000_000);
+        let cutoff = now.saturating_sub(retention_micros);
+        age_candidates.extend(
+            items
+                .iter()
+                .filter(|item| !item.favorite && item.updated_at < cutoff),
+        );
+        sort_oldest_first(&mut age_candidates);
+    }
+    for item in age_candidates {
+        select_candidate(
+            item,
+            blob_dir,
+            &active_refs,
+            &mut selected_refs,
+            &mut selected_ids,
+            &mut candidate_ids,
+            &mut reclaimable,
+        )?;
+    }
+
+    if max_history_items > 0 {
+        let mut remaining = items
+            .iter()
+            .filter(|item| !item.favorite && !selected_ids.contains(&item.id))
+            .collect::<Vec<_>>();
+        remaining.sort_by(|left, right| newest_order(left, right));
+        let keep = usize::try_from(max_history_items).unwrap_or(usize::MAX);
+        let mut count_candidates = remaining.into_iter().skip(keep).collect::<Vec<_>>();
+        sort_oldest_first(&mut count_candidates);
+        for item in count_candidates {
+            select_candidate(
+                item,
+                blob_dir,
+                &active_refs,
+                &mut selected_refs,
+                &mut selected_ids,
+                &mut candidate_ids,
+                &mut reclaimable,
+            )?;
+        }
+    }
+
+    let mut projected_usage = usage.saturating_sub(reclaimable);
+    if !capacity_fits(projected_usage, additional, quota)? {
+        let mut byte_candidates = items
+            .iter()
+            .filter(|item| {
+                item.item_type == "image" && !item.favorite && !selected_ids.contains(&item.id)
+            })
+            .collect::<Vec<_>>();
+        sort_oldest_first(&mut byte_candidates);
+        for item in byte_candidates {
+            select_candidate(
+                item,
+                blob_dir,
+                &active_refs,
+                &mut selected_refs,
+                &mut selected_ids,
+                &mut candidate_ids,
+                &mut reclaimable,
+            )?;
+            projected_usage = usage.saturating_sub(reclaimable);
+            if capacity_fits(projected_usage, additional, quota)? {
+                break;
+            }
+        }
+    }
+
+    projected_usage = usage.saturating_sub(reclaimable);
+    if !capacity_fits(projected_usage, additional, quota)? {
+        return Err(CapacityError {
+            usage,
+            additional,
+            quota,
+        }
+        .into());
+    }
+    Ok(CapacityPrunePlan {
+        candidate_ids,
+        projected_usage,
+    })
+}
+
+fn select_candidate(
+    item: &ClipboardItem,
+    blob_dir: &Path,
+    active_refs: &HashMap<std::path::PathBuf, usize>,
+    selected_refs: &mut HashMap<std::path::PathBuf, usize>,
+    selected_ids: &mut HashSet<String>,
+    candidate_ids: &mut Vec<String>,
+    reclaimable: &mut u64,
+) -> anyhow::Result<()> {
+    if !selected_ids.insert(item.id.clone()) {
+        return Ok(());
+    }
+    candidate_ids.push(item.id.clone());
+    if item.item_type != "image" {
+        return Ok(());
+    }
+    let Some(path) = item.content_path.as_deref().map(std::path::PathBuf::from) else {
+        return Ok(());
+    };
+    let selected = selected_refs.entry(path.clone()).or_default();
+    *selected += 1;
+    if active_refs.get(&path).copied() == Some(*selected) {
+        *reclaimable = reclaimable
+            .checked_add(reclaimable_image_bytes(blob_dir, &path)?)
+            .ok_or_else(|| anyhow!("capacity reclaimable byte count overflow"))?;
+    }
+    Ok(())
+}
+
+fn reclaimable_image_bytes(blob_dir: &Path, bmp_path: &Path) -> anyhow::Result<u64> {
+    let mut bytes = 0_u64;
+    for path in [
+        bmp_path.to_path_buf(),
+        crate::blobs::thumbnail_path_for(bmp_path),
+    ] {
+        if !path.is_absolute() || path.parent() != Some(blob_dir) {
+            continue;
+        }
+        match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.file_type().is_file()
+                    && !metadata.file_type().is_symlink()
+                    && !is_reparse_point(&metadata) =>
+            {
+                bytes = bytes
+                    .checked_add(metadata.len())
+                    .ok_or_else(|| anyhow!("capacity reclaimable byte count overflow"))?;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(bytes)
+}
+
+fn sort_oldest_first(items: &mut Vec<&ClipboardItem>) {
+    items.sort_by(|left, right| {
+        left.updated_at
+            .cmp(&right.updated_at)
+            .then_with(|| left.created_at.cmp(&right.created_at))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
+fn newest_order(left: &ClipboardItem, right: &ClipboardItem) -> std::cmp::Ordering {
+    right
+        .updated_at
+        .cmp(&left.updated_at)
+        .then_with(|| right.created_at.cmp(&left.created_at))
+        .then_with(|| right.id.cmp(&left.id))
+}
+
+fn capacity_fits(usage: u64, additional: u64, quota: u64) -> anyhow::Result<bool> {
+    Ok(usage
+        .checked_add(additional)
+        .ok_or_else(|| anyhow!("managed blob capacity arithmetic overflow"))?
+        <= quota)
+}
+
+fn ensure_capacity(usage: u64, additional: u64, quota: u64) -> anyhow::Result<()> {
+    if capacity_fits(usage, additional, quota)? {
+        Ok(())
+    } else {
+        Err(CapacityError {
+            usage,
+            additional,
+            quota,
+        }
+        .into())
     }
 }
 
@@ -225,12 +427,12 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        capture_reservation, exact_bmp_size, managed_usage, prune_for_capacity_with_quota,
-        PruneThrottle,
+        build_capacity_prune_plan, capture_reservation, exact_bmp_size, managed_usage,
+        prune_for_capacity_with_quota, PruneThrottle,
     };
     use crate::blobs::store::ImageBlobStore;
     use crate::clipboard::types::{ClipboardItemDraft, ClipboardItemType};
-    use crate::storage::repository::ClipboardRepository;
+    use crate::storage::repository::{ClipboardItem, ClipboardRepository};
 
     fn temp_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -314,6 +516,54 @@ mod tests {
             .expect("insert image")
     }
 
+    fn planner_item(id: &str, path: &std::path::Path, updated_at: i64) -> ClipboardItem {
+        ClipboardItem {
+            id: id.to_string(),
+            hash: format!("image:{id}"),
+            item_type: "image".to_string(),
+            content: None,
+            content_path: Some(path.to_string_lossy().to_string()),
+            content_hash: Some(id.to_string()),
+            preview: id.to_string(),
+            source_app: None,
+            favorite: false,
+            pinned: false,
+            size_bytes: 2,
+            created_at: updated_at,
+            updated_at,
+        }
+    }
+
+    #[test]
+    fn planner_orders_age_then_count_then_oldest_byte_pressure() {
+        const DAY_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
+        let root = temp_dir("planner-order");
+        let blob_dir = root.join("blobs");
+        fs::create_dir_all(&blob_dir).expect("blob dir");
+        let now = 2 * DAY_MICROS;
+        let cutoff = now - DAY_MICROS;
+        let definitions = [
+            ("age", 0),
+            ("count", cutoff + 10),
+            ("byte", cutoff + 20),
+            ("kept-middle", cutoff + 30),
+            ("kept-newest", cutoff + 40),
+        ];
+        let mut items = Vec::new();
+        for (id, updated_at) in definitions {
+            let path = blob_dir.join(format!("{id}.bmp"));
+            fs::write(&path, b"xx").expect("planner blob");
+            items.push(planner_item(id, &path, updated_at));
+        }
+
+        let plan = build_capacity_prune_plan(&items, &blob_dir, 10, 3, 1, now, 0, 4)
+            .expect("capacity plan");
+
+        assert_eq!(plan.candidate_ids, vec!["age", "count", "byte"]);
+        assert_eq!(plan.projected_usage, 4);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     #[test]
     fn capacity_prune_never_deletes_favorites_and_returns_clear_error() {
         let root = temp_dir("favorite");
@@ -341,6 +591,54 @@ mod tests {
             .get_item(&favorite.id)
             .expect("favorite query")
             .is_some());
+        drop(repository);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn insufficient_capacity_does_not_partially_delete_eligible_history() {
+        let root = temp_dir("atomic-failure");
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let first_path = store.blob_dir().join("first.bmp");
+        let second_path = store.blob_dir().join("second.bmp");
+        let favorite_path = store.blob_dir().join("favorite.bmp");
+        let orphan_path = store.blob_dir().join("orphan.tmp");
+        fs::write(&first_path, b"one").expect("first blob");
+        fs::write(&second_path, b"two").expect("second blob");
+        fs::write(&favorite_path, b"favorite").expect("favorite blob");
+        fs::write(&orphan_path, b"orphan").expect("orphan blob");
+        let first = insert_image(&repository, &first_path, "atomic-first");
+        let second = insert_image(&repository, &second_path, "atomic-second");
+        let favorite = insert_image(&repository, &favorite_path, "atomic-favorite");
+        repository
+            .lock()
+            .expect("repository lock")
+            .toggle_favorite(&favorite.id)
+            .expect("favorite");
+
+        let error = prune_for_capacity_with_quota(&repository, &store, 10_000, 0, 0, 4)
+            .expect_err("eligible bytes are insufficient");
+
+        assert!(error.downcast_ref::<super::CapacityError>().is_some());
+        let repository_guard = repository.lock().expect("repository lock");
+        for id in [&first.id, &second.id, &favorite.id] {
+            assert!(repository_guard
+                .get_item(id)
+                .expect("history query")
+                .is_some());
+        }
+        assert!(repository_guard
+            .pending_cleanup_paths()
+            .expect("cleanup queue")
+            .is_empty());
+        drop(repository_guard);
+        for path in [&first_path, &second_path, &favorite_path, &orphan_path] {
+            assert!(path.is_file(), "missing {}", path.display());
+        }
         drop(repository);
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");
@@ -407,6 +705,44 @@ mod tests {
         prune_for_capacity_with_quota(&repository, &store, 10_000, 0, 0, 100)
             .expect("active shared cleanup is skipped");
 
+        assert!(shared_path.is_file());
+        drop(repository);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn shared_path_is_not_projected_reclaimable_while_favorite_ref_remains() {
+        let root = temp_dir("shared-favorite");
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let shared_path = store.blob_dir().join("shared.bmp");
+        fs::write(&shared_path, b"shared").expect("shared blob");
+        let eligible = insert_image(&repository, &shared_path, "shared-eligible");
+        let favorite = insert_image(&repository, &shared_path, "shared-favorite");
+        repository
+            .lock()
+            .expect("repository lock")
+            .toggle_favorite(&favorite.id)
+            .expect("favorite");
+
+        prune_for_capacity_with_quota(&repository, &store, 10_000, 0, 0, 0)
+            .expect_err("favorite shared ref prevents reclaim");
+
+        let repository_guard = repository.lock().expect("repository lock");
+        for id in [&eligible.id, &favorite.id] {
+            assert!(repository_guard
+                .get_item(id)
+                .expect("shared query")
+                .is_some());
+        }
+        assert!(repository_guard
+            .pending_cleanup_paths()
+            .expect("cleanup queue")
+            .is_empty());
+        drop(repository_guard);
         assert!(shared_path.is_file());
         drop(repository);
         drop(store);

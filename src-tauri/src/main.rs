@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use blobs::store::ImageBlobStore;
 use storage::repository::ClipboardRepository;
 use system::settings::AppSettings;
-use tauri::{Manager, WindowEvent};
+use tauri::{Emitter, Manager, WindowEvent};
 
 pub struct AppState {
     pub repository: Arc<Mutex<ClipboardRepository>>,
@@ -27,6 +27,49 @@ pub struct AppState {
     pub blob_dir: PathBuf,
     pub image_store: Arc<ImageBlobStore>,
     pub log_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StartupCapacityState {
+    usage: u64,
+    blocked: bool,
+}
+
+fn run_startup_capacity_then<T>(
+    repository: &Mutex<ClipboardRepository>,
+    image_store: &ImageBlobStore,
+    max_history_items: i64,
+    retention_days: i64,
+    mut on_step: impl FnMut(&'static str),
+    start_listener: impl FnOnce(StartupCapacityState) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let startup_prune = storage::capacity::prune_for_capacity(
+        repository,
+        image_store,
+        max_history_items,
+        retention_days,
+        0,
+    );
+    match startup_prune {
+        Ok(_) => {}
+        Err(error)
+            if error
+                .downcast_ref::<storage::capacity::CapacityError>()
+                .is_some() =>
+        {
+            diagnostics::warn(format!(
+                "setup: startup capacity prune could not reach quota: {error}"
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    on_step("prune");
+    let usage = image_store.managed_usage()?;
+    on_step("usage");
+    start_listener(StartupCapacityState {
+        usage,
+        blocked: usage > storage::capacity::MANAGED_BLOB_QUOTA,
+    })
 }
 
 fn main() {
@@ -101,37 +144,6 @@ fn main() {
             let settings = Arc::new(Mutex::new(loaded_settings));
             let current_shortcut = Arc::new(Mutex::new(None));
             diagnostics::info("setup: settings loaded");
-            let startup_settings = settings
-                .lock()
-                .map(|settings| settings.clone())
-                .unwrap_or_default();
-            let startup_prune = storage::capacity::prune_for_capacity(
-                repository.as_ref(),
-                image_store.as_ref(),
-                startup_settings.max_history_items,
-                startup_settings.retention_days,
-                0,
-            );
-            if let Err(error) = &startup_prune {
-                if error
-                    .downcast_ref::<storage::capacity::CapacityError>()
-                    .is_some()
-                {
-                    diagnostics::warn(format!(
-                        "setup: startup capacity prune could not reach quota: {error}"
-                    ));
-                } else {
-                    diagnostics::error(format!("setup: startup capacity prune failed: {error:#}"));
-                    return Err(anyhow::anyhow!("startup capacity prune failed: {error:#}").into());
-                }
-            }
-            let startup_usage = image_store.managed_usage()?;
-            let image_capture_enabled =
-                startup_usage <= storage::capacity::MANAGED_BLOB_QUOTA;
-            diagnostics::info(format!(
-                "setup: startup capacity prune completed, managed_usage={}, migration_quota_blocked={}, image_capture_enabled={}",
-                startup_usage, migration_outcome.quota_blocked, image_capture_enabled
-            ));
             if let Some(window) = app.get_webview_window("main") {
                 let window_for_close = window.clone();
                 window.on_window_event(move |event| {
@@ -153,17 +165,40 @@ fn main() {
                 log_path,
             });
 
-            if let Err(error) = clipboard::start_background_listener(
-                app.handle().clone(),
-                repository,
-                settings.clone(),
-                image_store,
-                image_capture_enabled,
-            ) {
-                diagnostics::error(format!("setup: clipboard listener failed: {error}"));
-            } else {
-                diagnostics::info("setup: clipboard listener started");
-            }
+            let startup_settings = settings
+                .lock()
+                .map(|settings| settings.clone())
+                .unwrap_or_default();
+            run_startup_capacity_then(
+                repository.as_ref(),
+                image_store.as_ref(),
+                startup_settings.max_history_items,
+                startup_settings.retention_days,
+                |_| {},
+                |capacity| {
+                    diagnostics::info(format!(
+                        "setup: startup capacity prune completed, managed_usage={}, migration_quota_blocked={}, image_capture_blocked={}",
+                        capacity.usage, migration_outcome.quota_blocked, capacity.blocked
+                    ));
+                    if capacity.blocked {
+                        let _ = app.handle().emit(
+                            "clipboard-status",
+                            "图片未保存：剪贴板图片存储空间已满，请取消收藏或删除历史图片。",
+                        );
+                    }
+                    if let Err(error) = clipboard::start_background_listener(
+                        app.handle().clone(),
+                        repository.clone(),
+                        settings.clone(),
+                        image_store.clone(),
+                    ) {
+                        diagnostics::error(format!("setup: clipboard listener failed: {error}"));
+                    } else {
+                        diagnostics::info("setup: clipboard listener started");
+                    }
+                    Ok(())
+                },
+            )?;
 
             if let Err(error) = system::tray::setup(app) {
                 diagnostics::error(format!("setup: tray setup failed: {error}"));
@@ -217,4 +252,57 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run super-clipboard");
+}
+
+#[cfg(test)]
+mod startup_capacity_tests {
+    use std::cell::RefCell;
+    use std::fs;
+    use std::sync::Mutex;
+
+    use uuid::Uuid;
+
+    use super::run_startup_capacity_then;
+    use crate::blobs::store::ImageBlobStore;
+    use crate::storage::repository::ClipboardRepository;
+
+    #[test]
+    fn startup_prune_and_usage_complete_before_listener_starts() {
+        let root = std::env::temp_dir().join(format!(
+            "super-clipboard-startup-capacity-{}",
+            Uuid::new_v4()
+        ));
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let pending = store.blob_dir().join("startup-pending.tmp");
+        fs::write(&pending, b"pending").expect("pending blob");
+        repository
+            .lock()
+            .expect("repository lock")
+            .update_image_references_and_enqueue_cleanup(&[], &[pending.clone()])
+            .expect("enqueue pending cleanup");
+        let events = RefCell::new(Vec::new());
+
+        run_startup_capacity_then(
+            &repository,
+            &store,
+            10_000,
+            30,
+            |event| events.borrow_mut().push(event),
+            |state| {
+                events.borrow_mut().push("listener");
+                assert!(!pending.exists());
+                assert_eq!(state.usage, 0);
+                Ok(())
+            },
+        )
+        .expect("startup chain");
+
+        assert_eq!(&*events.borrow(), &["prune", "usage", "listener"]);
+        drop(repository);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
 }

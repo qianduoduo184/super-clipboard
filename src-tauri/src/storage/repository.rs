@@ -334,6 +334,55 @@ mod tests {
     }
 
     #[test]
+    fn capacity_batch_soft_delete_rolls_back_rows_fts_and_cleanup_queue_together() {
+        let repository = open_test_repository();
+        let first = repository
+            .insert_or_touch_image(image_draft("batch-first", "C:/blobs/batch-first.bmp"))
+            .expect("first image");
+        let second = repository
+            .insert_or_touch_image(image_draft("batch-second", "C:/blobs/batch-second.bmp"))
+            .expect("second image");
+        repository
+            .conn
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_capacity_batch
+                 BEFORE UPDATE OF deleted_at ON clipboard_items
+                 WHEN OLD.id = '{}'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected capacity batch failure');
+                 END;",
+                second.id
+            ))
+            .expect("failure trigger");
+
+        repository
+            .soft_delete_batch(&[first.id.clone(), second.id.clone()])
+            .expect_err("batch must roll back");
+
+        assert!(repository
+            .get_item(&first.id)
+            .expect("first query")
+            .is_some());
+        assert!(repository
+            .get_item(&second.id)
+            .expect("second query")
+            .is_some());
+        assert!(repository
+            .pending_cleanup_paths()
+            .expect("cleanup queue")
+            .is_empty());
+        let fts_count: i64 = repository
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM clipboard_items_fts WHERE id IN (?1, ?2)",
+                params![first.id, second.id],
+                |row| row.get(0),
+            )
+            .expect("fts count");
+        assert_eq!(fts_count, 2);
+    }
+
+    #[test]
     fn prune_history_enqueues_image_and_thumbnail_paths() {
         let repository = open_test_repository();
         let old = repository
@@ -1762,21 +1811,36 @@ impl ClipboardRepository {
         Ok(())
     }
 
-    pub(crate) fn oldest_capacity_candidate_id(&self) -> anyhow::Result<Option<String>> {
-        self.conn
-            .query_row(
-                "SELECT id
-                 FROM clipboard_items
-                 WHERE deleted_at IS NULL
-                   AND item_type = 'image'
-                   AND favorite = 0
-                 ORDER BY updated_at ASC, created_at ASC, id ASC
-                 LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(Into::into)
+    pub(crate) fn capacity_items(&self) -> anyhow::Result<Vec<ClipboardItem>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, hash, item_type, content, content_path, preview, source_app, favorite, pinned, size_bytes, created_at, updated_at, content_hash
+             FROM clipboard_items
+             WHERE deleted_at IS NULL",
+        )?;
+        let rows = statement.query_map([], Self::map_item)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub(crate) fn soft_delete_batch(&self, ids: &[String]) -> anyhow::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let blob_paths = self.content_paths_for_ids(ids)?;
+        let transaction = self.conn.unchecked_transaction()?;
+        enqueue_cleanup_paths(&transaction, &blob_paths)?;
+        let now = Utc::now().timestamp_micros();
+        for id in ids {
+            let changed = transaction.execute(
+                "UPDATE clipboard_items
+                 SET deleted_at = ?1
+                 WHERE id = ?2 AND deleted_at IS NULL AND favorite = 0",
+                params![now, id],
+            )?;
+            anyhow::ensure!(changed == 1, "capacity prune candidate changed: {id}");
+            transaction.execute("DELETE FROM clipboard_items_fts WHERE id = ?1", params![id])?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn clear_history(&self) -> anyhow::Result<()> {

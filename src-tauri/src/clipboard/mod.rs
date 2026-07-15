@@ -173,17 +173,9 @@ fn store_clipboard_capture(
     repository: &Mutex<ClipboardRepository>,
     image_store: &ImageBlobStore,
     capture: ClipboardCapture,
-    image_capture_enabled: bool,
 ) -> anyhow::Result<Option<ClipboardItem>> {
-    store_clipboard_capture_with_retention(
-        repository,
-        image_store,
-        capture,
-        image_capture_enabled,
-        0,
-        0,
-    )
-    .map(|outcome| outcome.item)
+    store_clipboard_capture_with_retention(repository, image_store, capture, 0, 0)
+        .map(|outcome| outcome.item)
 }
 
 struct StoredCaptureOutcome {
@@ -196,7 +188,6 @@ fn store_clipboard_capture_with_retention(
     repository: &Mutex<ClipboardRepository>,
     image_store: &ImageBlobStore,
     capture: ClipboardCapture,
-    image_capture_enabled: bool,
     max_history_items: i64,
     retention_days: i64,
 ) -> anyhow::Result<StoredCaptureOutcome> {
@@ -210,14 +201,6 @@ fn store_clipboard_capture_with_retention(
             Ok(StoredCaptureOutcome {
                 item: Some(item),
                 created,
-                retention_pruned: false,
-            })
-        }
-        ClipboardCapture::ImageDib(_) if !image_capture_enabled => {
-            crate::diagnostics::warn("clipboard: image capture blocked by storage quota");
-            Ok(StoredCaptureOutcome {
-                item: None,
-                created: false,
                 retention_pruned: false,
             })
         }
@@ -341,12 +324,54 @@ fn install_image_capture_outcome(
     }
 }
 
+fn store_capture_with_throttle(
+    repository: &Mutex<ClipboardRepository>,
+    image_store: &ImageBlobStore,
+    capture: ClipboardCapture,
+    settings: &AppSettings,
+    prune_throttle: &crate::storage::capacity::PruneThrottle,
+    now: Duration,
+) -> anyhow::Result<StoredCaptureOutcome> {
+    let prune_due = prune_throttle.is_due_at(now);
+    let (max_history_items, retention_days) = if prune_due {
+        (settings.max_history_items, settings.retention_days)
+    } else {
+        (0, 0)
+    };
+    let outcome = store_clipboard_capture_with_retention(
+        repository,
+        image_store,
+        capture,
+        max_history_items,
+        retention_days,
+    )?;
+    if outcome.created && prune_due {
+        let prune_result = if outcome.retention_pruned {
+            Ok(())
+        } else {
+            crate::commands::prune_history_with(
+                repository,
+                image_store,
+                settings.max_history_items,
+                settings.retention_days,
+            )
+        };
+        if let Err(error) = prune_result {
+            crate::diagnostics::error(format!(
+                "clipboard: failed to prune clipboard history: {error}"
+            ));
+        } else {
+            prune_throttle.mark_pruned_at(now);
+        }
+    }
+    Ok(outcome)
+}
+
 pub fn start_background_listener(
     app_handle: AppHandle,
     repository: Arc<Mutex<ClipboardRepository>>,
     settings: Arc<Mutex<AppSettings>>,
     image_store: Arc<ImageBlobStore>,
-    image_capture_enabled: bool,
 ) -> anyhow::Result<()> {
     crate::diagnostics::info(format!(
         "clipboard: preparing listener with blob_dir={}",
@@ -416,21 +441,13 @@ pub fn start_background_listener(
         let mut stored_any = false;
         for capture in drafts {
             let now = listener_started.elapsed();
-            let prune_due = prune_throttle.is_due_at(now);
-            let is_blocked_image =
-                !image_capture_enabled && matches!(&capture, ClipboardCapture::ImageDib(_));
-            let (max_history_items, retention_days) = if prune_due {
-                (app_settings.max_history_items, app_settings.retention_days)
-            } else {
-                (0, 0)
-            };
-            let result = store_clipboard_capture_with_retention(
+            let result = store_capture_with_throttle(
                 &repository,
                 &image_store,
                 capture,
-                image_capture_enabled,
-                max_history_items,
-                retention_days,
+                &app_settings,
+                &prune_throttle,
+                now,
             );
             match result {
                 Err(error) => {
@@ -445,28 +462,6 @@ pub fn start_background_listener(
                     ));
                 }
                 Ok(outcome) => {
-                    if is_blocked_image {
-                        emit_capacity_status(&app_handle);
-                    }
-                    if outcome.created && prune_due {
-                        let prune_result = if outcome.retention_pruned {
-                            Ok(())
-                        } else {
-                            crate::commands::prune_history_with(
-                                &repository,
-                                &image_store,
-                                app_settings.max_history_items,
-                                app_settings.retention_days,
-                            )
-                        };
-                        if let Err(error) = prune_result {
-                            crate::diagnostics::error(format!(
-                                "clipboard: failed to prune clipboard history: {error}"
-                            ));
-                        } else {
-                            prune_throttle.mark_pruned_at(now);
-                        }
-                    }
                     stored_any |= outcome.item.is_some();
                 }
             }
@@ -485,8 +480,8 @@ pub fn start_background_listener(
 #[cfg(test)]
 mod tests {
     use super::{
-        image_draft, install_image_capture, store_clipboard_capture, store_image_capture,
-        store_image_capture_with, store_image_capture_with_hooks,
+        image_draft, install_image_capture, store_capture_with_throttle, store_clipboard_capture,
+        store_image_capture, store_image_capture_with, store_image_capture_with_hooks,
     };
     use crate::blobs::image::stage_dib;
     use crate::blobs::store::ImageBlobStore;
@@ -511,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn quota_gate_blocks_image_capture_without_writing_rows_or_blobs() {
+    fn quota_blocked_active_duplicate_still_touches_without_pruning() {
         let root =
             std::env::temp_dir().join(format!("super-clipboard-quota-gate-{}", Uuid::new_v4()));
         let repository = Mutex::new(
@@ -519,25 +514,120 @@ mod tests {
         );
         let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
 
+        let first = store_image_capture(&repository, &store, dib32(40, [30, 20, 10, 255], 0))
+            .expect("first capture");
+        let filler = store.blob_dir().join("quota-filler.tmp");
+        fs::File::create(&filler)
+            .expect("quota filler")
+            .set_len(crate::storage::capacity::MANAGED_BLOB_QUOTA)
+            .expect("sparse quota filler");
+
         let stored = store_clipboard_capture(
             &repository,
             &store,
-            crate::clipboard::types::ClipboardCapture::ImageDib(dib32(40, [30, 20, 10, 255], 0)),
-            false,
+            crate::clipboard::types::ClipboardCapture::ImageDib(dib32(124, [30, 20, 10, 255], 64)),
         )
-        .expect("blocked capture");
+        .expect("duplicate touch")
+        .expect("stored duplicate");
 
-        assert!(stored.is_none());
+        assert_eq!(stored.id, first.id);
+        assert!(filler.is_file());
+        drop(repository);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn capacity_failure_recovers_after_space_is_released_without_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "super-clipboard-capacity-recovery-{}",
+            Uuid::new_v4()
+        ));
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let filler = store.blob_dir().join("quota-filler.tmp");
+        fs::File::create(&filler)
+            .expect("quota filler")
+            .set_len(crate::storage::capacity::MANAGED_BLOB_QUOTA)
+            .expect("sparse quota filler");
+
+        let first_error = store_clipboard_capture(
+            &repository,
+            &store,
+            crate::clipboard::types::ClipboardCapture::ImageDib(dib32(40, [30, 20, 10, 255], 0)),
+        )
+        .expect_err("full quota must reject new image");
+        assert!(first_error
+            .downcast_ref::<crate::storage::capacity::CapacityError>()
+            .is_some());
+
+        fs::remove_file(&filler).expect("release capacity");
+        let stored = store_clipboard_capture(
+            &repository,
+            &store,
+            crate::clipboard::types::ClipboardCapture::ImageDib(dib32(40, [8, 7, 6, 255], 0)),
+        )
+        .expect("capture after release")
+        .expect("stored after release");
+
+        assert_eq!(stored.item_type, "image");
+        drop(repository);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn active_duplicate_does_not_prune_or_consume_due_throttle() {
+        let root = std::env::temp_dir().join(format!(
+            "super-clipboard-duplicate-throttle-{}",
+            Uuid::new_v4()
+        ));
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let first_dib = dib32(40, [30, 20, 10, 255], 0);
+        let first =
+            store_image_capture(&repository, &store, first_dib.clone()).expect("first capture");
+        let extra = repository
+            .lock()
+            .expect("repository lock")
+            .insert_or_touch(crate::clipboard::types::ClipboardItemDraft {
+                item_type: crate::clipboard::types::ClipboardItemType::Text,
+                content: Some("must survive duplicate".to_string()),
+                content_path: None,
+                content_hash: None,
+                preview: "must survive duplicate".to_string(),
+                source_app: None,
+                size_bytes: 22,
+            })
+            .expect("extra item");
+        let mut settings = crate::system::settings::AppSettings::default();
+        settings.max_history_items = 1;
+        settings.retention_days = 0;
+        let throttle = crate::storage::capacity::PruneThrottle::new_at(Duration::ZERO);
+        let now = Duration::from_secs(600);
+
+        let outcome = store_capture_with_throttle(
+            &repository,
+            &store,
+            crate::clipboard::types::ClipboardCapture::ImageDib(first_dib),
+            &settings,
+            &throttle,
+            now,
+        )
+        .expect("duplicate touch");
+
+        assert_eq!(outcome.item.expect("duplicate item").id, first.id);
         assert!(repository
             .lock()
             .expect("repository lock")
-            .active_blob_paths()
-            .expect("active paths")
-            .is_empty());
-        assert!(fs::read_dir(store.blob_dir())
-            .expect("blob directory")
-            .next()
-            .is_none());
+            .get_item(&extra.id)
+            .expect("extra query")
+            .is_some());
+        assert!(throttle.is_due_at(now));
         drop(repository);
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");
@@ -629,6 +719,11 @@ mod tests {
         );
         let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
         let filler = store.blob_dir().join("concurrent-orphan.tmp");
+        let existing = store_image_capture(&repository, &store, dib32(40, [1, 2, 3, 255], 0))
+            .expect("existing capture");
+        let existing_path =
+            std::path::PathBuf::from(existing.content_path.as_deref().expect("existing path"));
+        let existing_thumbnail = crate::blobs::thumbnail_path_for(&existing_path);
 
         let error = store_image_capture_with_hooks(
             &repository,
@@ -644,12 +739,18 @@ mod tests {
         .expect_err("second capacity check must reject concurrent usage");
 
         assert!(format!("{error:#}").contains("capacity"));
-        assert!(repository
-            .lock()
-            .expect("repository lock")
-            .active_blob_paths()
-            .expect("active paths")
+        let repository_guard = repository.lock().expect("repository lock");
+        assert!(repository_guard
+            .get_item(&existing.id)
+            .expect("existing query")
+            .is_some());
+        assert!(repository_guard
+            .pending_cleanup_paths()
+            .expect("cleanup queue")
             .is_empty());
+        drop(repository_guard);
+        assert!(existing_path.is_file());
+        assert!(existing_thumbnail.is_file());
         assert!(fs::read_dir(store.stage_dir())
             .expect("stage directory")
             .next()
