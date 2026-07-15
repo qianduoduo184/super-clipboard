@@ -29,14 +29,7 @@ pub fn read_dib_from_bmp_file(path: &Path) -> anyhow::Result<Vec<u8>> {
 }
 
 fn read_dib_from_bmp(reader: &mut impl Read, file_len: u64) -> anyhow::Result<Vec<u8>> {
-    anyhow::ensure!(
-        file_len >= BMP_FILE_HEADER_LEN,
-        "BMP file header is truncated"
-    );
-    anyhow::ensure!(
-        file_len <= MAX_IMAGE_ALLOCATION,
-        "BMP file exceeds the 100 MiB image allocation limit"
-    );
+    validate_bmp_file_header(reader, file_len)?;
 
     let payload_len = file_len
         .checked_sub(BMP_FILE_HEADER_LEN)
@@ -47,6 +40,29 @@ fn read_dib_from_bmp(reader: &mut impl Read, file_len: u64) -> anyhow::Result<Ve
     );
     let payload_len = usize::try_from(payload_len)
         .map_err(|_| anyhow::anyhow!("DIB payload length does not fit in memory"))?;
+
+    let mut dib = Vec::new();
+    dib.try_reserve_exact(payload_len)
+        .context("failed to allocate DIB payload")?;
+    dib.resize(payload_len, 0);
+    reader
+        .read_exact(&mut dib)
+        .context("failed to read DIB payload")?;
+    Ok(dib)
+}
+
+pub(crate) fn validate_bmp_file_header(
+    reader: &mut impl Read,
+    file_len: u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        file_len >= BMP_FILE_HEADER_LEN,
+        "BMP file header is truncated"
+    );
+    anyhow::ensure!(
+        file_len <= MAX_IMAGE_ALLOCATION,
+        "BMP file exceeds the 100 MiB image allocation limit"
+    );
 
     let mut header = [0_u8; BMP_FILE_HEADER_LEN as usize];
     reader
@@ -64,15 +80,7 @@ fn read_dib_from_bmp(reader: &mut impl Read, file_len: u64) -> anyhow::Result<Ve
         u64::from(pixel_offset) >= BMP_FILE_HEADER_LEN && u64::from(pixel_offset) <= file_len,
         "BMP pixel offset is out of bounds"
     );
-
-    let mut dib = Vec::new();
-    dib.try_reserve_exact(payload_len)
-        .context("failed to allocate DIB payload")?;
-    dib.resize(payload_len, 0);
-    reader
-        .read_exact(&mut dib)
-        .context("failed to read DIB payload")?;
-    Ok(dib)
+    Ok(())
 }
 
 pub fn thumbnail_path_for(blob_path: &Path) -> PathBuf {

@@ -5,7 +5,8 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::Context;
-use serde::{Deserialize, Serialize};
+use serde::de::{IgnoredAny, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
@@ -21,6 +22,253 @@ struct BackupManifest {
 }
 
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_LEGACY_PATH_BYTES: usize = 1024;
+// Base64 may expand the 5 GiB managed blob quota by 4/3. Reserve one more
+// managed quota for item text and JSON structure without imposing a 64 MiB cap.
+const MAX_LEGACY_INFO_BYTES: u64 = {
+    let base64_groups = match crate::storage::capacity::MANAGED_BLOB_QUOTA.checked_add(2) {
+        Some(bytes) => bytes / 3,
+        None => panic!("legacy backup size overflow"),
+    };
+    let base64_bytes = match base64_groups.checked_mul(4) {
+        Some(bytes) => bytes,
+        None => panic!("legacy backup size overflow"),
+    };
+    match base64_bytes.checked_add(crate::storage::capacity::MANAGED_BLOB_QUOTA) {
+        Some(bytes) => bytes,
+        None => panic!("legacy backup size overflow"),
+    }
+};
+
+struct BoundedString<const MAX_BYTES: usize>(String);
+
+struct BoundedStringVisitor<const MAX_BYTES: usize>;
+
+impl<const MAX_BYTES: usize> Visitor<'_> for BoundedStringVisitor<MAX_BYTES> {
+    type Value = BoundedString<MAX_BYTES>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "a string no longer than {MAX_BYTES} bytes")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        if value.len() > MAX_BYTES {
+            return Err(E::custom(format!(
+                "string exceeds the {MAX_BYTES}-byte limit"
+            )));
+        }
+        Ok(BoundedString(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        if value.len() > MAX_BYTES {
+            return Err(E::custom(format!(
+                "string exceeds the {MAX_BYTES}-byte limit"
+            )));
+        }
+        Ok(BoundedString(value))
+    }
+}
+
+impl<'de, const MAX_BYTES: usize> Deserialize<'de> for BoundedString<MAX_BYTES> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_string(BoundedStringVisitor::<MAX_BYTES>)
+    }
+}
+
+#[derive(Deserialize)]
+struct LegacyMetadataInfo {
+    version: BoundedString<32>,
+    created_at: BoundedString<128>,
+    item_count: usize,
+}
+
+#[derive(Deserialize)]
+struct LegacyItemInfo {
+    item_type: BoundedString<32>,
+    content_path: Option<BoundedString<MAX_LEGACY_PATH_BYTES>>,
+    #[serde(default, rename = "content")]
+    _content: Option<IgnoredAny>,
+}
+
+struct LegacyItems(usize);
+
+impl<'de> Deserialize<'de> for LegacyItems {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct LegacyItemsVisitor;
+
+        impl<'de> Visitor<'de> for LegacyItemsVisitor {
+            type Value = LegacyItems;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a legacy backup item array")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut count = 0usize;
+                while let Some(item) = sequence.next_element::<LegacyItemInfo>()? {
+                    if item.item_type.0 == "image" {
+                        let path = item.content_path.ok_or_else(|| {
+                            <A::Error as serde::de::Error>::custom(
+                                "legacy image item is missing content_path",
+                            )
+                        })?;
+                        validate_legacy_bmp_filename(&path.0)
+                            .map_err(<A::Error as serde::de::Error>::custom)?;
+                    }
+                    count = count.checked_add(1).ok_or_else(|| {
+                        <A::Error as serde::de::Error>::custom("legacy item count overflow")
+                    })?;
+                }
+                Ok(LegacyItems(count))
+            }
+        }
+
+        deserializer.deserialize_seq(LegacyItemsVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+struct LegacyBlobInfo {
+    filename: BoundedString<MAX_LEGACY_PATH_BYTES>,
+    #[serde(default, rename = "data_base64")]
+    _data_base64: Option<IgnoredAny>,
+}
+
+struct LegacyBlobs;
+
+impl<'de> Deserialize<'de> for LegacyBlobs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct LegacyBlobsVisitor;
+
+        impl<'de> Visitor<'de> for LegacyBlobsVisitor {
+            type Value = LegacyBlobs;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a legacy backup blob array")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut aliases = HashSet::new();
+                while let Some(blob) = sequence.next_element::<LegacyBlobInfo>()? {
+                    validate_legacy_bmp_filename(&blob.filename.0)
+                        .map_err(<A::Error as serde::de::Error>::custom)?;
+                    if !aliases.insert(blob.filename.0.to_ascii_lowercase()) {
+                        return Err(<A::Error as serde::de::Error>::custom(
+                            "legacy backup contains aliased blob filenames",
+                        ));
+                    }
+                }
+                Ok(LegacyBlobs)
+            }
+        }
+
+        deserializer.deserialize_seq(LegacyBlobsVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+struct LegacyBackupInfo {
+    metadata: LegacyMetadataInfo,
+    items: LegacyItems,
+    #[serde(rename = "blobs")]
+    _blobs: LegacyBlobs,
+}
+
+fn validate_legacy_bmp_filename(filename: &str) -> Result<(), String> {
+    let path = Path::new(filename);
+    let mut components = path.components();
+    let is_single_component = matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    );
+    if path.is_absolute()
+        || !is_single_component
+        || filename.contains(['/', '\\'])
+        || filename.ends_with(['.', ' '])
+        || filename
+            .chars()
+            .any(|character| character < ' ' || r#"<>:\"|?*"#.contains(character))
+    {
+        return Err("legacy blob path must be a safe single filename".to_string());
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .trim_end_matches(['.', ' '])
+        .to_ascii_uppercase();
+    let is_windows_device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|suffix| {
+                matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            });
+    if is_windows_device {
+        return Err("legacy blob filename must not use a Windows device alias".to_string());
+    }
+    let is_bmp = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("bmp"));
+    if !is_bmp {
+        return Err("legacy blob filename must use the .bmp extension".to_string());
+    }
+    Ok(())
+}
+
+fn parse_legacy_info(file: File, path: &Path) -> anyhow::Result<crate::commands::BackupInfo> {
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("inspect legacy backup {}", path.display()))?
+        .len();
+    anyhow::ensure!(
+        file_len <= MAX_LEGACY_INFO_BYTES,
+        "legacy backup exceeds the quota-derived metadata preview limit"
+    );
+
+    let mut deserializer = serde_json::Deserializer::from_reader(file);
+    let backup = LegacyBackupInfo::deserialize(&mut deserializer)
+        .with_context(|| format!("parse legacy backup {}", path.display()))?;
+    deserializer
+        .end()
+        .with_context(|| format!("parse legacy backup {}", path.display()))?;
+    anyhow::ensure!(
+        backup.metadata.version.0 == "1.0",
+        "unsupported legacy backup version"
+    );
+    anyhow::ensure!(
+        backup.metadata.item_count == backup.items.0,
+        "legacy backup item_count does not match items"
+    );
+    Ok(crate::commands::BackupInfo {
+        created_at: backup.metadata.created_at.0,
+        item_count: backup.metadata.item_count,
+        version: backup.metadata.version.0,
+    })
+}
 
 pub fn parse_backup_info_path(path: &Path) -> anyhow::Result<crate::commands::BackupInfo> {
     let mut file = File::open(path).with_context(|| format!("open backup {}", path.display()))?;
@@ -30,13 +278,7 @@ pub fn parse_backup_info_path(path: &Path) -> anyhow::Result<crate::commands::Ba
     if count == magic.len() && is_zip_magic(magic) {
         parse_zip_info(file)
     } else {
-        let backup: crate::commands::BackupData = serde_json::from_reader(file)
-            .with_context(|| format!("parse legacy backup {}", path.display()))?;
-        Ok(crate::commands::BackupInfo {
-            created_at: backup.metadata.created_at,
-            item_count: backup.metadata.item_count,
-            version: backup.metadata.version,
-        })
+        parse_legacy_info(file, path)
     }
 }
 
@@ -133,6 +375,20 @@ fn is_valid_content_hash(content_hash: &str) -> bool {
         && content_hash
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(target_os = "windows")]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    metadata.file_attributes()
+        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+        != 0
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 fn write_blob_entry<W: Write + Seek, R: Read>(
@@ -319,10 +575,12 @@ fn export_snapshot_to_with_hook(
                 "image item {} path is outside the canonical blob location",
                 item.id
             );
-            let metadata = fs::symlink_metadata(&source_path)
+            let path_metadata = fs::symlink_metadata(&source_path)
                 .with_context(|| format!("inspect image blob {}", source_path.display()))?;
             anyhow::ensure!(
-                metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+                path_metadata.file_type().is_file()
+                    && !path_metadata.file_type().is_symlink()
+                    && !is_reparse_point(&path_metadata),
                 "image blob must be a regular file"
             );
             let canonical_source = source_path
@@ -335,8 +593,18 @@ fn export_snapshot_to_with_hook(
             let archive_path = format!("blobs/{content_hash}.bmp");
             item.content_path = Some(archive_path.clone());
             if seen_hashes.insert(content_hash.to_string()) {
-                crate::blobs::image::decoded_thumbnail_for_hash(&source_path, content_hash)?;
-                blobs.push((archive_path, source_path));
+                let mut file = File::open(&source_path)
+                    .with_context(|| format!("open image blob {}", source_path.display()))?;
+                let metadata = file.metadata().with_context(|| {
+                    format!("inspect open image blob {}", source_path.display())
+                })?;
+                anyhow::ensure!(
+                    metadata.is_file(),
+                    "image blob handle must be a regular file"
+                );
+                crate::blobs::validate_bmp_file_header(&mut file, metadata.len())
+                    .with_context(|| format!("validate image blob {}", source_path.display()))?;
+                blobs.push((archive_path, source_path, file));
             }
         }
         hook()?;
@@ -353,9 +621,9 @@ fn export_snapshot_to_with_hook(
                 SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
             archive.start_file("manifest.json", options)?;
             serde_json::to_writer(&mut archive, &manifest)?;
-            for (archive_path, source_path) in blobs {
-                let mut file = File::open(&source_path)
-                    .with_context(|| format!("open image blob {}", source_path.display()))?;
+            for (archive_path, source_path, mut file) in blobs {
+                file.seek(SeekFrom::Start(0))
+                    .with_context(|| format!("rewind image blob {}", source_path.display()))?;
                 write_blob_entry(&mut archive, &archive_path, &mut file)
                     .with_context(|| format!("archive image blob {}", source_path.display()))?;
             }
@@ -400,6 +668,19 @@ mod tests {
         dib
     }
 
+    fn opaque_bmp(payload_len: usize) -> Vec<u8> {
+        let file_len = 14usize.checked_add(payload_len).expect("BMP length");
+        let mut bmp = vec![0u8; file_len];
+        bmp[0..2].copy_from_slice(b"BM");
+        bmp[2..6].copy_from_slice(
+            &u32::try_from(file_len)
+                .expect("test BMP fits u32")
+                .to_le_bytes(),
+        );
+        bmp[10..14].copy_from_slice(&14u32.to_le_bytes());
+        bmp
+    }
+
     fn write_test_zip(path: &std::path::Path, manifest: &serde_json::Value, entries: &[&str]) {
         let file = fs::File::create(path).expect("create test zip");
         let mut archive = zip::ZipWriter::new(file);
@@ -432,6 +713,54 @@ mod tests {
             "created_at": 1,
             "updated_at": 1
         })
+    }
+
+    fn legacy_item(item_type: &str, content_path: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "id": "legacy-item",
+            "hash": "legacy-record-hash",
+            "item_type": item_type,
+            "content": null,
+            "content_path": content_path,
+            "preview": "legacy preview",
+            "source_app": null,
+            "favorite": false,
+            "pinned": false,
+            "size_bytes": 4,
+            "created_at": 1,
+            "updated_at": 1
+        })
+    }
+
+    fn legacy_blob(filename: &str, data_base64: &str) -> serde_json::Value {
+        serde_json::json!({
+            "item_id": "legacy-item",
+            "filename": filename,
+            "data_base64": data_base64
+        })
+    }
+
+    fn write_legacy_json(
+        path: &std::path::Path,
+        version: &str,
+        item_count: usize,
+        items: Vec<serde_json::Value>,
+        blobs: Vec<serde_json::Value>,
+    ) {
+        fs::write(
+            path,
+            serde_json::to_vec(&serde_json::json!({
+                "metadata": {
+                    "version": version,
+                    "created_at": "2026-07-15T00:00:00Z",
+                    "item_count": item_count
+                },
+                "items": items,
+                "blobs": blobs
+            }))
+            .expect("legacy JSON"),
+        )
+        .expect("write legacy JSON");
     }
 
     #[test]
@@ -554,6 +883,106 @@ mod tests {
     }
 
     #[test]
+    fn export_streams_header_valid_blob_without_full_image_decode() {
+        let root = temp_dir("opaque-bmp");
+        let store =
+            crate::blobs::store::ImageBlobStore::new(root.join("blobs"), root.join("stage"))
+                .expect("store");
+        let content_hash = "0".repeat(64);
+        let source_path = store.blob_dir().join(format!("{content_hash}.bmp"));
+        let source_bytes = opaque_bmp(2 * 1024 * 1024);
+        fs::write(&source_path, &source_bytes).expect("opaque BMP");
+        let item = ClipboardItem {
+            id: "opaque".to_string(),
+            hash: "record-opaque".to_string(),
+            item_type: "image".to_string(),
+            content: None,
+            content_path: Some(source_path.to_string_lossy().into_owned()),
+            content_hash: Some(content_hash.clone()),
+            preview: "opaque".to_string(),
+            source_app: None,
+            favorite: false,
+            pinned: false,
+            size_bytes: i64::try_from(source_bytes.len()).expect("size"),
+            created_at: 1,
+            updated_at: 1,
+        };
+        let archive_path = root.join("backup.zip");
+
+        export_snapshot_to_with_hook(&archive_path, vec![item], &store, || Ok(()))
+            .expect("header validation must not decode the full image");
+
+        let file = fs::File::open(&archive_path).expect("archive");
+        let mut archive = zip::ZipArchive::new(file).expect("zip");
+        let mut archived = Vec::new();
+        archive
+            .by_name(&format!("blobs/{content_hash}.bmp"))
+            .expect("blob")
+            .read_to_end(&mut archived)
+            .expect("read archived blob");
+        assert_eq!(archived, source_bytes);
+
+        drop(archive);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn export_streams_from_the_same_handle_that_was_validated() {
+        let root = temp_dir("same-handle");
+        let store =
+            crate::blobs::store::ImageBlobStore::new(root.join("blobs"), root.join("stage"))
+                .expect("store");
+        let content_hash = "2".repeat(64);
+        let source_path = store.blob_dir().join(format!("{content_hash}.bmp"));
+        let mut original_bytes = opaque_bmp(64);
+        original_bytes[14..].fill(0x11);
+        fs::write(&source_path, &original_bytes).expect("original BMP");
+        let replacement_path = root.join("replacement.bmp");
+        let mut replacement_bytes = opaque_bmp(64);
+        replacement_bytes[14..].fill(0x22);
+        fs::write(&replacement_path, replacement_bytes).expect("replacement BMP");
+        let item = ClipboardItem {
+            id: "same-handle".to_string(),
+            hash: "record-same-handle".to_string(),
+            item_type: "image".to_string(),
+            content: None,
+            content_path: Some(source_path.to_string_lossy().into_owned()),
+            content_hash: Some(content_hash.clone()),
+            preview: "same-handle".to_string(),
+            source_app: None,
+            favorite: false,
+            pinned: false,
+            size_bytes: i64::try_from(original_bytes.len()).expect("size"),
+            created_at: 1,
+            updated_at: 1,
+        };
+        let archive_path = root.join("backup.zip");
+        let moved_original = root.join("opened-original.bmp");
+
+        export_snapshot_to_with_hook(&archive_path, vec![item], &store, || {
+            fs::rename(&source_path, &moved_original)?;
+            fs::rename(&replacement_path, &source_path)?;
+            Ok(())
+        })
+        .expect("export");
+
+        let file = fs::File::open(&archive_path).expect("archive");
+        let mut archive = zip::ZipArchive::new(file).expect("zip");
+        let mut archived = Vec::new();
+        archive
+            .by_name(&format!("blobs/{content_hash}.bmp"))
+            .expect("blob")
+            .read_to_end(&mut archived)
+            .expect("read archived blob");
+        assert_eq!(archived, original_bytes);
+
+        drop(archive);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn export_writes_one_blob_for_duplicate_content_hashes() {
         let root = temp_dir("deduplicate");
         let store =
@@ -644,13 +1073,21 @@ mod tests {
             export_snapshot_to_with_hook(&target, vec![uppercase_hash], &store, || Ok(())).is_err()
         );
         let mismatched_hash = "0".repeat(64);
-        let mismatched_path = store.blob_dir().join(format!("{mismatched_hash}.bmp"));
-        fs::copy(installed.bmp_path(), &mismatched_path).expect("mismatched blob");
-        let mut mismatched = valid;
+        let mut mismatched = valid.clone();
         mismatched.content_hash = Some(mismatched_hash);
-        mismatched.content_path = Some(mismatched_path.to_string_lossy().into_owned());
         assert!(
             export_snapshot_to_with_hook(&target, vec![mismatched], &store, || Ok(())).is_err()
+        );
+        let invalid_header_hash = "1".repeat(64);
+        let invalid_header_path = store.blob_dir().join(format!("{invalid_header_hash}.bmp"));
+        let mut invalid_header_bytes = fs::read(installed.bmp_path()).expect("source BMP");
+        invalid_header_bytes[2..6].copy_from_slice(&1u32.to_le_bytes());
+        fs::write(&invalid_header_path, invalid_header_bytes).expect("invalid header blob");
+        let mut invalid_header = valid;
+        invalid_header.content_hash = Some(invalid_header_hash);
+        invalid_header.content_path = Some(invalid_header_path.to_string_lossy().into_owned());
+        assert!(
+            export_snapshot_to_with_hook(&target, vec![invalid_header], &store, || Ok(())).is_err()
         );
         assert_eq!(fs::read(&target).expect("target"), b"existing backup");
 
@@ -819,6 +1256,151 @@ mod tests {
 
         drop(repository);
         drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn parse_backup_info_rejects_legacy_file_larger_than_the_quota_derived_bound() {
+        let root = temp_dir("legacy-size-bound");
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("oversize.json");
+        let file = fs::File::create(&path).expect("sparse legacy file");
+        file.set_len(
+            crate::storage::capacity::MANAGED_BLOB_QUOTA
+                .checked_mul(3)
+                .expect("test size"),
+        )
+        .expect("extend sparse legacy file");
+
+        let error = parse_backup_info_path(&path).expect_err("oversize legacy backup must fail");
+        assert!(format!("{error:#}").contains("legacy backup exceeds"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn parse_backup_info_rejects_unsupported_legacy_version_and_count_mismatch() {
+        let root = temp_dir("legacy-metadata-validation");
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("legacy.json");
+
+        write_legacy_json(&path, "2.0", 0, Vec::new(), Vec::new());
+        assert!(
+            parse_backup_info_path(&path).is_err(),
+            "unsupported legacy version must fail"
+        );
+
+        write_legacy_json(&path, "1.0", 2, vec![legacy_item("text", None)], Vec::new());
+        assert!(
+            parse_backup_info_path(&path).is_err(),
+            "legacy item_count mismatch must fail"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn parse_backup_info_rejects_unsafe_or_overlong_legacy_image_paths() {
+        let root = temp_dir("legacy-item-paths");
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("legacy.json");
+
+        for unsafe_path in ["../escape.bmp", "C:\\temp\\escape.bmp"] {
+            write_legacy_json(
+                &path,
+                "1.0",
+                1,
+                vec![legacy_item("image", Some(unsafe_path))],
+                Vec::new(),
+            );
+            assert!(
+                parse_backup_info_path(&path).is_err(),
+                "unsafe legacy image path must fail: {unsafe_path}"
+            );
+        }
+
+        let overlong_path = format!("{}.bmp", "a".repeat(1021));
+        write_legacy_json(
+            &path,
+            "1.0",
+            1,
+            vec![legacy_item("image", Some(&overlong_path))],
+            Vec::new(),
+        );
+        assert!(
+            parse_backup_info_path(&path).is_err(),
+            "overlong legacy image path must fail"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn parse_backup_info_rejects_unsafe_aliased_or_non_bmp_legacy_blobs() {
+        let root = temp_dir("legacy-blob-names");
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("legacy.json");
+
+        for invalid_name in [
+            "../escape.bmp",
+            "nested/image.bmp",
+            "image.png",
+            "image.bmp:stream.bmp",
+            "CON.bmp",
+        ] {
+            write_legacy_json(
+                &path,
+                "1.0",
+                0,
+                Vec::new(),
+                vec![legacy_blob(invalid_name, "AA==")],
+            );
+            assert!(
+                parse_backup_info_path(&path).is_err(),
+                "invalid legacy blob filename must fail: {invalid_name}"
+            );
+        }
+
+        write_legacy_json(
+            &path,
+            "1.0",
+            0,
+            Vec::new(),
+            vec![
+                legacy_blob("image.bmp", "AA=="),
+                legacy_blob("IMAGE.BMP", "AQ=="),
+            ],
+        );
+        assert!(
+            parse_backup_info_path(&path).is_err(),
+            "case-insensitive legacy blob aliases must fail"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn parse_backup_info_streams_large_legacy_payloads_in_any_field_order() {
+        let root = temp_dir("legacy-streaming");
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("legacy.json");
+        let large_base64 = "A".repeat(2 * 1024 * 1024);
+        let json = format!(
+            r#"{{"blobs":[{{"data_base64":"{large_base64}","filename":"image.bmp","item_id":"legacy-item"}}],"items":[{{"updated_at":1,"size_bytes":4,"source_app":null,"preview":"legacy","pinned":false,"item_type":"image","id":"legacy-item","hash":"legacy-hash","favorite":false,"created_at":1,"content_path":"image.bmp","content":null}}],"metadata":{{"item_count":1,"created_at":"2026-07-15T00:00:00Z","version":"1.0"}}}}"#
+        );
+        fs::write(&path, json).expect("write large legacy JSON");
+
+        let info = parse_backup_info_path(&path).expect("valid legacy info");
+        assert_eq!(info.version, "1.0");
+        assert_eq!(info.item_count, 1);
+
+        fs::write(&path, br#"{"metadata":{"version":"1.0","created_at":"test","item_count":0},"items":[],"blobs":[]} trailing"#)
+            .expect("write trailing JSON");
+        assert!(
+            parse_backup_info_path(&path).is_err(),
+            "trailing non-whitespace must fail"
+        );
+
         fs::remove_dir_all(root).expect("cleanup");
     }
 
