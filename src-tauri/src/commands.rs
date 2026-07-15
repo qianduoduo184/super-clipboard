@@ -15,6 +15,7 @@ use crate::AppState;
 fn copy_image_blob_with<T>(
     image_store: &crate::blobs::store::ImageBlobStore,
     content_path: &Path,
+    read_dib: impl FnOnce(&Path) -> anyhow::Result<Vec<u8>>,
     write_clipboard: impl FnOnce(&[u8]) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     image_store.with_read(|blob_dir| {
@@ -25,9 +26,21 @@ fn copy_image_blob_with<T>(
             blob_path.parent() == Some(blob_dir),
             "blob path outside allowed directory"
         );
-        let dib = crate::blobs::read_dib_from_bmp_file(&blob_path)?;
+        let dib = read_dib(&blob_path)?;
         write_clipboard(&dib)
     })
+}
+
+fn load_item_for_copy(
+    repository: &Mutex<crate::storage::repository::ClipboardRepository>,
+    id: &str,
+) -> anyhow::Result<ClipboardItem> {
+    let repository = repository
+        .lock()
+        .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?;
+    repository
+        .get_item(id)?
+        .ok_or_else(|| anyhow::anyhow!("clipboard item not found"))
 }
 
 pub(crate) fn mutate_and_cleanup_blobs<T>(
@@ -216,15 +229,7 @@ pub fn copy_item(
     plain_text: Option<bool>,
 ) -> Result<(), String> {
     crate::diagnostics::info(format!("command: copy_item id={id}"));
-    let item = {
-        state
-            .repository
-            .lock()
-            .map_err(|error| error.to_string())?
-            .get_item(&id)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "clipboard item not found".to_string())?
-    };
+    let item = load_item_for_copy(&state.repository, &id).map_err(|error| error.to_string())?;
     if item.item_type == "text" {
         if let Some(content) = item.content {
             #[cfg(target_os = "windows")]
@@ -261,13 +266,21 @@ pub fn copy_item(
             .ok_or_else(|| "image item has no blob path".to_string())?;
 
         #[cfg(target_os = "windows")]
-        copy_image_blob_with(&state.image_store, Path::new(&content_path), |dib| {
-            crate::clipboard::win::write_dib_to_clipboard(dib)
-        })
+        copy_image_blob_with(
+            &state.image_store,
+            Path::new(&content_path),
+            crate::blobs::read_dib_from_bmp_file,
+            |dib| crate::clipboard::win::write_dib_to_clipboard(dib),
+        )
         .map_err(|error| error.to_string())?;
         #[cfg(not(target_os = "windows"))]
-        copy_image_blob_with(&state.image_store, Path::new(&content_path), |_dib| Ok(()))
-            .map_err(|error| error.to_string())?;
+        copy_image_blob_with(
+            &state.image_store,
+            Path::new(&content_path),
+            crate::blobs::read_dib_from_bmp_file,
+            |_dib| Ok(()),
+        )
+        .map_err(|error| error.to_string())?;
         return Ok(());
     }
     if item.item_type == "files" {
@@ -1189,7 +1202,7 @@ mod tests {
 
     use super::{
         clear_history_with, copy_image_blob_with, delete_item_with, html_to_plain_text,
-        import_backup_data_with, mutate_and_cleanup_blobs, prune_history_with,
+        import_backup_data_with, load_item_for_copy, mutate_and_cleanup_blobs, prune_history_with,
         safe_backup_blob_filename, validate_migration_paths, BackupData, BackupMetadata, BlobData,
     };
     use crate::blobs::image::stage_dib;
@@ -1354,7 +1367,7 @@ mod tests {
     }
 
     #[test]
-    fn image_copy_holds_read_lease_through_write_callback() {
+    fn dib_from_bmp_image_copy_releases_repository_before_io_and_holds_read_lease() {
         let root = std::env::temp_dir().join(format!(
             "super-clipboard-copy-image-{}",
             uuid::Uuid::new_v4()
@@ -1369,19 +1382,54 @@ mod tests {
                 |_| Ok(false),
             )
             .expect("install");
+        let repository = Arc::new(Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        ));
+        let item = repository
+            .lock()
+            .expect("repository lock")
+            .insert_or_touch_image(ClipboardItemDraft {
+                item_type: ClipboardItemType::Image,
+                content: None,
+                content_path: Some(image_path.to_string_lossy().to_string()),
+                content_hash: Some("copy-image-content".to_string()),
+                preview: "image".to_string(),
+                source_app: None,
+                size_bytes: 44,
+            })
+            .expect("insert image");
+        let (read_started_tx, read_started_rx) = mpsc::channel();
+        let (release_read_tx, release_read_rx) = mpsc::channel();
         let (write_started_tx, write_started_rx) = mpsc::channel();
         let (release_copy_tx, release_copy_rx) = mpsc::channel();
         let (lease_entered_tx, lease_entered_rx) = mpsc::channel();
 
         let reader_store = Arc::clone(&store);
+        let reader_repository = Arc::clone(&repository);
         let reader = thread::spawn(move || {
-            copy_image_blob_with(&reader_store, &image_path, |_dib| {
-                write_started_tx.send(()).expect("write started");
-                release_copy_rx.recv().expect("release copy");
-                Ok(())
-            })
+            let item = load_item_for_copy(&reader_repository, &item.id)?;
+            let image_path = item
+                .content_path
+                .ok_or_else(|| anyhow::anyhow!("image item has no blob path"))?;
+            copy_image_blob_with(
+                &reader_store,
+                Path::new(&image_path),
+                |path| {
+                    let repository_available = reader_repository.try_lock().is_ok();
+                    read_started_tx
+                        .send(repository_available)
+                        .expect("read started");
+                    release_read_rx.recv().expect("release read");
+                    crate::blobs::read_dib_from_bmp_file(path)
+                },
+                |_dib| {
+                    write_started_tx.send(()).expect("write started");
+                    release_copy_rx.recv().expect("release copy");
+                    Ok(())
+                },
+            )
         });
-        write_started_rx.recv().expect("copy callback entered");
+        assert!(read_started_rx.recv().expect("image read started"));
         let writer_store = Arc::clone(&store);
         let writer = thread::spawn(move || {
             writer_store.with_write(|_, _| {
@@ -1390,6 +1438,11 @@ mod tests {
             })
         });
 
+        assert!(lease_entered_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+        release_read_tx.send(()).expect("release read");
+        write_started_rx.recv().expect("copy callback entered");
         assert!(lease_entered_rx
             .recv_timeout(Duration::from_millis(100))
             .is_err());
@@ -1402,6 +1455,7 @@ mod tests {
             .join()
             .expect("writer thread")
             .expect("writer result");
+        drop(repository);
         drop(store);
         std::fs::remove_dir_all(root).expect("cleanup");
     }

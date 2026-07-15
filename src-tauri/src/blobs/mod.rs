@@ -1,8 +1,14 @@
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+use anyhow::Context;
 
 pub mod image;
 pub mod store;
+
+pub const MAX_IMAGE_ALLOCATION: u64 = 100 * 1024 * 1024;
+const BMP_FILE_HEADER_LEN: u64 = 14;
 
 pub fn ensure_blob_dir(app_data: &Path) -> anyhow::Result<PathBuf> {
     let dir = app_data.join("blobs");
@@ -11,8 +17,61 @@ pub fn ensure_blob_dir(app_data: &Path) -> anyhow::Result<PathBuf> {
 }
 
 pub fn read_dib_from_bmp_file(path: &Path) -> anyhow::Result<Vec<u8>> {
-    let bytes = fs::read(path)?;
-    bmp_file_to_dib(&bytes)
+    let mut file = File::open(path)
+        .with_context(|| format!("failed to open BMP image blob: {}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("failed to read BMP image blob metadata: {}", path.display()))?
+        .len();
+    read_dib_from_bmp(&mut file, file_len)
+        .with_context(|| format!("failed to read BMP image blob: {}", path.display()))
+}
+
+fn read_dib_from_bmp(reader: &mut impl Read, file_len: u64) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        file_len >= BMP_FILE_HEADER_LEN,
+        "BMP file header is truncated"
+    );
+    anyhow::ensure!(
+        file_len <= MAX_IMAGE_ALLOCATION,
+        "BMP file exceeds the 100 MiB image allocation limit"
+    );
+
+    let payload_len = file_len
+        .checked_sub(BMP_FILE_HEADER_LEN)
+        .ok_or_else(|| anyhow::anyhow!("BMP payload length underflow"))?;
+    anyhow::ensure!(
+        payload_len <= MAX_IMAGE_ALLOCATION,
+        "DIB payload exceeds the 100 MiB image allocation limit"
+    );
+    let payload_len = usize::try_from(payload_len)
+        .map_err(|_| anyhow::anyhow!("DIB payload length does not fit in memory"))?;
+
+    let mut header = [0_u8; BMP_FILE_HEADER_LEN as usize];
+    reader
+        .read_exact(&mut header)
+        .context("failed to read BMP file header")?;
+    anyhow::ensure!(&header[..2] == b"BM", "image blob is not a BMP file");
+
+    let declared_file_len = u32::from_le_bytes(header[2..6].try_into().expect("fixed BMP header"));
+    anyhow::ensure!(
+        u64::from(declared_file_len) == file_len,
+        "BMP declared file size does not match blob length"
+    );
+    let pixel_offset = u32::from_le_bytes(header[10..14].try_into().expect("fixed BMP header"));
+    anyhow::ensure!(
+        u64::from(pixel_offset) >= BMP_FILE_HEADER_LEN && u64::from(pixel_offset) <= file_len,
+        "BMP pixel offset is out of bounds"
+    );
+
+    let mut dib = Vec::new();
+    dib.try_reserve_exact(payload_len)
+        .context("failed to allocate DIB payload")?;
+    dib.resize(payload_len, 0);
+    reader
+        .read_exact(&mut dib)
+        .context("failed to read DIB payload")?;
+    Ok(dib)
 }
 
 pub fn thumbnail_path_for(blob_path: &Path) -> PathBuf {
@@ -47,13 +106,6 @@ fn bmp_file_from_dib(dib_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     bmp.extend_from_slice(&(pixel_offset as u32).to_le_bytes());
     bmp.extend_from_slice(dib_bytes);
     Ok(bmp)
-}
-
-fn bmp_file_to_dib(bmp_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
-    if bmp_bytes.len() < 14 || &bmp_bytes[..2] != b"BM" {
-        return Err(anyhow::anyhow!("image blob is not a BMP file"));
-    }
-    Ok(bmp_bytes[14..].to_vec())
 }
 
 fn dib_pixel_offset(dib_bytes: &[u8]) -> anyhow::Result<usize> {
@@ -122,8 +174,48 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> anyhow::Result<u32> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::io::{self, Read};
+    use std::rc::Rc;
+
     use super::*;
     use uuid::Uuid;
+
+    struct RecordingReader {
+        bytes: Vec<u8>,
+        position: usize,
+        requests: Rc<RefCell<Vec<usize>>>,
+    }
+
+    impl Read for RecordingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.requests.borrow_mut().push(buffer.len());
+            let remaining = &self.bytes[self.position..];
+            let read_len = remaining.len().min(buffer.len());
+            buffer[..read_len].copy_from_slice(&remaining[..read_len]);
+            self.position += read_len;
+            Ok(read_len)
+        }
+    }
+
+    struct PanicReader;
+
+    impl Read for PanicReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            panic!("oversized BMP must be rejected before reading or allocating")
+        }
+    }
+
+    fn test_bmp(dib: &[u8]) -> Vec<u8> {
+        let file_len = 14_u32 + u32::try_from(dib.len()).expect("test DIB length");
+        let mut bmp = Vec::with_capacity(file_len as usize);
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&file_len.to_le_bytes());
+        bmp.extend_from_slice(&0_u32.to_le_bytes());
+        bmp.extend_from_slice(&14_u32.to_le_bytes());
+        bmp.extend_from_slice(dib);
+        bmp
+    }
 
     #[test]
     fn thumbnail_path_uses_png_extension() {
@@ -158,5 +250,92 @@ mod tests {
         let restored = read_dib_from_bmp_file(&path).expect("dib payload");
 
         assert_eq!(restored, dib);
+    }
+
+    #[test]
+    fn dib_from_bmp_reader_returns_every_byte_after_the_file_header() {
+        let dib = [40, 0, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd];
+        let mut bmp = test_bmp(&dib);
+        bmp[10..14].copy_from_slice(&18_u32.to_le_bytes());
+
+        let restored =
+            read_dib_from_bmp(&mut bmp.as_slice(), bmp.len() as u64).expect("valid BMP payload");
+
+        assert_eq!(restored, dib);
+    }
+
+    #[test]
+    fn dib_from_bmp_reader_rejects_truncated_or_inconsistent_headers() {
+        let valid = test_bmp(&[40, 0, 0, 0]);
+        let cases = [
+            (b"not a bitmap".to_vec(), 12_u64),
+            (valid[..10].to_vec(), valid.len() as u64),
+            (valid[..valid.len() - 1].to_vec(), valid.len() as u64),
+            (
+                {
+                    let mut bytes = valid.clone();
+                    bytes[0..2].copy_from_slice(b"ZZ");
+                    bytes
+                },
+                valid.len() as u64,
+            ),
+            (
+                {
+                    let mut bytes = valid.clone();
+                    bytes[2..6].copy_from_slice(&((valid.len() as u32) - 1).to_le_bytes());
+                    bytes
+                },
+                valid.len() as u64,
+            ),
+            (
+                {
+                    let mut bytes = valid.clone();
+                    bytes[10..14].copy_from_slice(&13_u32.to_le_bytes());
+                    bytes
+                },
+                valid.len() as u64,
+            ),
+            (
+                {
+                    let mut bytes = valid.clone();
+                    bytes[10..14].copy_from_slice(&((valid.len() as u32) + 1).to_le_bytes());
+                    bytes
+                },
+                valid.len() as u64,
+            ),
+        ];
+
+        for (bytes, declared_len) in cases {
+            assert!(
+                read_dib_from_bmp(&mut bytes.as_slice(), declared_len).is_err(),
+                "invalid BMP header was accepted: {bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dib_from_bmp_reader_rejects_oversized_lengths_before_reading() {
+        for file_len in [MAX_IMAGE_ALLOCATION + 1, u64::MAX] {
+            let error =
+                read_dib_from_bmp(&mut PanicReader, file_len).expect_err("oversized BMP must fail");
+            assert!(error.to_string().contains("100 MiB"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn dib_from_bmp_reader_reads_directly_into_one_payload_buffer() {
+        let dib = vec![0x5a; 32];
+        let bmp = test_bmp(&dib);
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let mut reader = RecordingReader {
+            bytes: bmp.clone(),
+            position: 0,
+            requests: Rc::clone(&requests),
+        };
+
+        let restored = read_dib_from_bmp(&mut reader, bmp.len() as u64).expect("valid BMP payload");
+
+        assert_eq!(restored, dib);
+        assert_eq!(&*requests.borrow(), &[14, dib.len()]);
     }
 }
