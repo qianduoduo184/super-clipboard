@@ -15,6 +15,7 @@ export function mapBackendItemToViewItem(item) {
 
   return {
     id: item.id,
+    hash: item.hash,
     type,
     preview: item.preview || '(空内容)',
     contentPath: item.content_path ?? null,
@@ -34,26 +35,46 @@ export function mapBackendItemDetailToViewItem(item) {
   };
 }
 
-export function cacheItemDetailById(detailsById, detail) {
+export function createItemIdentity(item) {
   return {
-    ...detailsById,
-    [detail.id]: detail,
+    itemId: item.id,
+    itemHash: item.hash,
+    updatedAt: item.updatedAt,
   };
 }
 
-export function beginDetailRequest(currentRequest, itemId) {
+function isSameItemIdentity(left, right) {
+  return (
+    left?.itemId === right?.itemId &&
+    left?.itemHash === right?.itemHash &&
+    left?.updatedAt === right?.updatedAt
+  );
+}
+
+export function reconcileDetailSlot(slot, selectedItem) {
+  if (!slot || !selectedItem) return null;
+  return isSameItemIdentity(slot.identity, createItemIdentity(selectedItem)) ? slot : null;
+}
+
+export function beginDetailRequest(currentRequest, identity) {
   return {
-    itemId,
+    identity,
     generation: currentRequest.generation + 1,
   };
 }
 
-export function isDetailResponseCurrent(activeRequest, completedRequest, selectedId) {
+export function isDetailResponseCurrent(activeRequest, completedRequest, selectedIdentity) {
   return (
     activeRequest.generation === completedRequest.generation &&
-    activeRequest.itemId === completedRequest.itemId &&
-    completedRequest.itemId === selectedId
+    isSameItemIdentity(activeRequest.identity, completedRequest.identity) &&
+    isSameItemIdentity(completedRequest.identity, selectedIdentity)
   );
+}
+
+export function resolveDetailResponse(activeRequest, completedRequest, selectedIdentity, detail) {
+  if (!isDetailResponseCurrent(activeRequest, completedRequest, selectedIdentity)) return null;
+  if (!isSameItemIdentity(completedRequest.identity, createItemIdentity(detail))) return null;
+  return { identity: selectedIdentity, detail };
 }
 
 export function getDetailDisplayContent(summary, detail) {
@@ -61,4 +82,40 @@ export function getDetailDisplayContent(summary, detail) {
     return detail.content;
   }
   return summary.preview;
+}
+
+export function createImageFallbackState(thumbnailPath, contentPath) {
+  return {
+    thumbnailPath,
+    contentPath,
+    stage: thumbnailPath ? 'thumbnail' : contentPath ? 'original' : 'none',
+  };
+}
+
+export function getImageFallbackPath(state) {
+  if (state.stage === 'thumbnail') return state.thumbnailPath;
+  if (state.stage === 'original') return state.contentPath;
+  return null;
+}
+
+export function advanceImageFallback(state) {
+  if (state.stage === 'thumbnail') {
+    return { ...state, stage: state.contentPath ? 'original' : 'none' };
+  }
+  if (state.stage === 'original') {
+    return { ...state, stage: 'none' };
+  }
+  return state;
+}
+
+export function reconcileImageFallbackState(state, thumbnailPath, contentPath) {
+  if (state.thumbnailPath === thumbnailPath && state.contentPath === contentPath) return state;
+  return createImageFallbackState(thumbnailPath, contentPath);
+}
+
+export function selectDetailLoadStatus(status, selectedIdentity) {
+  if (!isSameItemIdentity(status.identity, selectedIdentity)) {
+    return { loading: false, error: null };
+  }
+  return { loading: status.loading, error: status.error };
 }

@@ -23,13 +23,22 @@ import { calculateVirtualWindow, moveSelection } from './lib/history-ui';
 import { applyThemeMode, getErrorMessage, mergeSettings, shouldCheckForUpdatesToday, toLocalDateString } from './lib/settings-model';
 import SettingsView from './features/settings/SettingsView';
 import {
+  advanceImageFallback,
   beginDetailRequest,
-  cacheItemDetailById,
+  createImageFallbackState,
+  createItemIdentity,
   getDetailDisplayContent,
+  getImageFallbackPath,
   isDetailResponseCurrent,
+  reconcileDetailSlot,
+  reconcileImageFallbackState,
+  resolveDetailResponse,
+  selectDetailLoadStatus,
+  type DetailLoadStatus,
   type DetailRequest,
+  type DetailSlot,
+  type ItemIdentity,
   type ViewClipboardItem,
-  type ViewClipboardItemDetail,
 } from './lib/clipboard-adapter';
 import {
   copyItem,
@@ -55,6 +64,7 @@ type ClipboardItem = ViewClipboardItem;
 const seedItems: ClipboardItem[] = [
   {
     id: '1',
+    hash: 'seed-1',
     type: 'text',
     preview: 'SQLite WAL 模式 + FTS5 搜索，保证大量历史记录下仍能快速返回首屏。',
     contentPath: null,
@@ -67,6 +77,7 @@ const seedItems: ClipboardItem[] = [
   },
   {
     id: '2',
+    hash: 'seed-2',
     type: 'image',
     preview: 'screenshot-2026-06-08.png',
     contentPath: null,
@@ -79,6 +90,7 @@ const seedItems: ClipboardItem[] = [
   },
   {
     id: '3',
+    hash: 'seed-3',
     type: 'files',
     preview: '需求说明.docx, 架构草图.png',
     contentPath: null,
@@ -91,6 +103,7 @@ const seedItems: ClipboardItem[] = [
   },
   {
     id: '4',
+    hash: 'seed-4',
     type: 'html',
     preview: '<table><tr><td>CopyQ / Ditto / PasteBar 功能对比</td></tr></table>',
     contentPath: null,
@@ -119,6 +132,28 @@ function iconForType(type: ClipboardType) {
   return <Clipboard size={16} />;
 }
 
+function HistoryListImage({ thumbnailPath, contentPath }: { thumbnailPath: string | null; contentPath: string | null }) {
+  const [fallbackState, setFallbackState] = useState(() => createImageFallbackState(thumbnailPath, contentPath));
+  const currentFallbackState = reconcileImageFallbackState(fallbackState, thumbnailPath, contentPath);
+  const imagePath = getImageFallbackPath(currentFallbackState);
+
+  useEffect(() => {
+    setFallbackState((current) => reconcileImageFallbackState(current, thumbnailPath, contentPath));
+  }, [contentPath, thumbnailPath]);
+
+  if (!imagePath) return <Image size={16} />;
+
+  return (
+    <img
+      src={convertFileSrc(imagePath)}
+      alt=""
+      loading="lazy"
+      decoding="async"
+      onError={() => setFallbackState(advanceImageFallback(currentFallbackState))}
+    />
+  );
+}
+
 function useDebouncedValue<T>(value: T, delay: number) {
   const [debouncedValue, setDebouncedValue] = useState(value);
 
@@ -138,9 +173,12 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [items, setItems] = useState(seedItems);
   const [selectedId, setSelectedId] = useState<string | undefined>(seedItems[0]?.id);
-  const [detailsById, setDetailsById] = useState<Record<string, ViewClipboardItemDetail>>({});
-  const [detailLoading, setDetailLoading] = useState(false);
-  const [detailError, setDetailError] = useState<string | null>(null);
+  const [detailSlot, setDetailSlot] = useState<DetailSlot | null>(null);
+  const [detailLoadStatus, setDetailLoadStatus] = useState<DetailLoadStatus>({
+    identity: null,
+    loading: false,
+    error: null,
+  });
   const [scrollTop, setScrollTop] = useState(0);
   const [backendAvailable, setBackendAvailable] = useState(true);
   const [statusMessage, setStatusMessage] = useState('正在连接本地剪贴板服务');
@@ -153,7 +191,8 @@ export default function App() {
   const [previewPaneWidth, setPreviewPaneWidth] = useState(0.47);
   const [isResizing, setIsResizing] = useState(false);
   const historyListRef = useRef<HTMLDivElement | null>(null);
-  const detailRequestRef = useRef<DetailRequest>({ itemId: null, generation: 0 });
+  const detailRequestRef = useRef<DetailRequest>({ identity: null, generation: 0 });
+  const selectedIdentityRef = useRef<ItemIdentity | null>(null);
   const debouncedQuery = useDebouncedValue(query, 100);
 
   // Track the latest settingsOpen for the blur handler (registered once with []).
@@ -341,48 +380,60 @@ export default function App() {
 
   const virtualItems = visibleItems.slice(virtualWindow.startIndex, virtualWindow.endIndex);
   const selectedItem = visibleItems.find((item) => item.id === selectedId) ?? visibleItems[0];
-  const selectedDetail = selectedItem ? detailsById[selectedItem.id] : undefined;
-  const selectedItemIdRef = useRef<string | undefined>(selectedItem?.id);
-  selectedItemIdRef.current = selectedItem?.id;
+  const selectedIdentity = useMemo(
+    () => selectedItem ? createItemIdentity(selectedItem) : null,
+    [selectedItem?.hash, selectedItem?.id, selectedItem?.updatedAt],
+  );
+  selectedIdentityRef.current = selectedIdentity;
+  const selectedDetailSlot = reconcileDetailSlot(detailSlot, selectedItem);
+  const selectedDetail = selectedDetailSlot?.detail;
+  const selectedDetailLoadStatus = selectDetailLoadStatus(detailLoadStatus, selectedIdentity);
   const detailDisplayContent = selectedItem
     ? getDetailDisplayContent(selectedItem, selectedDetail)
     : '';
   const detailImagePath = selectedDetail?.contentPath ?? selectedItem?.contentPath ?? null;
 
   useEffect(() => {
+    setDetailSlot((current) => reconcileDetailSlot(current, selectedItem));
+  }, [selectedItem]);
+
+  useEffect(() => {
     const selectedItemId = selectedItem?.id;
-    if (!previewEnabled || !backendAvailable || !selectedItemId) {
+    if (!previewEnabled || !backendAvailable || !selectedItemId || !selectedIdentity) {
       detailRequestRef.current = beginDetailRequest(detailRequestRef.current, null);
-      setDetailLoading(false);
-      setDetailError(null);
+      setDetailSlot(null);
+      setDetailLoadStatus({ identity: null, loading: false, error: null });
       return;
     }
     if (selectedDetail) {
-      setDetailLoading(false);
-      setDetailError(null);
+      setDetailLoadStatus({ identity: selectedIdentity, loading: false, error: null });
       return;
     }
 
-    const request = beginDetailRequest(detailRequestRef.current, selectedItemId);
+    const request = beginDetailRequest(detailRequestRef.current, selectedIdentity);
     detailRequestRef.current = request;
-    setDetailLoading(true);
-    setDetailError(null);
+    setDetailLoadStatus({ identity: selectedIdentity, loading: true, error: null });
 
     getItemDetail(selectedItemId)
       .then((detail) => {
-        if (!isDetailResponseCurrent(detailRequestRef.current, request, selectedItemIdRef.current)) return;
         if (!detail) {
-          setDetailLoading(false);
-          setDetailError('详情加载失败');
+          if (!isDetailResponseCurrent(detailRequestRef.current, request, selectedIdentityRef.current)) return;
+          setDetailLoadStatus({ identity: selectedIdentity, loading: false, error: '详情加载失败' });
           return;
         }
-        setDetailsById((current) => cacheItemDetailById(current, detail));
-        setDetailLoading(false);
+        const nextSlot = resolveDetailResponse(
+          detailRequestRef.current,
+          request,
+          selectedIdentityRef.current,
+          detail,
+        );
+        if (!nextSlot) return;
+        setDetailSlot(nextSlot);
+        setDetailLoadStatus({ identity: nextSlot.identity, loading: false, error: null });
       })
       .catch(() => {
-        if (!isDetailResponseCurrent(detailRequestRef.current, request, selectedItemIdRef.current)) return;
-        setDetailLoading(false);
-        setDetailError('详情加载失败');
+        if (!isDetailResponseCurrent(detailRequestRef.current, request, selectedIdentityRef.current)) return;
+        setDetailLoadStatus({ identity: selectedIdentity, loading: false, error: '详情加载失败' });
       });
 
     return () => {
@@ -390,7 +441,7 @@ export default function App() {
         detailRequestRef.current = beginDetailRequest(detailRequestRef.current, null);
       }
     };
-  }, [backendAvailable, previewEnabled, selectedDetail, selectedItem?.id]);
+  }, [backendAvailable, previewEnabled, selectedDetail, selectedIdentity, selectedItem?.id]);
 
   useEffect(() => {
     if (!selectedItem && visibleItems[0]) {
@@ -419,6 +470,12 @@ export default function App() {
   async function deleteItem(id: string) {
     if (backendAvailable) {
       await deleteBackendItem(id);
+    }
+    if (selectedIdentityRef.current?.itemId === id) {
+      detailRequestRef.current = beginDetailRequest(detailRequestRef.current, null);
+      selectedIdentityRef.current = null;
+      setDetailSlot(null);
+      setDetailLoadStatus({ identity: null, loading: false, error: null });
     }
     setItems((current) => current.filter((item) => item.id !== id));
   }
@@ -636,6 +693,10 @@ export default function App() {
           setNavFiltersConfig(settings.nav_filters_config);
         }}
         onHistoryCleared={() => {
+          detailRequestRef.current = beginDetailRequest(detailRequestRef.current, null);
+          selectedIdentityRef.current = null;
+          setDetailSlot(null);
+          setDetailLoadStatus({ identity: null, loading: false, error: null });
           setItems([]);
           setSelectedId(undefined);
           setRefreshVersion((current) => current + 1);
@@ -864,7 +925,7 @@ export default function App() {
             const actualIndex = virtualWindow.startIndex + idx;
             const itemHeight = itemHeights[actualIndex];
             const isDraggingDisabled = false;
-            const imageListPath = item.type === 'image' ? item.thumbnailPath ?? item.contentPath : null;
+            const hasImageListPath = item.type === 'image' && Boolean(item.thumbnailPath ?? item.contentPath);
             return (
             <button
               key={item.id}
@@ -911,13 +972,11 @@ export default function App() {
               <span className="drag-handle-icon">
                 <GripVertical size={16} />
               </span>
-              <span className={imageListPath ? 'type-icon image-thumb' : 'type-icon'}>
-                {imageListPath ? (
-                  <img
-                    src={convertFileSrc(imageListPath)}
-                    alt=""
-                    loading="lazy"
-                    decoding="async"
+              <span className={hasImageListPath ? 'type-icon image-thumb' : 'type-icon'}>
+                {item.type === 'image' ? (
+                  <HistoryListImage
+                    thumbnailPath={item.thumbnailPath}
+                    contentPath={item.contentPath}
                   />
                 ) : (
                   iconForType(item.type)
@@ -952,8 +1011,10 @@ export default function App() {
               <>
                 <div className="detail-header">
                   <span className="detail-type">{getTypeLabel(selectedItem.type)}</span>
-                  <span role={detailLoading ? 'status' : undefined}>
-                    {detailLoading ? '正在加载完整内容…' : detailError ?? selectedItem.size}
+                  <span role="status" aria-live="polite">
+                    {selectedDetailLoadStatus.loading
+                      ? '正在加载完整内容…'
+                      : selectedDetailLoadStatus.error ?? selectedItem.size}
                   </span>
                 </div>
                 {selectedItem.type === 'image' && detailImagePath ? (
@@ -961,7 +1022,7 @@ export default function App() {
                     <img src={convertFileSrc(detailImagePath)} alt="剪贴板图片预览" />
                   </div>
                 ) : (
-                  <pre aria-busy={detailLoading}>{detailDisplayContent}</pre>
+                  <pre aria-busy={selectedDetailLoadStatus.loading}>{detailDisplayContent}</pre>
                 )}
                 <div className="detail-actions">
                   <button onClick={() => void pasteSelectedItem()}>

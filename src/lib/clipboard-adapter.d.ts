@@ -21,6 +21,7 @@ export type BackendClipboardItem = BackendClipboardItemDetail;
 
 export type ViewClipboardItem = {
   id: string;
+  hash: string;
   type: 'text' | 'html' | 'image' | 'files';
   preview: string;
   contentPath: string | null;
@@ -36,9 +37,32 @@ export type ViewClipboardItemDetail = ViewClipboardItem & {
   content: string | null;
 };
 
+export type ItemIdentity = {
+  itemId: string;
+  itemHash: string;
+  updatedAt: number;
+};
+
+export type DetailSlot = {
+  identity: ItemIdentity;
+  detail: ViewClipboardItemDetail;
+};
+
 export type DetailRequest = {
-  itemId: string | null;
+  identity: ItemIdentity | null;
   generation: number;
+};
+
+export type DetailLoadStatus = {
+  identity: ItemIdentity | null;
+  loading: boolean;
+  error: string | null;
+};
+
+export type ImageFallbackState = {
+  thumbnailPath: string | null;
+  contentPath: string | null;
+  stage: 'thumbnail' | 'original' | 'none';
 };
 
 export function formatBytes(value: number): string;
@@ -47,20 +71,54 @@ export function mapBackendItemToViewItem(item: BackendClipboardItemSummary): Vie
 
 export function mapBackendItemDetailToViewItem(item: BackendClipboardItemDetail): ViewClipboardItemDetail;
 
-export function cacheItemDetailById(
-  detailsById: Record<string, ViewClipboardItemDetail>,
-  detail: ViewClipboardItemDetail,
-): Record<string, ViewClipboardItemDetail>;
+export function createItemIdentity(
+  item: Pick<ViewClipboardItem, 'id' | 'hash' | 'updatedAt'>,
+): ItemIdentity;
 
-export function beginDetailRequest(currentRequest: DetailRequest, itemId: string | null): DetailRequest;
+export function reconcileDetailSlot(
+  slot: DetailSlot | null,
+  selectedItem?: Pick<ViewClipboardItem, 'id' | 'hash' | 'updatedAt'> | null,
+): DetailSlot | null;
+
+export function beginDetailRequest(
+  currentRequest: DetailRequest,
+  identity: ItemIdentity | null,
+): DetailRequest;
 
 export function isDetailResponseCurrent(
   activeRequest: DetailRequest,
   completedRequest: DetailRequest,
-  selectedId: string | null | undefined,
+  selectedIdentity: ItemIdentity | null | undefined,
 ): boolean;
+
+export function resolveDetailResponse(
+  activeRequest: DetailRequest,
+  completedRequest: DetailRequest,
+  selectedIdentity: ItemIdentity | null | undefined,
+  detail: ViewClipboardItemDetail,
+): DetailSlot | null;
 
 export function getDetailDisplayContent(
   summary: Pick<ViewClipboardItem, 'id' | 'preview'>,
   detail?: Pick<ViewClipboardItemDetail, 'id' | 'content'>,
 ): string;
+
+export function createImageFallbackState(
+  thumbnailPath: string | null,
+  contentPath: string | null,
+): ImageFallbackState;
+
+export function getImageFallbackPath(state: ImageFallbackState): string | null;
+
+export function advanceImageFallback(state: ImageFallbackState): ImageFallbackState;
+
+export function reconcileImageFallbackState(
+  state: ImageFallbackState,
+  thumbnailPath: string | null,
+  contentPath: string | null,
+): ImageFallbackState;
+
+export function selectDetailLoadStatus(
+  status: DetailLoadStatus,
+  selectedIdentity: ItemIdentity | null | undefined,
+): Pick<DetailLoadStatus, 'loading' | 'error'>;

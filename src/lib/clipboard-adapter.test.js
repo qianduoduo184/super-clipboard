@@ -3,13 +3,19 @@ import assert from 'node:assert/strict';
 import * as clipboardAdapter from './clipboard-adapter.js';
 
 const {
+  advanceImageFallback,
   beginDetailRequest,
-  cacheItemDetailById,
+  createImageFallbackState,
+  createItemIdentity,
   formatBytes,
   getDetailDisplayContent,
-  isDetailResponseCurrent,
+  getImageFallbackPath,
   mapBackendItemDetailToViewItem,
   mapBackendItemToViewItem,
+  reconcileDetailSlot,
+  reconcileImageFallbackState,
+  resolveDetailResponse,
+  selectDetailLoadStatus,
 } = clipboardAdapter;
 
 test('formatBytes renders compact byte labels', () => {
@@ -36,6 +42,7 @@ test('mapBackendItemToViewItem maps backend fields to UI fields', () => {
 
   assert.deepEqual(item, {
     id: 'id-1',
+    hash: 'hash',
     type: 'text',
     preview: 'hello',
     contentPath: null,
@@ -120,6 +127,7 @@ test('mapBackendItemToViewItem maps summary image paths without inventing full c
 
   assert.equal(item.thumbnailPath, 'C:\\blob\\image.thumb.png');
   assert.equal(item.contentPath, 'C:\\blob\\image.bmp');
+  assert.equal(item.hash, 'hash');
   assert.equal(Object.hasOwn(item, 'content'), false);
 });
 
@@ -143,26 +151,54 @@ test('mapBackendItemDetailToViewItem maps full content from item detail', () => 
   assert.equal(item.contentPath, null);
 });
 
-test('cacheItemDetailById enriches only the matching cache entry without changing list order', () => {
-  const items = [{ id: 'a' }, { id: 'b' }];
-  const cachedA = { id: 'a', content: 'A' };
-  const detailB = { id: 'b', content: '完整 B' };
-  const detailsById = { a: cachedA };
+test('reconcileDetailSlot invalidates cached detail when authoritative summary identity changes', () => {
+  const summary = { id: 'a', hash: 'hash-a', updatedAt: 100 };
+  const slot = {
+    identity: createItemIdentity(summary),
+    detail: { ...summary, content: '旧正文' },
+  };
 
-  const nextDetails = cacheItemDetailById(detailsById, detailB);
-
-  assert.deepEqual(items.map((item) => item.id), ['a', 'b']);
-  assert.equal(nextDetails.a, cachedA);
-  assert.equal(nextDetails.b, detailB);
-  assert.equal(detailsById.b, undefined);
+  assert.equal(reconcileDetailSlot(slot, { ...summary, hash: 'hash-new' }), null);
+  assert.equal(reconcileDetailSlot(slot, { ...summary, updatedAt: 101 }), null);
 });
 
-test('detail request generation rejects a late response after selection changes', () => {
-  const requestA = beginDetailRequest({ itemId: null, generation: 0 }, 'a');
-  const requestB = beginDetailRequest(requestA, 'b');
+test('reconcileDetailSlot evicts detail when selected item is deleted or history is cleared', () => {
+  const summary = { id: 'a', hash: 'hash-a', updatedAt: 100 };
+  const slot = {
+    identity: createItemIdentity(summary),
+    detail: { ...summary, content: '旧正文' },
+  };
 
-  assert.equal(isDetailResponseCurrent(requestB, requestA, 'b'), false);
-  assert.equal(isDetailResponseCurrent(requestB, requestB, 'b'), true);
+  assert.equal(reconcileDetailSlot(slot, undefined), null);
+  assert.equal(reconcileDetailSlot(slot, null), null);
+});
+
+test('resolveDetailResponse rejects old generation and old identity responses', () => {
+  const identityA = createItemIdentity({ id: 'a', hash: 'hash-a', updatedAt: 100 });
+  const refreshedIdentityA = createItemIdentity({ id: 'a', hash: 'hash-new', updatedAt: 101 });
+  const requestA = beginDetailRequest({ identity: null, generation: 0 }, identityA);
+  const refreshedRequestA = beginDetailRequest(requestA, refreshedIdentityA);
+  const oldDetail = { id: 'a', hash: 'hash-a', updatedAt: 100, content: '旧正文' };
+
+  assert.equal(resolveDetailResponse(refreshedRequestA, requestA, refreshedIdentityA, oldDetail), null);
+  assert.equal(resolveDetailResponse(requestA, requestA, refreshedIdentityA, oldDetail), null);
+  assert.equal(
+    resolveDetailResponse(requestA, requestA, identityA, { ...oldDetail, hash: 'unexpected-hash' }),
+    null,
+  );
+});
+
+test('resolveDetailResponse stores at most the current selected detail', () => {
+  const identityA = createItemIdentity({ id: 'a', hash: 'hash-a', updatedAt: 100 });
+  const identityB = createItemIdentity({ id: 'b', hash: 'hash-b', updatedAt: 200 });
+  const requestA = beginDetailRequest({ identity: null, generation: 0 }, identityA);
+  const requestB = beginDetailRequest(requestA, identityB);
+  const detailB = { id: 'b', hash: 'hash-b', updatedAt: 200, content: '完整 B' };
+
+  const slot = resolveDetailResponse(requestB, requestB, identityB, detailB);
+
+  assert.deepEqual(slot, { identity: identityB, detail: detailB });
+  assert.equal(Object.hasOwn(slot, 'a'), false);
 });
 
 test('getDetailDisplayContent prefers fetched full text or HTML over summary preview', () => {
@@ -172,4 +208,35 @@ test('getDetailDisplayContent prefers fetched full text or HTML over summary pre
   assert.equal(getDetailDisplayContent(summary, detail), '<p>完整 HTML 正文</p>');
   assert.equal(getDetailDisplayContent(summary, undefined), '<p>截断...</p>');
   assert.equal(getDetailDisplayContent(summary, { id: 'other', content: '错误内容' }), '<p>截断...</p>');
+});
+
+test('image fallback tries thumbnail then original once before showing the type icon', () => {
+  let state = createImageFallbackState('thumb.png', 'original.bmp');
+  assert.equal(getImageFallbackPath(state), 'thumb.png');
+
+  state = advanceImageFallback(state);
+  assert.equal(getImageFallbackPath(state), 'original.bmp');
+
+  state = advanceImageFallback(state);
+  assert.equal(getImageFallbackPath(state), null);
+  assert.equal(advanceImageFallback(state), state);
+});
+
+test('image fallback resets to a new thumbnail when paths change', () => {
+  const failed = advanceImageFallback(advanceImageFallback(
+    createImageFallbackState('old-thumb.png', 'old-original.bmp'),
+  ));
+
+  const reset = reconcileImageFallbackState(failed, 'new-thumb.png', 'new-original.bmp');
+
+  assert.equal(getImageFallbackPath(reset), 'new-thumb.png');
+});
+
+test('selectDetailLoadStatus hides loading and errors from a different selection', () => {
+  const identityA = createItemIdentity({ id: 'a', hash: 'hash-a', updatedAt: 100 });
+  const identityB = createItemIdentity({ id: 'b', hash: 'hash-b', updatedAt: 200 });
+  const statusA = { identity: identityA, loading: true, error: 'A 加载失败' };
+
+  assert.deepEqual(selectDetailLoadStatus(statusA, identityB), { loading: false, error: null });
+  assert.deepEqual(selectDetailLoadStatus(statusA, identityA), { loading: true, error: 'A 加载失败' });
 });
