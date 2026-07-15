@@ -135,7 +135,7 @@ pub fn available_space(path: &Path) -> anyhow::Result<u64> {
     available_space_at(path)
 }
 
-fn install_staged_locked(
+pub(crate) fn install_staged_locked(
     blob_dir: &Path,
     stage_root: &Path,
     staged: StagedImage,

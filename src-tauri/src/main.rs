@@ -74,6 +74,21 @@ fn main() {
             diagnostics::info("setup: sqlite repository opened");
             let repository = Arc::new(Mutex::new(repository));
 
+            let migration_outcome = match storage::image_migration::run_image_migration(
+                repository.as_ref(),
+                image_store.as_ref(),
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    diagnostics::error(format!("setup: image migration failed: {error:#}"));
+                    return Err(error.into());
+                }
+            };
+            diagnostics::info(format!(
+                "setup: image migration completed, managed_usage={}, quota_blocked={}",
+                migration_outcome.usage, migration_outcome.quota_blocked
+            ));
+
             let loaded_settings = match AppSettings::load(&settings_path) {
                 Ok(settings) => settings,
                 Err(error) => {
@@ -112,6 +127,7 @@ fn main() {
                 repository,
                 settings.clone(),
                 image_store,
+                !migration_outcome.quota_blocked,
             ) {
                 diagnostics::error(format!("setup: clipboard listener failed: {error}"));
             } else {

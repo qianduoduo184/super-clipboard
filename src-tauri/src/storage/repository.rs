@@ -930,6 +930,38 @@ pub struct ImageReferenceUpdate {
     pub content_path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MigrationRecord {
+    pub state: String,
+    pub backup_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MigrationImageRow {
+    pub id: String,
+    pub content_path: Option<PathBuf>,
+    pub favorite: bool,
+    pub pinned: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub sort_rank: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImageMigrationMerge {
+    pub retained_id: String,
+    pub duplicate_ids: Vec<String>,
+    pub content_hash: String,
+    pub content_path: PathBuf,
+    pub favorite: bool,
+    pub pinned: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub sort_rank: i64,
+    pub size_bytes: i64,
+    pub obsolete_paths: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchFilters {
     pub item_type: Option<String>,
@@ -938,6 +970,7 @@ pub struct SearchFilters {
 
 pub struct ClipboardRepository {
     conn: Connection,
+    database_path: PathBuf,
 }
 
 impl ClipboardRepository {
@@ -945,11 +978,163 @@ impl ClipboardRepository {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
+        let conn = Connection::open(&path)?;
         conn.execute_batch(INIT_SQL)?;
         migrate_schema(&conn)?;
         conn.execute_batch(INDEX_SQL)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            database_path: path,
+        })
+    }
+
+    pub(crate) fn database_path(&self) -> &Path {
+        &self.database_path
+    }
+
+    pub(crate) fn checkpoint_wal(&self) -> anyhow::Result<()> {
+        let busy = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        anyhow::ensure!(busy == 0, "SQLite WAL checkpoint remained busy");
+        Ok(())
+    }
+
+    pub(crate) fn migration_record(&self, name: &str) -> anyhow::Result<Option<MigrationRecord>> {
+        self.conn
+            .query_row(
+                "SELECT state, backup_path FROM schema_migrations WHERE name = ?1",
+                params![name],
+                |row| {
+                    Ok(MigrationRecord {
+                        state: row.get(0)?,
+                        backup_path: row.get::<_, Option<String>>(1)?.map(PathBuf::from),
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn reserve_migration_backup(
+        &self,
+        name: &str,
+        backup_path: &Path,
+    ) -> anyhow::Result<MigrationRecord> {
+        let now = Utc::now().timestamp_micros();
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations
+             (name, state, backup_path, created_at, updated_at)
+             VALUES (?1, 'pending', ?2, ?3, ?3)",
+            params![name, backup_path.to_string_lossy(), now],
+        )?;
+        self.migration_record(name)?
+            .ok_or_else(|| anyhow::anyhow!("reserved migration row is missing"))
+    }
+
+    pub(crate) fn set_migration_state(&self, name: &str, state: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            matches!(state, "pending" | "cleanup_pending" | "complete"),
+            "invalid migration state"
+        );
+        let changed = self.conn.execute(
+            "UPDATE schema_migrations SET state = ?1, updated_at = ?2 WHERE name = ?3",
+            params![state, Utc::now().timestamp_micros(), name],
+        )?;
+        anyhow::ensure!(changed == 1, "migration row is missing");
+        Ok(())
+    }
+
+    pub(crate) fn active_image_rows(&self) -> anyhow::Result<Vec<MigrationImageRow>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, content_path, favorite, pinned,
+                    created_at, updated_at, COALESCE(sort_rank, updated_at)
+             FROM clipboard_items
+             WHERE item_type = 'image' AND deleted_at IS NULL
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(MigrationImageRow {
+                    id: row.get(0)?,
+                    content_path: row.get::<_, Option<String>>(1)?.map(PathBuf::from),
+                    favorite: row.get::<_, i64>(2)? == 1,
+                    pinned: row.get::<_, i64>(3)? == 1,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                    sort_rank: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+        Ok(rows)
+    }
+
+    pub(crate) fn commit_image_migration(
+        &self,
+        name: &str,
+        merges: &[ImageMigrationMerge],
+    ) -> anyhow::Result<()> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let now = Utc::now().timestamp_micros();
+        for merge in merges {
+            for duplicate_id in &merge.duplicate_ids {
+                let changed = transaction.execute(
+                    "UPDATE clipboard_items SET deleted_at = ?1
+                     WHERE id = ?2 AND item_type = 'image' AND deleted_at IS NULL",
+                    params![now, duplicate_id],
+                )?;
+                anyhow::ensure!(changed == 1, "active duplicate image row is missing");
+                transaction.execute(
+                    "DELETE FROM clipboard_items_fts WHERE id = ?1",
+                    params![duplicate_id],
+                )?;
+            }
+        }
+        for merge in merges {
+            let changed = transaction.execute(
+                "UPDATE clipboard_items
+                 SET hash = ?1, content_hash = NULL
+                 WHERE id = ?2 AND item_type = 'image' AND deleted_at IS NULL",
+                params![
+                    format!("__image_migration__:{name}:{}", merge.retained_id),
+                    merge.retained_id
+                ],
+            )?;
+            anyhow::ensure!(changed == 1, "retained image row is missing");
+        }
+        for merge in merges {
+            let changed = transaction.execute(
+                "UPDATE clipboard_items
+                 SET hash = ?1, content_hash = ?2, content_path = ?3,
+                     favorite = ?4, pinned = ?5, created_at = ?6, updated_at = ?7,
+                     sort_rank = ?8, size_bytes = ?9
+                 WHERE id = ?10 AND item_type = 'image' AND deleted_at IS NULL",
+                params![
+                    format!("image:{}", merge.content_hash),
+                    merge.content_hash,
+                    merge.content_path.to_string_lossy(),
+                    i64::from(merge.favorite),
+                    i64::from(merge.pinned),
+                    merge.created_at,
+                    merge.updated_at,
+                    merge.sort_rank,
+                    merge.size_bytes,
+                    merge.retained_id
+                ],
+            )?;
+            anyhow::ensure!(changed == 1, "retained image row is missing");
+            enqueue_cleanup_paths(&transaction, &merge.obsolete_paths)?;
+        }
+        let changed = transaction.execute(
+            "UPDATE schema_migrations SET state = 'cleanup_pending', updated_at = ?1
+             WHERE name = ?2 AND state = 'pending'",
+            params![now, name],
+        )?;
+        anyhow::ensure!(changed == 1, "pending migration row is missing");
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn insert_or_touch(&self, draft: ClipboardItemDraft) -> anyhow::Result<ClipboardItem> {

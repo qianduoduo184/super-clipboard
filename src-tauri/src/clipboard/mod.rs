@@ -118,6 +118,28 @@ fn store_image_capture_with(
     install_image_capture(repository, image_store, staged, size_bytes)
 }
 
+fn store_clipboard_capture(
+    repository: &Mutex<ClipboardRepository>,
+    image_store: &ImageBlobStore,
+    capture: ClipboardCapture,
+    image_capture_enabled: bool,
+) -> anyhow::Result<Option<ClipboardItem>> {
+    match capture {
+        ClipboardCapture::Draft(draft) => repository
+            .lock()
+            .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?
+            .insert_or_touch(draft)
+            .map(Some),
+        ClipboardCapture::ImageDib(_) if !image_capture_enabled => {
+            crate::diagnostics::warn("clipboard: image capture blocked by storage quota");
+            Ok(None)
+        }
+        ClipboardCapture::ImageDib(dib) => {
+            store_image_capture(repository, image_store, dib).map(Some)
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ImageCaptureRace(ClipboardItem);
 
@@ -183,6 +205,7 @@ pub fn start_background_listener(
     repository: Arc<Mutex<ClipboardRepository>>,
     settings: Arc<Mutex<AppSettings>>,
     image_store: Arc<ImageBlobStore>,
+    image_capture_enabled: bool,
 ) -> anyhow::Result<()> {
     crate::diagnostics::info(format!(
         "clipboard: preparing listener with blob_dir={}",
@@ -249,23 +272,16 @@ pub fn start_background_listener(
 
         let mut stored_any = false;
         for capture in drafts {
-            let result = match capture {
-                ClipboardCapture::Draft(draft) => repository
-                    .lock()
-                    .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))
-                    .and_then(|repository| repository.insert_or_touch(draft)),
-                ClipboardCapture::ImageDib(dib) => {
-                    store_image_capture(&repository, &image_store, dib)
-                }
-            };
+            let result =
+                store_clipboard_capture(&repository, &image_store, capture, image_capture_enabled);
             match result {
                 Err(error) => {
                     crate::diagnostics::error(format!(
                         "clipboard: failed to store clipboard item: {error}"
                     ));
                 }
-                Ok(_) => {
-                    stored_any = true;
+                Ok(stored) => {
+                    stored_any |= stored.is_some();
                 }
             }
         }
@@ -293,7 +309,8 @@ pub fn start_background_listener(
 #[cfg(test)]
 mod tests {
     use super::{
-        image_draft, install_image_capture, store_image_capture, store_image_capture_with,
+        image_draft, install_image_capture, store_clipboard_capture, store_image_capture,
+        store_image_capture_with,
     };
     use crate::blobs::image::stage_dib;
     use crate::blobs::store::ImageBlobStore;
@@ -315,6 +332,39 @@ mod tests {
         dib.extend_from_slice(&pixel);
         dib.resize(dib.len() + trailing_padding, 0xAA);
         dib
+    }
+
+    #[test]
+    fn quota_gate_blocks_image_capture_without_writing_rows_or_blobs() {
+        let root =
+            std::env::temp_dir().join(format!("super-clipboard-quota-gate-{}", Uuid::new_v4()));
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+
+        let stored = store_clipboard_capture(
+            &repository,
+            &store,
+            crate::clipboard::types::ClipboardCapture::ImageDib(dib32(40, [30, 20, 10, 255], 0)),
+            false,
+        )
+        .expect("blocked capture");
+
+        assert!(stored.is_none());
+        assert!(repository
+            .lock()
+            .expect("repository lock")
+            .active_blob_paths()
+            .expect("active paths")
+            .is_empty());
+        assert!(fs::read_dir(store.blob_dir())
+            .expect("blob directory")
+            .next()
+            .is_none());
+        drop(repository);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
