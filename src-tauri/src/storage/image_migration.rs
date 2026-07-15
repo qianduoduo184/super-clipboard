@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -13,6 +13,7 @@ use crate::storage::repository::{ClipboardRepository, ImageMigrationMerge};
 
 const IMAGE_MIGRATION_NAME: &str = "legacy-image-content-dedup-v1";
 const IMAGE_QUOTA_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+const THUMBNAIL_RESERVATION_BYTES: u64 = 1024 * 1024;
 const BACKUP_COMPLETE_MARKER: &str = ".complete";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +25,9 @@ pub struct MigrationOutcome {
 trait MigrationIo {
     fn available_space(&self, path: &Path) -> anyhow::Result<u64>;
     fn copy_file(&self, from: &Path, to: &Path) -> anyhow::Result<u64>;
+    fn backup_source_exists(&self, path: &Path) -> bool {
+        path.exists()
+    }
     fn quota_bytes(&self) -> u64;
 }
 
@@ -106,8 +110,7 @@ fn run_image_migration_with(
 struct ScannedImage {
     row: crate::storage::repository::MigrationImageRow,
     source_path: PathBuf,
-    source_len: u64,
-    decoded_bytes: u64,
+    staged_bmp_bytes: u64,
 }
 
 struct MigrationScan {
@@ -158,18 +161,17 @@ fn scan_images(
                 identity.content_hash
             );
         }
-        let pixel_count = u64::from(identity.width)
-            .checked_mul(u64::from(identity.height))
-            .and_then(|value| value.checked_mul(4))
-            .ok_or_else(|| anyhow!("decoded image byte count overflow"))?;
+        let staged_bmp_bytes = u64::try_from(dib.len())
+            .ok()
+            .and_then(|value| value.checked_add(14))
+            .ok_or_else(|| anyhow!("staged BMP byte count overflow"))?;
         groups
             .entry(identity.content_hash.clone())
             .or_default()
             .push(ScannedImage {
                 row,
                 source_path,
-                source_len: metadata.len(),
-                decoded_bytes: pixel_count,
+                staged_bmp_bytes,
             });
     }
 
@@ -182,17 +184,18 @@ fn scan_images(
             .first()
             .ok_or_else(|| anyhow!("image migration group is empty"))?;
         if canonical_bmp.exists() {
-            validate_canonical_bmp(&canonical_bmp, content_hash)?;
+            validate_canonical_bmp(blob_dir, &canonical_bmp, content_hash)?;
         }
         if canonical_thumbnail.exists() {
+            validate_regular_managed_file(blob_dir, &canonical_thumbnail)?;
             let expected =
                 crate::blobs::image::decoded_thumbnail_for_hash(&first.source_path, content_hash)?;
             crate::blobs::image::validate_thumbnail(&canonical_thumbnail, &expected)?;
         }
         if !canonical_bmp.exists() || !canonical_thumbnail.exists() {
             temporary_bytes = temporary_bytes
-                .checked_add(first.source_len)
-                .and_then(|value| value.checked_add(first.decoded_bytes))
+                .checked_add(first.staged_bmp_bytes)
+                .and_then(|value| value.checked_add(THUMBNAIL_RESERVATION_BYTES))
                 .ok_or_else(|| anyhow!("temporary image byte count overflow"))?;
         }
     }
@@ -263,7 +266,8 @@ fn prepare_canonical_images(
             );
             install_staged_locked(blob_dir, migration_stage, staged)?;
         }
-        validate_canonical_bmp(&canonical_bmp, &content_hash)?;
+        validate_canonical_bmp(blob_dir, &canonical_bmp, &content_hash)?;
+        validate_regular_managed_file(blob_dir, &canonical_thumbnail)?;
         let expected_thumbnail =
             crate::blobs::image::decoded_thumbnail_for_hash(&canonical_bmp, &content_hash)?;
         crate::blobs::image::validate_thumbnail(&canonical_thumbnail, &expected_thumbnail)?;
@@ -274,10 +278,12 @@ fn prepare_canonical_images(
             .skip(1)
             .map(|image| image.row.id.clone())
             .collect();
-        let mut obsolete_paths = BTreeSet::new();
+        let canonical_identity = managed_path_identity(blob_dir, &canonical_bmp)?;
+        let mut obsolete_paths = BTreeMap::new();
         for image in &images {
-            if image.source_path != canonical_bmp {
-                obsolete_paths.insert(image.source_path.clone());
+            let source_identity = managed_path_identity(blob_dir, &image.source_path)?;
+            if source_identity != canonical_identity {
+                obsolete_paths.insert(source_identity, image.source_path.clone());
             }
         }
         merges.push(ImageMigrationMerge {
@@ -303,7 +309,7 @@ fn prepare_canonical_images(
                 .max()
                 .ok_or_else(|| anyhow!("image group has no sort rank"))?,
             size_bytes: i64::try_from(fs::metadata(&canonical_bmp)?.len()).unwrap_or(i64::MAX),
-            obsolete_paths: obsolete_paths.into_iter().collect(),
+            obsolete_paths: obsolete_paths.into_values().collect(),
         });
     }
     Ok(merges)
@@ -317,13 +323,13 @@ fn cleanup_pending(repository: &Mutex<ClipboardRepository>, blob_dir: &Path) -> 
             repository.active_blob_paths()?,
         )
     };
-    let active_paths = active_paths
-        .into_iter()
-        .flat_map(|path| {
-            let thumbnail = crate::blobs::thumbnail_path_for(&path);
-            [path, thumbnail]
-        })
-        .collect::<HashSet<_>>();
+    let mut active_identities = HashSet::new();
+    for path in active_paths {
+        let thumbnail = crate::blobs::thumbnail_path_for(&path);
+        for active_path in [path, thumbnail] {
+            active_identities.insert(managed_path_identity(blob_dir, &active_path)?);
+        }
+    }
     let mut first_error = None;
     for path in pending_paths {
         let result = (|| {
@@ -332,8 +338,9 @@ fn cleanup_pending(repository: &Mutex<ClipboardRepository>, blob_dir: &Path) -> 
                 "cleanup path outside managed blob directory: {}",
                 path.display()
             );
+            let path_identity = managed_path_identity(blob_dir, &path)?;
             ensure!(
-                !active_paths.contains(&path),
+                !active_identities.contains(&path_identity),
                 "cleanup path is still active: {}",
                 path.display()
             );
@@ -371,6 +378,27 @@ fn cleanup_pending(repository: &Mutex<ClipboardRepository>, blob_dir: &Path) -> 
     Ok(())
 }
 
+fn managed_path_identity(blob_dir: &Path, path: &Path) -> anyhow::Result<String> {
+    ensure!(
+        path.is_absolute() && path.parent() == Some(blob_dir),
+        "managed path outside blob directory: {}",
+        path.display()
+    );
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("managed path has no UTF-8 filename"))?;
+    ensure!(
+        !filename.is_empty() && filename.is_ascii(),
+        "managed filename must be non-empty ASCII"
+    );
+    ensure!(
+        !filename.ends_with(['.', ' ']),
+        "managed filename must not end with a dot or space"
+    );
+    Ok(filename.to_ascii_lowercase())
+}
+
 fn remove_migration_stage(stage_root: &Path) -> anyhow::Result<()> {
     let migration_stage = stage_root.join("legacy-image-dedup-v1");
     match fs::symlink_metadata(&migration_stage) {
@@ -392,15 +420,32 @@ fn remove_migration_stage(stage_root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_canonical_bmp(path: &Path, expected_hash: &str) -> anyhow::Result<()> {
+fn validate_canonical_bmp(blob_dir: &Path, path: &Path, expected_hash: &str) -> anyhow::Result<()> {
+    validate_regular_managed_file(blob_dir, path)?;
+    crate::blobs::image::decoded_thumbnail_for_hash(path, expected_hash).map(|_| ())
+}
+
+fn validate_regular_managed_file(managed_dir: &Path, path: &Path) -> anyhow::Result<()> {
+    managed_path_identity(managed_dir, path)?;
     let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("read canonical image metadata {}", path.display()))?;
+        .with_context(|| format!("read managed file metadata {}", path.display()))?;
     ensure!(
-        metadata.file_type().is_file(),
-        "canonical image is not a regular file: {}",
+        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+        "managed path is not a regular file: {}",
         path.display()
     );
-    crate::blobs::image::decoded_thumbnail_for_hash(path, expected_hash).map(|_| ())
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        ensure!(
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "managed path is a reparse point: {}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn repository_lock(
@@ -443,15 +488,18 @@ fn ensure_backup(
     );
     fs::create_dir_all(backup_path)
         .with_context(|| format!("create migration backup {}", backup_path.display()))?;
-    if backup_path.join(BACKUP_COMPLETE_MARKER).is_file() {
+    validate_backup_directory(database_path, backup_path)?;
+    let marker_path = backup_path.join(BACKUP_COMPLETE_MARKER);
+    if backup_marker_is_complete(&marker_path)? {
         return Ok(());
     }
+    clear_incomplete_backup(database_path, backup_path, &marker_path)?;
 
     repository_lock(repository)?.checkpoint_wal()?;
     let mut sources = vec![database_path.to_path_buf()];
     for suffix in ["-wal", "-shm"] {
         let sidecar = sidecar_path(database_path, suffix);
-        if sidecar.exists() {
+        if io.backup_source_exists(&sidecar) {
             sources.push(sidecar);
         }
     }
@@ -461,26 +509,168 @@ fn ensure_backup(
                 .file_name()
                 .ok_or_else(|| anyhow!("backup source has no filename"))?,
         );
-        io.copy_file(&source, &destination).with_context(|| {
+        validate_backup_source(database_path, &source)?;
+        let temporary = temporary_backup_path(&destination)?;
+        io.copy_file(&source, &temporary).with_context(|| {
             format!(
                 "copy migration backup file {} to {}",
                 source.display(),
+                temporary.display()
+            )
+        })?;
+        validate_regular_backup_file(&temporary)?;
+        OpenOptions::new()
+            .write(true)
+            .open(&temporary)
+            .with_context(|| format!("open copied backup {}", temporary.display()))?
+            .sync_all()
+            .with_context(|| format!("flush copied backup {}", temporary.display()))?;
+        fs::rename(&temporary, &destination).with_context(|| {
+            format!(
+                "publish migration backup {} as {}",
+                temporary.display(),
                 destination.display()
             )
         })?;
-        OpenOptions::new()
-            .write(true)
-            .open(&destination)
-            .with_context(|| format!("open copied backup {}", destination.display()))?
-            .sync_all()
-            .with_context(|| format!("flush copied backup {}", destination.display()))?;
     }
-    let marker_path = backup_path.join(BACKUP_COMPLETE_MARKER);
-    let mut marker = File::create(&marker_path)
-        .with_context(|| format!("create backup marker {}", marker_path.display()))?;
+    let marker_temporary = temporary_backup_path(&marker_path)?;
+    let mut marker = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker_temporary)
+        .with_context(|| format!("create backup marker {}", marker_temporary.display()))?;
     marker.write_all(b"complete\n")?;
     marker.sync_all()?;
+    drop(marker);
+    fs::rename(&marker_temporary, &marker_path).with_context(|| {
+        format!(
+            "publish backup marker {} as {}",
+            marker_temporary.display(),
+            marker_path.display()
+        )
+    })?;
     Ok(())
+}
+
+fn validate_backup_directory(database_path: &Path, backup_path: &Path) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(backup_path)
+        .with_context(|| format!("read backup directory metadata {}", backup_path.display()))?;
+    ensure!(
+        metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+        "migration backup directory is not a regular directory"
+    );
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        ensure!(
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "migration backup directory is a reparse point"
+        );
+    }
+    let database_parent = database_path
+        .parent()
+        .ok_or_else(|| anyhow!("database path has no parent"))?
+        .canonicalize()?;
+    let resolved_backup = backup_path.canonicalize()?;
+    ensure!(
+        resolved_backup.parent() == Some(database_parent.as_path()),
+        "migration backup directory resolves outside database directory"
+    );
+    Ok(())
+}
+
+fn backup_marker_is_complete(marker_path: &Path) -> anyhow::Result<bool> {
+    match fs::symlink_metadata(marker_path) {
+        Ok(_) => {
+            validate_regular_backup_file(marker_path)?;
+            Ok(fs::read(marker_path)? == b"complete\n")
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn clear_incomplete_backup(
+    database_path: &Path,
+    backup_path: &Path,
+    marker_path: &Path,
+) -> anyhow::Result<()> {
+    let mut targets = vec![database_path.to_path_buf()];
+    targets.extend(
+        ["-wal", "-shm"]
+            .into_iter()
+            .map(|suffix| sidecar_path(database_path, suffix)),
+    );
+    let mut backup_entries = Vec::with_capacity(8);
+    for target in targets {
+        let destination = backup_path.join(
+            target
+                .file_name()
+                .ok_or_else(|| anyhow!("backup target has no filename"))?,
+        );
+        backup_entries.push(temporary_backup_path(&destination)?);
+        backup_entries.push(destination);
+    }
+    backup_entries.push(temporary_backup_path(marker_path)?);
+    backup_entries.push(marker_path.to_path_buf());
+    for entry in backup_entries {
+        remove_incomplete_backup_file(&entry)?;
+    }
+    Ok(())
+}
+
+fn remove_incomplete_backup_file(path: &Path) -> anyhow::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            validate_regular_backup_file(path)?;
+            fs::remove_file(path)
+                .with_context(|| format!("remove incomplete backup {}", path.display()))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn validate_backup_source(database_path: &Path, source: &Path) -> anyhow::Result<()> {
+    ensure!(
+        source.is_absolute() && source.parent() == database_path.parent(),
+        "migration backup source is not a database sibling"
+    );
+    validate_regular_backup_file(source)
+}
+
+fn validate_regular_backup_file(path: &Path) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("read backup file metadata {}", path.display()))?;
+    ensure!(
+        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+        "migration backup entry is not a regular file: {}",
+        path.display()
+    );
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        ensure!(
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "migration backup entry is a reparse point: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn temporary_backup_path(destination: &Path) -> anyhow::Result<PathBuf> {
+    let filename = destination
+        .file_name()
+        .ok_or_else(|| anyhow!("backup destination has no filename"))?;
+    let mut temporary_name = OsString::from(filename);
+    temporary_name.push(".tmp");
+    Ok(destination.with_file_name(temporary_name))
 }
 
 fn sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
@@ -512,7 +702,10 @@ mod tests {
     use crate::blobs::store::ImageBlobStore;
     use crate::storage::repository::ClipboardRepository;
 
-    use super::{run_image_migration_with, MigrationIo, IMAGE_MIGRATION_NAME, IMAGE_QUOTA_BYTES};
+    use super::{
+        run_image_migration_with, MigrationIo, BACKUP_COMPLETE_MARKER, IMAGE_MIGRATION_NAME,
+        IMAGE_QUOTA_BYTES,
+    };
 
     struct TestIo {
         free_space: u64,
@@ -549,6 +742,50 @@ mod tests {
 
         fn quota_bytes(&self) -> u64 {
             self.quota_bytes
+        }
+    }
+
+    struct NthCopyFailureIo {
+        copy_count: Cell<usize>,
+        fail_at: usize,
+    }
+
+    impl MigrationIo for NthCopyFailureIo {
+        fn available_space(&self, _path: &Path) -> anyhow::Result<u64> {
+            Ok(u64::MAX)
+        }
+
+        fn copy_file(&self, from: &Path, to: &Path) -> anyhow::Result<u64> {
+            let attempt = self.copy_count.get() + 1;
+            self.copy_count.set(attempt);
+            if attempt == self.fail_at {
+                return Err(anyhow!("injected copy #{attempt} failure"));
+            }
+            Ok(fs::copy(from, to)?)
+        }
+
+        fn quota_bytes(&self) -> u64 {
+            IMAGE_QUOTA_BYTES
+        }
+    }
+
+    struct RetryWithoutWalIo;
+
+    impl MigrationIo for RetryWithoutWalIo {
+        fn available_space(&self, _path: &Path) -> anyhow::Result<u64> {
+            Ok(u64::MAX)
+        }
+
+        fn copy_file(&self, from: &Path, to: &Path) -> anyhow::Result<u64> {
+            Ok(fs::copy(from, to)?)
+        }
+
+        fn backup_source_exists(&self, path: &Path) -> bool {
+            !path.to_string_lossy().ends_with("-wal") && path.exists()
+        }
+
+        fn quota_bytes(&self) -> u64 {
+            IMAGE_QUOTA_BYTES
         }
     }
 
@@ -844,6 +1081,76 @@ mod tests {
     }
 
     #[test]
+    fn partial_backup_retry_removes_stale_sidecars_before_marking_complete() {
+        let fixture = Fixture::new("backup-stale-sidecar");
+        let wal_path = PathBuf::from(format!("{}-wal", fixture.database_path.display()));
+        let shm_path = PathBuf::from(format!("{}-shm", fixture.database_path.display()));
+        assert!(wal_path.is_file(), "test requires an existing WAL");
+        assert!(shm_path.is_file(), "test requires an existing SHM");
+        let failing = NthCopyFailureIo {
+            copy_count: Cell::new(0),
+            fail_at: 3,
+        };
+
+        run_image_migration_with(&fixture.repository, &fixture.store, &failing)
+            .expect_err("third backup copy must fail");
+        assert_eq!(failing.copy_count.get(), 3);
+        let (state, backup_path) = fixture.migration_state();
+        assert_eq!(state, "pending");
+        let backup_wal = backup_path.join(wal_path.file_name().expect("WAL filename"));
+        assert!(
+            backup_wal.is_file(),
+            "partial backup must contain stale WAL"
+        );
+        assert!(!backup_path.join(BACKUP_COMPLETE_MARKER).exists());
+
+        run_image_migration_with(&fixture.repository, &fixture.store, &RetryWithoutWalIo)
+            .expect("backup retry");
+
+        assert_eq!(fixture.migration_state().1, backup_path);
+        assert!(!backup_wal.exists(), "stale backup WAL survived retry");
+        assert!(backup_path.join(BACKUP_COMPLETE_MARKER).is_file());
+        assert!(fs::read_dir(&backup_path)
+            .expect("backup entries")
+            .all(|entry| !entry
+                .expect("backup entry")
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn backup_retry_rejects_symlinked_backup_directory_without_writing_target() {
+        use std::os::windows::fs::symlink_dir;
+
+        let fixture = Fixture::new("backup-dir-symlink");
+        let failing = TestIo {
+            free_space: u64::MAX,
+            quota_bytes: IMAGE_QUOTA_BYTES,
+            fail_next_copy: Cell::new(true),
+            forbid_copy: false,
+        };
+        run_image_migration_with(&fixture.repository, &fixture.store, &failing)
+            .expect_err("initial backup must fail");
+        let (_, backup_path) = fixture.migration_state();
+        fs::remove_dir_all(&backup_path).expect("remove reserved backup directory");
+        let external_target = fixture.root.join("backup-escape-target");
+        fs::create_dir(&external_target).expect("external target");
+        symlink_dir(&external_target, &backup_path).expect("backup directory symlink");
+
+        let error = run_image_migration_with(&fixture.repository, &fixture.store, &TestIo::real())
+            .expect_err("symlinked backup directory must be rejected");
+
+        assert!(format!("{error:#}").contains("backup directory"));
+        assert_eq!(fixture.migration_state().0, "pending");
+        assert!(fs::read_dir(&external_target)
+            .expect("external target entries")
+            .next()
+            .is_none());
+    }
+
+    #[test]
     fn completed_migration_does_not_repeat_backup() {
         let fixture = Fixture::new("complete");
         run_image_migration_with(&fixture.repository, &fixture.store, &TestIo::real())
@@ -913,6 +1220,43 @@ mod tests {
     }
 
     #[test]
+    fn free_space_preflight_reserves_thumbnail_bytes_before_staging() {
+        let fixture = Fixture::new("thumbnail-reservation");
+        let dib = Fixture::dib32(40, [8, 7, 6, 255]);
+        let content_hash = image_identity_from_dib(&dib)
+            .expect("image identity")
+            .content_hash;
+        let legacy = fixture.write_legacy_bmp("legacy.bmp", dib);
+        fixture.insert_image_row("legacy", &legacy, 1, 2, 2, false, false);
+        let between_old_and_safe_estimates = TestIo {
+            free_space: 1024,
+            quota_bytes: IMAGE_QUOTA_BYTES,
+            fail_next_copy: Cell::new(false),
+            forbid_copy: false,
+        };
+
+        let error = run_image_migration_with(
+            &fixture.repository,
+            &fixture.store,
+            &between_old_and_safe_estimates,
+        )
+        .expect_err("thumbnail reservation must fail preflight");
+
+        assert!(format!("{error:#}").contains("insufficient"));
+        assert!(!fixture
+            .store
+            .blob_dir()
+            .join(format!("{content_hash}.bmp"))
+            .exists());
+        assert!(!fixture
+            .store
+            .stage_dir()
+            .join("legacy-image-dedup-v1")
+            .exists());
+        assert_eq!(fixture.migration_state().0, "pending");
+    }
+
+    #[test]
     fn corrupted_existing_canonical_stops_with_references_unchanged() {
         let fixture = Fixture::new("corrupt-canonical");
         let expected_hash = image_identity_from_dib(&Fixture::dib32(40, [1, 2, 3, 255]))
@@ -964,6 +1308,85 @@ mod tests {
             format!("image:{second_hash}")
         );
         assert_eq!(fixture.row_reference("second").1, Some(second_hash));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_case_alias_is_not_deleted_after_becoming_active_canonical_path() {
+        let fixture = Fixture::new("case-alias");
+        let dib = Fixture::dib32(40, [4, 5, 6, 255]);
+        let content_hash = image_identity_from_dib(&dib)
+            .expect("identity")
+            .content_hash;
+        let uppercase_name = format!("{}.BMP", content_hash.to_ascii_uppercase());
+        let uppercase_path = fixture.write_legacy_bmp(&uppercase_name, dib);
+        fixture.insert_image_row("alias", &uppercase_path, 1, 2, 2, false, false);
+
+        run_image_migration_with(&fixture.repository, &fixture.store, &TestIo::real())
+            .expect("case alias migration");
+
+        let canonical = fixture.store.blob_dir().join(format!("{content_hash}.bmp"));
+        assert!(canonical.is_file(), "active canonical alias was deleted");
+        assert_eq!(
+            fixture.row_reference("alias").2,
+            canonical.to_string_lossy()
+        );
+        assert!(fixture.cleanup_paths().is_empty());
+    }
+
+    #[test]
+    fn managed_path_identity_rejects_windows_trailing_dot_and_space_aliases() {
+        let fixture = Fixture::new("path-identity-tail");
+
+        for filename in ["legacy.bmp.", "legacy.bmp "] {
+            assert!(
+                super::managed_path_identity(
+                    fixture.store.blob_dir(),
+                    &fixture.store.blob_dir().join(filename)
+                )
+                .is_err(),
+                "accepted {filename}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn external_thumbnail_symlink_is_rejected_before_database_changes() {
+        use std::os::windows::fs::symlink_file;
+
+        let fixture = Fixture::new("thumbnail-symlink");
+        let dib = Fixture::dib32(40, [7, 6, 5, 255]);
+        let content_hash = image_identity_from_dib(&dib)
+            .expect("identity")
+            .content_hash;
+        let canonical = fixture.write_legacy_bmp(&format!("{content_hash}.bmp"), dib.clone());
+        fixture.insert_image_row("canonical", &canonical, 1, 2, 2, false, false);
+        let before = fixture.row_reference("canonical");
+
+        let outside_dir = fixture.root.join("outside");
+        fs::create_dir(&outside_dir).expect("outside directory");
+        let staged = stage_dib(fixture.store.stage_dir(), dib).expect("external thumbnail stage");
+        let external_thumbnail = outside_dir.join("valid.png");
+        fs::copy(staged.thumbnail_path(), &external_thumbnail).expect("external thumbnail");
+        fs::remove_dir_all(staged.stage_dir()).expect("remove thumbnail stage");
+        let external_before = fs::read(&external_thumbnail).expect("external bytes");
+        let thumbnail_alias = fixture
+            .store
+            .blob_dir()
+            .join(format!("{content_hash}.thumb.png"));
+        symlink_file(&external_thumbnail, &thumbnail_alias).expect("thumbnail symlink");
+
+        let error = run_image_migration_with(&fixture.repository, &fixture.store, &TestIo::real())
+            .expect_err("external thumbnail symlink must stop migration");
+
+        assert!(format!("{error:#}").contains("regular file"));
+        assert_eq!(fixture.row_reference("canonical"), before);
+        assert_eq!(fixture.migration_state().0, "pending");
+        assert_eq!(
+            fs::read(&external_thumbnail).expect("external target after migration"),
+            external_before
+        );
     }
 
     #[test]
