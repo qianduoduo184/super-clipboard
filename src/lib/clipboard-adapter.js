@@ -5,6 +5,10 @@ export function mapBackendCapacityStatus(status) {
   return {
     blocked,
     message: blocked ? String(status?.message ?? '') : '',
+    requiredAdditional:
+      blocked && Number.isSafeInteger(status?.required_additional)
+        ? status.required_additional
+        : 0,
     revision: Number.isSafeInteger(status?.revision) ? status.revision : 0,
   };
 }

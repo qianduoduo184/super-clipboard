@@ -40,7 +40,7 @@ fn initialize_startup_capacity_status(
     state: &Mutex<storage::capacity::ClipboardCapacityStatus>,
     capacity: StartupCapacityState,
 ) -> anyhow::Result<storage::capacity::ClipboardCapacityStatus> {
-    storage::capacity::update_capacity_status_with(state, capacity.blocked, |_| Ok(()))
+    storage::capacity::update_capacity_status_with(state, capacity.blocked, 0, |_| Ok(()))
 }
 
 fn run_startup_capacity_then<T>(
@@ -336,9 +336,7 @@ mod startup_capacity_tests {
             .expect("startup orphan")
             .set_len(crate::storage::capacity::MANAGED_BLOB_QUOTA + 1)
             .expect("sparse startup orphan");
-        let status_state = Mutex::new(
-            crate::storage::capacity::ClipboardCapacityStatus::default(),
-        );
+        let status_state = Mutex::new(crate::storage::capacity::ClipboardCapacityStatus::default());
 
         run_startup_capacity_then(
             &repository,
@@ -347,8 +345,7 @@ mod startup_capacity_tests {
             30,
             |_| {},
             |capacity| {
-                let initialized =
-                    initialize_startup_capacity_status(&status_state, capacity)?;
+                let initialized = initialize_startup_capacity_status(&status_state, capacity)?;
                 assert!(initialized.blocked);
                 assert_eq!(initialized.revision, 1);
                 assert_eq!(

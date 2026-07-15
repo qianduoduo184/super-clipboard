@@ -23,6 +23,7 @@ pub const CAPACITY_STATUS_MESSAGE: &str =
 pub struct ClipboardCapacityStatus {
     pub blocked: bool,
     pub message: String,
+    pub required_additional: u64,
     pub revision: u64,
 }
 
@@ -38,28 +39,34 @@ pub fn current_capacity_status(
 pub fn update_capacity_status_with(
     state: &Mutex<ClipboardCapacityStatus>,
     blocked: bool,
+    required_additional: u64,
     emit: impl FnOnce(&ClipboardCapacityStatus) -> anyhow::Result<()>,
 ) -> anyhow::Result<ClipboardCapacityStatus> {
+    let required_additional = if blocked { required_additional } else { 0 };
+    let message = if blocked {
+        CAPACITY_STATUS_MESSAGE.to_string()
+    } else {
+        String::new()
+    };
     let next = {
         let mut current = state
             .lock()
             .map_err(|error| anyhow!("clipboard capacity status lock poisoned: {error}"))?;
-        if current.blocked == blocked {
-            return Ok(current.clone());
+        if current.blocked != blocked
+            || current.message != message
+            || current.required_additional != required_additional
+        {
+            let revision = current
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("clipboard capacity status revision overflow"))?;
+            *current = ClipboardCapacityStatus {
+                blocked,
+                message,
+                required_additional,
+                revision,
+            };
         }
-        let revision = current
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("clipboard capacity status revision overflow"))?;
-        *current = ClipboardCapacityStatus {
-            blocked,
-            message: if blocked {
-                CAPACITY_STATUS_MESSAGE.to_string()
-            } else {
-                String::new()
-            },
-            revision,
-        };
         current.clone()
     };
     emit(&next)?;
@@ -70,10 +77,11 @@ pub fn publish_capacity_status(
     app_handle: &tauri::AppHandle,
     state: &Mutex<ClipboardCapacityStatus>,
     blocked: bool,
+    required_additional: u64,
 ) -> anyhow::Result<ClipboardCapacityStatus> {
     use tauri::Emitter;
 
-    update_capacity_status_with(state, blocked, |status| {
+    update_capacity_status_with(state, blocked, required_additional, |status| {
         app_handle
             .emit("clipboard-status", status)
             .map_err(Into::into)
@@ -85,11 +93,113 @@ pub fn clear_capacity_status_if_recovered(
     state: &Mutex<ClipboardCapacityStatus>,
     image_store: &ImageBlobStore,
 ) -> anyhow::Result<ClipboardCapacityStatus> {
-    if image_store.managed_usage()? <= MANAGED_BLOB_QUOTA {
-        publish_capacity_status(app_handle, state, false)
+    use tauri::Emitter;
+
+    clear_capacity_status_if_recovered_with(state, image_store, |status| {
+        app_handle
+            .emit("clipboard-status", status)
+            .map_err(Into::into)
+    })
+}
+
+pub(crate) fn clear_capacity_status_if_recovered_with(
+    state: &Mutex<ClipboardCapacityStatus>,
+    image_store: &ImageBlobStore,
+    emit: impl FnOnce(&ClipboardCapacityStatus) -> anyhow::Result<()>,
+) -> anyhow::Result<ClipboardCapacityStatus> {
+    clear_capacity_status_if_recovered_using(state, image_store, managed_usage, emit)
+}
+
+fn clear_capacity_status_if_recovered_using(
+    state: &Mutex<ClipboardCapacityStatus>,
+    image_store: &ImageBlobStore,
+    measure_usage: impl FnOnce(&Path) -> anyhow::Result<u64>,
+    emit: impl FnOnce(&ClipboardCapacityStatus) -> anyhow::Result<()>,
+) -> anyhow::Result<ClipboardCapacityStatus> {
+    image_store.with_read(|blob_dir| {
+        let current = current_capacity_status(state)?;
+        if !current.blocked {
+            return republish_capacity_status_if_unchanged_with(state, &current, emit);
+        }
+        let usage = measure_usage(blob_dir)?;
+        if capacity_fits(usage, current.required_additional, MANAGED_BLOB_QUOTA)? {
+            clear_capacity_status_if_unchanged_with(state, &current, emit)
+        } else {
+            Ok(current)
+        }
+    })
+}
+
+fn republish_capacity_status_if_unchanged_with(
+    state: &Mutex<ClipboardCapacityStatus>,
+    expected: &ClipboardCapacityStatus,
+    emit: impl FnOnce(&ClipboardCapacityStatus) -> anyhow::Result<()>,
+) -> anyhow::Result<ClipboardCapacityStatus> {
+    let current = current_capacity_status(state)?;
+    if current != *expected {
+        return Ok(current);
+    }
+    emit(&current)?;
+    Ok(current)
+}
+
+fn clear_capacity_status_if_unchanged_with(
+    state: &Mutex<ClipboardCapacityStatus>,
+    expected: &ClipboardCapacityStatus,
+    emit: impl FnOnce(&ClipboardCapacityStatus) -> anyhow::Result<()>,
+) -> anyhow::Result<ClipboardCapacityStatus> {
+    let next = {
+        let mut current = state
+            .lock()
+            .map_err(|error| anyhow!("clipboard capacity status lock poisoned: {error}"))?;
+        if !current.blocked
+            || current.revision != expected.revision
+            || current.required_additional != expected.required_additional
+        {
+            return Ok(current.clone());
+        }
+        let revision = current
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("clipboard capacity status revision overflow"))?;
+        *current = ClipboardCapacityStatus {
+            blocked: false,
+            message: String::new(),
+            required_additional: 0,
+            revision,
+        };
+        current.clone()
+    };
+    emit(&next)?;
+    Ok(next)
+}
+
+pub(crate) fn clear_capacity_status_after_image_capture_with(
+    state: &Mutex<ClipboardCapacityStatus>,
+    image_store: &ImageBlobStore,
+    created: bool,
+    emit: impl FnOnce(&ClipboardCapacityStatus) -> anyhow::Result<()>,
+) -> anyhow::Result<ClipboardCapacityStatus> {
+    if created {
+        clear_capacity_status_if_recovered_with(state, image_store, emit)
     } else {
         current_capacity_status(state)
     }
+}
+
+pub fn clear_capacity_status_after_image_capture(
+    app_handle: &tauri::AppHandle,
+    state: &Mutex<ClipboardCapacityStatus>,
+    image_store: &ImageBlobStore,
+    created: bool,
+) -> anyhow::Result<ClipboardCapacityStatus> {
+    use tauri::Emitter;
+
+    clear_capacity_status_after_image_capture_with(state, image_store, created, |status| {
+        app_handle
+            .emit("clipboard-status", status)
+            .map_err(Into::into)
+    })
 }
 
 #[derive(Debug)]
@@ -158,6 +268,12 @@ pub struct CapacityError {
     usage: u64,
     additional: u64,
     quota: u64,
+}
+
+impl CapacityError {
+    pub fn required_additional(&self) -> u64 {
+        self.additional
+    }
 }
 
 impl std::fmt::Display for CapacityError {
@@ -504,9 +620,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        build_capacity_prune_plan, capture_reservation, current_capacity_status, exact_bmp_size,
-        managed_usage, prune_for_capacity_with_quota, update_capacity_status_with,
-        ClipboardCapacityStatus, PruneThrottle,
+        build_capacity_prune_plan, capture_reservation,
+        clear_capacity_status_after_image_capture_with, clear_capacity_status_if_recovered_using,
+        clear_capacity_status_if_recovered_with, current_capacity_status, exact_bmp_size,
+        managed_usage, prune_for_capacity_with_quota, republish_capacity_status_if_unchanged_with,
+        update_capacity_status_with, ClipboardCapacityStatus, PruneThrottle, MANAGED_BLOB_QUOTA,
     };
     use crate::blobs::store::ImageBlobStore;
     use crate::clipboard::types::{ClipboardItemDraft, ClipboardItemType};
@@ -804,10 +922,7 @@ mod tests {
         repository
             .lock()
             .expect("repository lock")
-            .update_image_references_and_enqueue_cleanup(
-                &[],
-                &[pending_bmp.clone(), absent],
-            )
+            .update_image_references_and_enqueue_cleanup(&[], &[pending_bmp.clone(), absent])
             .expect("enqueue pending cleanup");
 
         let usage = prune_for_capacity_with_quota(&repository, &store, 0, 0, 6, 6)
@@ -832,7 +947,7 @@ mod tests {
         let state = Mutex::new(ClipboardCapacityStatus::default());
         let emitted = std::cell::RefCell::new(Vec::new());
 
-        let blocked = update_capacity_status_with(&state, true, |status| {
+        let blocked = update_capacity_status_with(&state, true, 7, |status| {
             emitted.borrow_mut().push(status.clone());
             Ok(())
         })
@@ -840,17 +955,28 @@ mod tests {
 
         assert!(blocked.blocked);
         assert!(!blocked.message.is_empty());
+        assert_eq!(blocked.required_additional, 7);
         assert_eq!(blocked.revision, 1);
         assert_eq!(current_capacity_status(&state).expect("query"), blocked);
         assert_eq!(&*emitted.borrow(), &[blocked.clone()]);
 
-        let unchanged = update_capacity_status_with(&state, true, |_| {
-            panic!("unchanged status must not emit")
+        let unchanged = update_capacity_status_with(&state, true, 7, |status| {
+            emitted.borrow_mut().push(status.clone());
+            Ok(())
         })
         .expect("unchanged status");
         assert_eq!(unchanged.revision, 1);
+        assert_eq!(emitted.borrow().len(), 2);
 
-        let cleared = update_capacity_status_with(&state, false, |status| {
+        let changed_requirement = update_capacity_status_with(&state, true, 8, |status| {
+            emitted.borrow_mut().push(status.clone());
+            Ok(())
+        })
+        .expect("changed requirement");
+        assert_eq!(changed_requirement.required_additional, 8);
+        assert_eq!(changed_requirement.revision, 2);
+
+        let cleared = update_capacity_status_with(&state, false, 0, |status| {
             emitted.borrow_mut().push(status.clone());
             Ok(())
         })
@@ -858,9 +984,243 @@ mod tests {
 
         assert!(!cleared.blocked);
         assert!(cleared.message.is_empty());
+        assert_eq!(cleared.required_additional, 0);
+        assert_eq!(cleared.revision, 3);
+        assert_eq!(
+            current_capacity_status(&state).expect("query clear"),
+            cleared
+        );
+        assert_eq!(emitted.borrow().len(), 4);
+    }
+
+    #[test]
+    fn unchanged_capacity_status_retries_emit_after_sink_failure() {
+        let state = Mutex::new(ClipboardCapacityStatus::default());
+        let calls = std::cell::Cell::new(0);
+
+        update_capacity_status_with(&state, true, 13, |_| {
+            calls.set(calls.get() + 1);
+            Err(anyhow::anyhow!("injected emit failure"))
+        })
+        .expect_err("first emit must fail");
+        let persisted = current_capacity_status(&state).expect("persisted after failure");
+        assert!(persisted.blocked);
+        assert_eq!(persisted.required_additional, 13);
+        assert_eq!(persisted.revision, 1);
+
+        let retried = update_capacity_status_with(&state, true, 13, |_| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        })
+        .expect("retry same status");
+
+        assert_eq!(calls.get(), 2);
+        assert_eq!(retried.revision, 1);
+        assert_eq!(
+            current_capacity_status(&state).expect("query retry"),
+            retried
+        );
+    }
+
+    #[test]
+    fn recovery_retries_unchanged_clear_after_sink_failure() {
+        let root = temp_dir("status-clear-retry");
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let state = Mutex::new(ClipboardCapacityStatus::default());
+        update_capacity_status_with(&state, true, 1, |_| Ok(())).expect("blocked status");
+        let calls = std::cell::Cell::new(0);
+
+        clear_capacity_status_if_recovered_with(&state, &store, |_| {
+            calls.set(calls.get() + 1);
+            Err(anyhow::anyhow!("injected clear emit failure"))
+        })
+        .expect_err("first clear emit must fail");
+        let persisted = current_capacity_status(&state).expect("persisted clear");
+        assert!(!persisted.blocked);
+        assert_eq!(persisted.revision, 2);
+
+        let retried = clear_capacity_status_if_recovered_with(&state, &store, |_| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        })
+        .expect("retry clear");
+
+        assert_eq!(calls.get(), 2);
+        assert_eq!(retried, persisted);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn clear_retry_does_not_overwrite_newer_failure_publish() {
+        let state = Mutex::new(ClipboardCapacityStatus::default());
+        update_capacity_status_with(&state, true, 1, |_| Ok(())).expect("initial failure");
+        let recovered =
+            update_capacity_status_with(&state, false, 0, |_| Ok(())).expect("recovered status");
+        assert_eq!(recovered.revision, 2);
+        let recovered_snapshot = current_capacity_status(&state).expect("recovered snapshot");
+        let failed = update_capacity_status_with(&state, true, 3, |_| Ok(()))
+            .expect("newer failure publish");
+        let calls = std::cell::Cell::new(0);
+
+        let current =
+            republish_capacity_status_if_unchanged_with(&state, &recovered_snapshot, |_| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .expect("stale clear retry");
+
+        assert_eq!(calls.get(), 0);
+        assert_eq!(current, failed);
+        assert!(current.blocked);
+        assert_eq!(current.required_additional, 3);
+        assert_eq!(current.revision, 3);
+        assert_eq!(
+            current_capacity_status(&state).expect("final status"),
+            failed
+        );
+    }
+
+    #[test]
+    fn delayed_failure_publish_prevents_stale_recovery_clear() {
+        let root = temp_dir("status-delayed-failure");
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let state = Mutex::new(ClipboardCapacityStatus::default());
+        update_capacity_status_with(&state, true, 1, |_| Ok(())).expect("initial failure");
+
+        let recovered = clear_capacity_status_if_recovered_using(
+            &state,
+            &store,
+            |_| {
+                update_capacity_status_with(&state, true, 2, |_| Ok(()))
+                    .expect("delayed newer failure publish");
+                Ok(0)
+            },
+            |_| panic!("stale recovery must not emit clear"),
+        )
+        .expect("stale recovery check");
+
+        assert!(recovered.blocked);
+        assert_eq!(recovered.required_additional, 2);
+        assert_eq!(recovered.revision, 2);
+        assert_eq!(
+            current_capacity_status(&state).expect("final status"),
+            recovered
+        );
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn recovery_requires_usage_plus_failed_additional_to_fit() {
+        let root = temp_dir("status-required");
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let filler = store.blob_dir().join("filler.tmp");
+        let file = fs::File::create(&filler).expect("filler");
+        file.set_len(MANAGED_BLOB_QUOTA).expect("sparse filler");
+        let state = Mutex::new(ClipboardCapacityStatus::default());
+        update_capacity_status_with(&state, true, 1, |_| Ok(())).expect("blocked status");
+
+        let still_blocked = clear_capacity_status_if_recovered_with(&state, &store, |_| {
+            panic!("exact quota plus required bytes must not clear")
+        })
+        .expect("recovery check");
+        assert!(still_blocked.blocked);
+        assert_eq!(still_blocked.required_additional, 1);
+
+        let text_delete_did_not_help =
+            clear_capacity_status_if_recovered_with(&state, &store, |_| {
+                panic!("text-only delete must not clear blob capacity")
+            })
+            .expect("text delete recovery check");
+        assert!(text_delete_did_not_help.blocked);
+
+        file.set_len(MANAGED_BLOB_QUOTA - 1)
+            .expect("release enough bytes");
+        let cleared = clear_capacity_status_if_recovered_with(&state, &store, |_| Ok(()))
+            .expect("clear after release");
+        assert!(!cleared.blocked);
+        assert_eq!(cleared.required_additional, 0);
         assert_eq!(cleared.revision, 2);
-        assert_eq!(current_capacity_status(&state).expect("query clear"), cleared);
-        assert_eq!(emitted.borrow().len(), 2);
+        drop(file);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn duplicate_image_success_does_not_clear_failed_capacity_status() {
+        let root = temp_dir("status-duplicate");
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let state = Mutex::new(ClipboardCapacityStatus::default());
+        update_capacity_status_with(&state, true, 1, |_| Ok(())).expect("blocked status");
+
+        let unchanged =
+            clear_capacity_status_after_image_capture_with(&state, &store, false, |_| {
+                panic!("duplicate touch must not clear or emit")
+            })
+            .expect("duplicate status");
+
+        assert!(unchanged.blocked);
+        assert_eq!(unchanged.revision, 1);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn recovery_update_holds_store_lease_before_later_failure_publish() {
+        use std::sync::{mpsc, Arc};
+        use std::thread;
+        use std::time::Duration;
+
+        let root = temp_dir("status-race");
+        let store =
+            Arc::new(ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store"));
+        let state = Arc::new(Mutex::new(ClipboardCapacityStatus::default()));
+        update_capacity_status_with(&state, true, 1, |_| Ok(())).expect("blocked status");
+        let (clear_updated_tx, clear_updated_rx) = mpsc::channel();
+        let (release_clear_tx, release_clear_rx) = mpsc::channel();
+        let clear_store = Arc::clone(&store);
+        let clear_state = Arc::clone(&state);
+        let clear_thread = thread::spawn(move || {
+            clear_capacity_status_if_recovered_with(&clear_state, &clear_store, |status| {
+                assert!(!status.blocked);
+                clear_updated_tx.send(()).expect("clear updated");
+                release_clear_rx.recv().expect("release clear");
+                Ok(())
+            })
+        });
+        clear_updated_rx.recv().expect("clear reached update");
+
+        let (writer_entered_tx, writer_entered_rx) = mpsc::channel();
+        let writer_store = Arc::clone(&store);
+        let writer = thread::spawn(move || {
+            writer_store.with_write(|_, _| {
+                writer_entered_tx.send(()).expect("writer entered");
+                Ok(())
+            })
+        });
+        assert!(writer_entered_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+        release_clear_tx.send(()).expect("release clear");
+        clear_thread.join().expect("clear thread").expect("clear");
+        writer_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("writer entered after clear");
+        writer.join().expect("writer thread").expect("writer");
+
+        let failed = update_capacity_status_with(&state, true, 2, |_| Ok(()))
+            .expect("later failure publish");
+        assert!(failed.blocked);
+        assert_eq!(failed.required_additional, 2);
+        assert_eq!(failed.revision, 3);
+        assert_eq!(
+            current_capacity_status(&state).expect("final query"),
+            failed
+        );
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

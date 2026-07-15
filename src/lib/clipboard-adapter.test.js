@@ -22,12 +22,22 @@ const {
 
 test('capacity status maps snake_case backend payload', () => {
   assert.deepEqual(
-    mapBackendCapacityStatus({ blocked: true, message: '存储空间已满', revision: 7 }),
-    { blocked: true, message: '存储空间已满', revision: 7 },
+    mapBackendCapacityStatus({
+      blocked: true,
+      message: '存储空间已满',
+      required_additional: 11,
+      revision: 7,
+    }),
+    { blocked: true, message: '存储空间已满', requiredAdditional: 11, revision: 7 },
   );
   assert.deepEqual(
-    mapBackendCapacityStatus({ blocked: false, message: 'stale', revision: 8 }),
-    { blocked: false, message: '', revision: 8 },
+    mapBackendCapacityStatus({
+      blocked: false,
+      message: 'stale',
+      required_additional: 11,
+      revision: 8,
+    }),
+    { blocked: false, message: '', requiredAdditional: 0, revision: 8 },
   );
 });
 

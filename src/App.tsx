@@ -190,6 +190,7 @@ export default function App() {
   const [capacityStatus, setCapacityStatus] = useState<ClipboardCapacityStatus>({
     blocked: false,
     message: '',
+    requiredAdditional: 0,
     revision: -1,
   });
   const [refreshVersion, setRefreshVersion] = useState(0);

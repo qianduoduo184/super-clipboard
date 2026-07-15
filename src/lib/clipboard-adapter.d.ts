@@ -22,10 +22,16 @@ export type BackendClipboardItem = BackendClipboardItemDetail;
 export type BackendClipboardCapacityStatus = {
   blocked: boolean;
   message: string;
+  required_additional: number;
   revision: number;
 };
 
-export type ClipboardCapacityStatus = BackendClipboardCapacityStatus;
+export type ClipboardCapacityStatus = {
+  blocked: boolean;
+  message: string;
+  requiredAdditional: number;
+  revision: number;
+};
 
 export type ViewClipboardItem = {
   id: string;

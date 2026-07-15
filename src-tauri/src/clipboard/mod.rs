@@ -444,14 +444,14 @@ pub fn start_background_listener(
             );
             match result {
                 Err(error) => {
-                    if error
-                        .downcast_ref::<crate::storage::capacity::CapacityError>()
-                        .is_some()
+                    if let Some(capacity_error) =
+                        error.downcast_ref::<crate::storage::capacity::CapacityError>()
                     {
                         if let Err(status_error) = crate::storage::capacity::publish_capacity_status(
                             &app_handle,
                             &capacity_status,
                             true,
+                            capacity_error.required_additional(),
                         ) {
                             crate::diagnostics::warn(format!(
                                 "clipboard: failed to publish capacity status: {status_error}"
@@ -465,10 +465,11 @@ pub fn start_background_listener(
                 Ok(outcome) => {
                     if outcome.image {
                         if let Err(status_error) =
-                            crate::storage::capacity::clear_capacity_status_if_recovered(
+                            crate::storage::capacity::clear_capacity_status_after_image_capture(
                                 &app_handle,
                                 &capacity_status,
                                 &image_store,
+                                outcome.created,
                             )
                         {
                             crate::diagnostics::warn(format!(
