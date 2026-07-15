@@ -106,8 +106,35 @@ impl ImageBlobStore {
         }
     }
 
+    pub fn install_staged_with_preflight<T>(
+        &self,
+        staged: StagedImage,
+        preflight: impl FnOnce(&Path, &StagedImage) -> anyhow::Result<()>,
+        persist: impl FnOnce(&InstalledImage) -> anyhow::Result<T>,
+        is_referenced: impl FnOnce(&InstalledImage) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<T> {
+        let _lease = self.write_lease()?;
+        if let Err(error) = preflight(&self.blob_dir, &staged) {
+            return Err(match discard_staged_locked(&self.stage_dir, &staged) {
+                Ok(()) => error,
+                Err(cleanup_error) => anyhow!(
+                    "{error:#}; additionally failed to remove rejected stage: {cleanup_error:#}"
+                ),
+            });
+        }
+        let installed = install_staged_locked(&self.blob_dir, &self.stage_dir, staged)?;
+        match persist(&installed) {
+            Ok(value) => Ok(value),
+            Err(persist_error) => Err(clean_after_persist_failure(
+                &installed,
+                persist_error,
+                is_referenced,
+            )),
+        }
+    }
+
     pub fn managed_usage(&self) -> anyhow::Result<u64> {
-        self.with_read(managed_usage)
+        self.with_read(crate::storage::capacity::managed_usage)
     }
 
     pub fn available_space(&self) -> anyhow::Result<u64> {
@@ -125,10 +152,6 @@ impl ImageBlobStore {
             .write()
             .map_err(|_| anyhow!("image blob write lease is poisoned"))
     }
-}
-
-pub fn managed_usage(blob_dir: &Path) -> anyhow::Result<u64> {
-    managed_usage_at(blob_dir)
 }
 
 pub fn available_space(path: &Path) -> anyhow::Result<u64> {
@@ -198,6 +221,12 @@ pub(crate) fn install_staged_locked(
         thumbnail_path,
         created_paths,
     })
+}
+
+fn discard_staged_locked(stage_root: &Path, staged: &StagedImage) -> anyhow::Result<()> {
+    let stage_dir = validate_stage_directory(stage_root, staged)?;
+    fs::remove_dir_all(&stage_dir)
+        .with_context(|| format!("remove rejected image stage {}", stage_dir.display()))
 }
 
 fn validate_stage_directory(stage_root: &Path, staged: &StagedImage) -> anyhow::Result<PathBuf> {
@@ -316,26 +345,6 @@ fn rollback_paths(paths: &[PathBuf]) -> anyhow::Result<()> {
         Some(error) => Err(error.into()),
         None => Ok(()),
     }
-}
-
-fn managed_usage_at(root: &Path) -> anyhow::Result<u64> {
-    let mut usage = 0u64;
-    for entry in fs::read_dir(root)
-        .with_context(|| format!("read managed blob directory {}", root.display()))?
-    {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            usage = usage
-                .checked_add(managed_usage_at(&entry.path())?)
-                .ok_or_else(|| anyhow!("managed blob usage overflow"))?;
-        } else if file_type.is_file() {
-            usage = usage
-                .checked_add(entry.metadata()?.len())
-                .ok_or_else(|| anyhow!("managed blob usage overflow"))?;
-        }
-    }
-    Ok(usage)
 }
 
 #[cfg(target_os = "windows")]

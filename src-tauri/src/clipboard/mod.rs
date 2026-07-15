@@ -43,7 +43,7 @@ pub mod win {
 
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::storage::repository::ClipboardRepository;
 use crate::system::settings::AppSettings;
@@ -56,6 +56,17 @@ use crate::{
     storage::repository::ClipboardItem,
 };
 use tauri::{AppHandle, Emitter};
+
+const CAPACITY_STATUS_MESSAGE: &str =
+    "图片未保存：剪贴板图片存储空间已满，请取消收藏或删除历史图片。";
+
+fn emit_capacity_status(app_handle: &AppHandle) {
+    if let Err(error) = app_handle.emit("clipboard-status", CAPACITY_STATUS_MESSAGE) {
+        crate::diagnostics::warn(format!(
+            "clipboard: failed to emit capacity status event: {error}"
+        ));
+    }
+}
 
 fn image_draft(
     content_hash: &str,
@@ -77,6 +88,7 @@ fn image_draft(
     }
 }
 
+#[cfg(test)]
 fn store_image_capture(
     repository: &Mutex<ClipboardRepository>,
     image_store: &ImageBlobStore,
@@ -85,12 +97,38 @@ fn store_image_capture(
     store_image_capture_with(repository, image_store, dib, || {})
 }
 
+#[cfg(test)]
 fn store_image_capture_with(
     repository: &Mutex<ClipboardRepository>,
     image_store: &ImageBlobStore,
     dib: Vec<u8>,
     on_existing: impl FnOnce(),
 ) -> anyhow::Result<ClipboardItem> {
+    store_image_capture_with_hooks(repository, image_store, dib, on_existing, || {})
+}
+
+#[cfg(test)]
+fn store_image_capture_with_hooks(
+    repository: &Mutex<ClipboardRepository>,
+    image_store: &ImageBlobStore,
+    dib: Vec<u8>,
+    on_existing: impl FnOnce(),
+    after_stage: impl FnOnce(),
+) -> anyhow::Result<ClipboardItem> {
+    store_image_capture_with_retention(repository, image_store, dib, 0, 0, on_existing, after_stage)
+        .map(|(item, _)| item)
+}
+
+fn store_image_capture_with_retention(
+    repository: &Mutex<ClipboardRepository>,
+    image_store: &ImageBlobStore,
+    dib: Vec<u8>,
+    max_history_items: i64,
+    retention_days: i64,
+    on_existing: impl FnOnce(),
+    after_stage: impl FnOnce(),
+) -> anyhow::Result<(ClipboardItem, bool)> {
+    let bmp_size = crate::storage::capacity::exact_bmp_size(dib.len())?;
     let size_bytes = i64::try_from(dib.len()).unwrap_or(i64::MAX);
     let identity = image_identity_from_dib(&dib)?;
     let repository_guard = repository
@@ -102,40 +140,102 @@ fn store_image_capture_with(
             .content_path
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("active image has no blob path"))?;
-        return repository_guard.insert_or_touch_image(image_draft(
-            &identity.content_hash,
-            std::path::Path::new(content_path),
-            size_bytes,
-        ));
+        return repository_guard
+            .insert_or_touch_image(image_draft(
+                &identity.content_hash,
+                std::path::Path::new(content_path),
+                size_bytes,
+            ))
+            .map(|item| (item, false));
     }
     drop(repository_guard);
 
+    let reservation = crate::storage::capacity::capture_reservation(bmp_size)?;
+    crate::storage::capacity::prune_for_capacity(
+        repository,
+        image_store,
+        max_history_items,
+        retention_days,
+        reservation,
+    )?;
+
     let staged = stage_dib(image_store.stage_dir(), dib)?;
+    after_stage();
     anyhow::ensure!(
         staged.content_hash() == identity.content_hash,
         "staged image identity changed"
     );
-    install_image_capture(repository, image_store, staged, size_bytes)
+    install_image_capture_outcome(repository, image_store, staged, size_bytes)
 }
 
+#[cfg(test)]
 fn store_clipboard_capture(
     repository: &Mutex<ClipboardRepository>,
     image_store: &ImageBlobStore,
     capture: ClipboardCapture,
     image_capture_enabled: bool,
 ) -> anyhow::Result<Option<ClipboardItem>> {
+    store_clipboard_capture_with_retention(
+        repository,
+        image_store,
+        capture,
+        image_capture_enabled,
+        0,
+        0,
+    )
+    .map(|outcome| outcome.item)
+}
+
+struct StoredCaptureOutcome {
+    item: Option<ClipboardItem>,
+    created: bool,
+    retention_pruned: bool,
+}
+
+fn store_clipboard_capture_with_retention(
+    repository: &Mutex<ClipboardRepository>,
+    image_store: &ImageBlobStore,
+    capture: ClipboardCapture,
+    image_capture_enabled: bool,
+    max_history_items: i64,
+    retention_days: i64,
+) -> anyhow::Result<StoredCaptureOutcome> {
     match capture {
-        ClipboardCapture::Draft(draft) => repository
-            .lock()
-            .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?
-            .insert_or_touch(draft)
-            .map(Some),
+        ClipboardCapture::Draft(draft) => {
+            let repository = repository
+                .lock()
+                .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?;
+            let created = repository.find_by_hash(&draft.stable_hash())?.is_none();
+            let item = repository.insert_or_touch(draft)?;
+            Ok(StoredCaptureOutcome {
+                item: Some(item),
+                created,
+                retention_pruned: false,
+            })
+        }
         ClipboardCapture::ImageDib(_) if !image_capture_enabled => {
             crate::diagnostics::warn("clipboard: image capture blocked by storage quota");
-            Ok(None)
+            Ok(StoredCaptureOutcome {
+                item: None,
+                created: false,
+                retention_pruned: false,
+            })
         }
         ClipboardCapture::ImageDib(dib) => {
-            store_image_capture(repository, image_store, dib).map(Some)
+            let (item, created) = store_image_capture_with_retention(
+                repository,
+                image_store,
+                dib,
+                max_history_items,
+                retention_days,
+                || {},
+                || {},
+            )?;
+            Ok(StoredCaptureOutcome {
+                item: Some(item),
+                created,
+                retention_pruned: created,
+            })
         }
     }
 }
@@ -151,15 +251,56 @@ impl std::fmt::Display for ImageCaptureRace {
 
 impl std::error::Error for ImageCaptureRace {}
 
+#[cfg(test)]
 fn install_image_capture(
     repository: &Mutex<ClipboardRepository>,
     image_store: &ImageBlobStore,
     staged: StagedImage,
     size_bytes: i64,
 ) -> anyhow::Result<ClipboardItem> {
+    install_image_capture_outcome(repository, image_store, staged, size_bytes).map(|(item, _)| item)
+}
+
+fn install_image_capture_outcome(
+    repository: &Mutex<ClipboardRepository>,
+    image_store: &ImageBlobStore,
+    staged: StagedImage,
+    size_bytes: i64,
+) -> anyhow::Result<(ClipboardItem, bool)> {
     let content_hash = staged.content_hash().to_string();
-    let result = image_store.install_staged_with(
+    let result = image_store.install_staged_with_preflight(
         staged,
+        |blob_dir, staged| {
+            let repository_guard = repository
+                .lock()
+                .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?;
+            if let Some(winner) = repository_guard.find_active_image(&content_hash)? {
+                let winner_path = winner
+                    .content_path
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("active image has no blob path"))?;
+                let winner = repository_guard.insert_or_touch_image(image_draft(
+                    &content_hash,
+                    std::path::Path::new(winner_path),
+                    size_bytes,
+                ))?;
+                return Err(ImageCaptureRace(winner).into());
+            }
+            drop(repository_guard);
+            let additional = crate::storage::capacity::staged_allocation(
+                staged.bmp_size(),
+                staged.thumbnail_size(),
+            )?;
+            crate::storage::capacity::prune_for_capacity_locked(
+                repository,
+                blob_dir,
+                0,
+                0,
+                additional,
+                crate::storage::capacity::MANAGED_BLOB_QUOTA,
+            )?;
+            Ok(())
+        },
         |installed| {
             let repository = repository
                 .lock()
@@ -192,9 +333,9 @@ fn install_image_capture(
         },
     );
     match result {
-        Ok(item) => Ok(item),
+        Ok(item) => Ok((item, true)),
         Err(error) => match error.downcast::<ImageCaptureRace>() {
-            Ok(race) => Ok(race.0),
+            Ok(race) => Ok((race.0, false)),
             Err(error) => Err(error),
         },
     }
@@ -212,6 +353,8 @@ pub fn start_background_listener(
         image_store.blob_dir().display()
     ));
 
+    let listener_started = Instant::now();
+    let prune_throttle = crate::storage::capacity::PruneThrottle::new_at(Duration::ZERO);
     win::start_listener(move |event_sequence| {
         crate::diagnostics::info("clipboard: change event received");
         let app_settings = settings
@@ -272,31 +415,64 @@ pub fn start_background_listener(
 
         let mut stored_any = false;
         for capture in drafts {
-            let result =
-                store_clipboard_capture(&repository, &image_store, capture, image_capture_enabled);
+            let now = listener_started.elapsed();
+            let prune_due = prune_throttle.is_due_at(now);
+            let is_blocked_image =
+                !image_capture_enabled && matches!(&capture, ClipboardCapture::ImageDib(_));
+            let (max_history_items, retention_days) = if prune_due {
+                (app_settings.max_history_items, app_settings.retention_days)
+            } else {
+                (0, 0)
+            };
+            let result = store_clipboard_capture_with_retention(
+                &repository,
+                &image_store,
+                capture,
+                image_capture_enabled,
+                max_history_items,
+                retention_days,
+            );
             match result {
                 Err(error) => {
+                    if error
+                        .downcast_ref::<crate::storage::capacity::CapacityError>()
+                        .is_some()
+                    {
+                        emit_capacity_status(&app_handle);
+                    }
                     crate::diagnostics::error(format!(
                         "clipboard: failed to store clipboard item: {error}"
                     ));
                 }
-                Ok(stored) => {
-                    stored_any |= stored.is_some();
+                Ok(outcome) => {
+                    if is_blocked_image {
+                        emit_capacity_status(&app_handle);
+                    }
+                    if outcome.created && prune_due {
+                        let prune_result = if outcome.retention_pruned {
+                            Ok(())
+                        } else {
+                            crate::commands::prune_history_with(
+                                &repository,
+                                &image_store,
+                                app_settings.max_history_items,
+                                app_settings.retention_days,
+                            )
+                        };
+                        if let Err(error) = prune_result {
+                            crate::diagnostics::error(format!(
+                                "clipboard: failed to prune clipboard history: {error}"
+                            ));
+                        } else {
+                            prune_throttle.mark_pruned_at(now);
+                        }
+                    }
+                    stored_any |= outcome.item.is_some();
                 }
             }
         }
 
         if stored_any {
-            if let Err(error) = crate::commands::prune_history_with(
-                &repository,
-                &image_store,
-                app_settings.max_history_items,
-                app_settings.retention_days,
-            ) {
-                crate::diagnostics::error(format!(
-                    "clipboard: failed to prune clipboard history: {error}"
-                ));
-            }
             if let Err(error) = app_handle.emit("clipboard-changed", ()) {
                 crate::diagnostics::warn(format!(
                     "clipboard: failed to emit change event: {error}"
@@ -310,7 +486,7 @@ pub fn start_background_listener(
 mod tests {
     use super::{
         image_draft, install_image_capture, store_clipboard_capture, store_image_capture,
-        store_image_capture_with,
+        store_image_capture_with, store_image_capture_with_hooks,
     };
     use crate::blobs::image::stage_dib;
     use crate::blobs::store::ImageBlobStore;
@@ -390,6 +566,90 @@ mod tests {
                 .count(),
             2
         );
+        assert!(fs::read_dir(store.stage_dir())
+            .expect("stage directory")
+            .next()
+            .is_none());
+        drop(repository);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn oversized_duplicate_is_rejected_by_global_image_limit_without_mutation() {
+        let root = std::env::temp_dir().join(format!(
+            "super-clipboard-oversized-duplicate-{}",
+            Uuid::new_v4()
+        ));
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let first = store_image_capture(&repository, &store, dib32(40, [30, 20, 10, 255], 0))
+            .expect("first capture");
+        let mut oversized = dib32(40, [30, 20, 10, 255], 0);
+        oversized.resize(
+            crate::storage::capacity::MAX_IMAGE_ALLOCATION as usize,
+            0xAA,
+        );
+
+        let error = store_image_capture(&repository, &store, oversized)
+            .expect_err("global image limit must apply before duplicate lookup");
+
+        assert!(format!("{error:#}").contains("100 MiB"));
+        assert!(repository
+            .lock()
+            .expect("repository lock")
+            .get_item(&first.id)
+            .expect("first query")
+            .is_some());
+        assert_eq!(
+            fs::read_dir(store.blob_dir())
+                .expect("blob directory")
+                .count(),
+            2
+        );
+        assert!(fs::read_dir(store.stage_dir())
+            .expect("stage directory")
+            .next()
+            .is_none());
+        drop(repository);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn second_capacity_check_removes_stage_and_leaves_history_unchanged() {
+        let root = std::env::temp_dir().join(format!(
+            "super-clipboard-second-capacity-check-{}",
+            Uuid::new_v4()
+        ));
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let filler = store.blob_dir().join("concurrent-orphan.tmp");
+
+        let error = store_image_capture_with_hooks(
+            &repository,
+            &store,
+            dib32(40, [30, 20, 10, 255], 0),
+            || {},
+            || {
+                let file = fs::File::create(&filler).expect("capacity filler");
+                file.set_len(crate::storage::capacity::MANAGED_BLOB_QUOTA)
+                    .expect("sparse capacity filler");
+            },
+        )
+        .expect_err("second capacity check must reject concurrent usage");
+
+        assert!(format!("{error:#}").contains("capacity"));
+        assert!(repository
+            .lock()
+            .expect("repository lock")
+            .active_blob_paths()
+            .expect("active paths")
+            .is_empty());
         assert!(fs::read_dir(store.stage_dir())
             .expect("stage directory")
             .next()

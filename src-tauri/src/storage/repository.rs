@@ -1762,6 +1762,23 @@ impl ClipboardRepository {
         Ok(())
     }
 
+    pub(crate) fn oldest_capacity_candidate_id(&self) -> anyhow::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT id
+                 FROM clipboard_items
+                 WHERE deleted_at IS NULL
+                   AND item_type = 'image'
+                   AND favorite = 0
+                 ORDER BY updated_at ASC, created_at ASC, id ASC
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn clear_history(&self) -> anyhow::Result<()> {
         let blob_paths = self.active_blob_paths()?;
         let transaction = self.conn.unchecked_transaction()?;

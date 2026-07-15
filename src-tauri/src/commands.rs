@@ -90,7 +90,7 @@ pub(crate) fn prune_history_with(
     })
 }
 
-fn cleanup_pending_blobs(
+pub(crate) fn cleanup_pending_blobs(
     repository: &Mutex<crate::storage::repository::ClipboardRepository>,
     blob_dir: &Path,
 ) -> anyhow::Result<()> {

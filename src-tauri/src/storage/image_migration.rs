@@ -9,11 +9,12 @@ use anyhow::{anyhow, ensure, Context};
 use chrono::Utc;
 
 use crate::blobs::store::{install_staged_locked, ImageBlobStore};
+use crate::storage::capacity::{managed_usage, MANAGED_BLOB_QUOTA, THUMBNAIL_RESERVATION};
 use crate::storage::repository::{ClipboardRepository, ImageMigrationMerge};
 
 const IMAGE_MIGRATION_NAME: &str = "legacy-image-content-dedup-v1";
-const IMAGE_QUOTA_BYTES: u64 = 5 * 1024 * 1024 * 1024;
-const THUMBNAIL_RESERVATION_BYTES: u64 = 1024 * 1024;
+#[cfg(test)]
+const IMAGE_QUOTA_BYTES: u64 = MANAGED_BLOB_QUOTA;
 const BACKUP_COMPLETE_MARKER: &str = ".complete";
 const BACKUP_MANIFEST_VERSION: &str = "super-clipboard-image-backup-v1";
 
@@ -44,7 +45,7 @@ impl MigrationIo for SystemMigrationIo {
     }
 
     fn quota_bytes(&self) -> u64 {
-        IMAGE_QUOTA_BYTES
+        MANAGED_BLOB_QUOTA
     }
 }
 
@@ -199,7 +200,7 @@ fn scan_images(
         if !canonical_bmp_exists || !canonical_thumbnail_exists {
             temporary_bytes = temporary_bytes
                 .checked_add(first.staged_bmp_bytes)
-                .and_then(|value| value.checked_add(THUMBNAIL_RESERVATION_BYTES))
+                .and_then(|value| value.checked_add(THUMBNAIL_RESERVATION))
                 .ok_or_else(|| anyhow!("temporary image byte count overflow"))?;
         }
     }
@@ -819,7 +820,7 @@ fn sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
 }
 
 fn migration_outcome(blob_dir: &Path, quota_bytes: u64) -> anyhow::Result<MigrationOutcome> {
-    let usage = crate::blobs::store::managed_usage(blob_dir)?;
+    let usage = managed_usage(blob_dir)?;
     Ok(MigrationOutcome {
         quota_blocked: usage > quota_bytes,
         usage,

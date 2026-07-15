@@ -4,10 +4,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
+use crate::storage::capacity::MAX_IMAGE_ALLOCATION;
+
 pub mod image;
 pub mod store;
 
-pub const MAX_IMAGE_ALLOCATION: u64 = 100 * 1024 * 1024;
 const BMP_FILE_HEADER_LEN: u64 = 14;
 
 pub fn ensure_blob_dir(app_data: &Path) -> anyhow::Result<PathBuf> {

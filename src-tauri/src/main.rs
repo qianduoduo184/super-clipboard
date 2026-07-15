@@ -101,6 +101,37 @@ fn main() {
             let settings = Arc::new(Mutex::new(loaded_settings));
             let current_shortcut = Arc::new(Mutex::new(None));
             diagnostics::info("setup: settings loaded");
+            let startup_settings = settings
+                .lock()
+                .map(|settings| settings.clone())
+                .unwrap_or_default();
+            let startup_prune = storage::capacity::prune_for_capacity(
+                repository.as_ref(),
+                image_store.as_ref(),
+                startup_settings.max_history_items,
+                startup_settings.retention_days,
+                0,
+            );
+            if let Err(error) = &startup_prune {
+                if error
+                    .downcast_ref::<storage::capacity::CapacityError>()
+                    .is_some()
+                {
+                    diagnostics::warn(format!(
+                        "setup: startup capacity prune could not reach quota: {error}"
+                    ));
+                } else {
+                    diagnostics::error(format!("setup: startup capacity prune failed: {error:#}"));
+                    return Err(anyhow::anyhow!("startup capacity prune failed: {error:#}").into());
+                }
+            }
+            let startup_usage = image_store.managed_usage()?;
+            let image_capture_enabled =
+                startup_usage <= storage::capacity::MANAGED_BLOB_QUOTA;
+            diagnostics::info(format!(
+                "setup: startup capacity prune completed, managed_usage={}, migration_quota_blocked={}, image_capture_enabled={}",
+                startup_usage, migration_outcome.quota_blocked, image_capture_enabled
+            ));
             if let Some(window) = app.get_webview_window("main") {
                 let window_for_close = window.clone();
                 window.on_window_event(move |event| {
@@ -127,7 +158,7 @@ fn main() {
                 repository,
                 settings.clone(),
                 image_store,
-                !migration_outcome.quota_blocked,
+                image_capture_enabled,
             ) {
                 diagnostics::error(format!("setup: clipboard listener failed: {error}"));
             } else {
