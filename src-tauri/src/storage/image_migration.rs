@@ -66,6 +66,7 @@ fn run_image_migration_with(
             .as_ref()
             .is_some_and(|record| record.state == "complete")
         {
+            cleanup_pending(repository, blob_dir)?;
             return migration_outcome(blob_dir, io.quota_bytes());
         }
 
@@ -345,11 +346,10 @@ fn cleanup_pending(repository: &Mutex<ClipboardRepository>, blob_dir: &Path) -> 
                 path.display()
             );
             let path_identity = managed_path_identity(blob_dir, &path)?;
-            ensure!(
-                !active_identities.contains(&path_identity),
-                "cleanup path is still active: {}",
-                path.display()
-            );
+            if active_identities.contains(&path_identity) {
+                repository_lock(repository)?.complete_cleanup_path(&path)?;
+                return Ok::<(), anyhow::Error>(());
+            }
             match fs::symlink_metadata(&path) {
                 Ok(metadata) => {
                     ensure!(
@@ -1366,6 +1366,41 @@ mod tests {
     }
 
     #[test]
+    fn completed_migration_resumes_global_cleanup_before_recomputing_usage() {
+        let fixture = Fixture::new("complete-cleanup-resume");
+        run_image_migration_with(&fixture.repository, &fixture.store, &TestIo::real())
+            .expect("initial migration");
+        let orphan = fixture.store.blob_dir().join("orphan.bmp");
+        let orphan_thumbnail = crate::blobs::thumbnail_path_for(&orphan);
+        fs::write(&orphan, b"orphan").expect("orphan BMP");
+        fs::write(&orphan_thumbnail, b"thumb").expect("orphan thumbnail");
+        let absent = fixture.store.blob_dir().join("absent.bmp");
+        fixture
+            .repository
+            .lock()
+            .expect("repository lock")
+            .update_image_references_and_enqueue_cleanup(&[], &[orphan.clone(), absent])
+            .expect("enqueue cleanup");
+        let missing_active = fixture.store.blob_dir().join("late-missing.bmp");
+        fixture.insert_image_row("late-active", &missing_active, 1, 2, 2, false, false);
+        let forbid_copy = TestIo {
+            free_space: u64::MAX,
+            quota_bytes: IMAGE_QUOTA_BYTES,
+            fail_next_copy: Cell::new(false),
+            forbid_copy: true,
+        };
+
+        let outcome = run_image_migration_with(&fixture.repository, &fixture.store, &forbid_copy)
+            .expect("completed cleanup resume");
+
+        assert_eq!(outcome.usage, 0);
+        assert!(!orphan.exists());
+        assert!(!orphan_thumbnail.exists());
+        assert!(fixture.cleanup_paths().is_empty());
+        assert_eq!(fixture.migration_state().0, "complete");
+    }
+
+    #[test]
     fn missing_legacy_blob_stops_with_history_unchanged() {
         let fixture = Fixture::new("missing");
         let missing = fixture.store.blob_dir().join("missing.bmp");
@@ -1788,6 +1823,43 @@ mod tests {
             .stage_dir()
             .join("legacy-image-dedup-v1")
             .exists());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn active_case_alias_cleanup_requests_are_dequeued_without_deleting_files() {
+        let fixture = Fixture::new("active-cleanup-request");
+        let dib = Fixture::dib32(40, [5, 7, 9, 255]);
+        let content_hash = image_identity_from_dib(&dib)
+            .expect("identity")
+            .content_hash;
+        let staged = stage_dib(fixture.store.stage_dir(), dib).expect("canonical stage");
+        let uppercase_bmp = fixture
+            .store
+            .blob_dir()
+            .join(format!("{}.BMP", content_hash.to_ascii_uppercase()));
+        let uppercase_thumbnail = crate::blobs::thumbnail_path_for(&uppercase_bmp);
+        fs::copy(staged.bmp_path(), &uppercase_bmp).expect("uppercase BMP");
+        fs::copy(staged.thumbnail_path(), &uppercase_thumbnail).expect("uppercase thumbnail");
+        fs::remove_dir_all(staged.stage_dir()).expect("remove canonical stage");
+        fixture.insert_image_row("active", &uppercase_bmp, 1, 2, 2, false, false);
+        fixture
+            .repository
+            .lock()
+            .expect("repository lock")
+            .update_image_references_and_enqueue_cleanup(&[], &[uppercase_bmp.clone()])
+            .expect("enqueue active cleanup request");
+        assert_eq!(fixture.cleanup_paths().len(), 2);
+
+        run_image_migration_with(&fixture.repository, &fixture.store, &TestIo::real())
+            .expect("active cleanup request migration");
+
+        let canonical_bmp = fixture.store.blob_dir().join(format!("{content_hash}.bmp"));
+        let canonical_thumbnail = crate::blobs::thumbnail_path_for(&canonical_bmp);
+        assert!(canonical_bmp.is_file());
+        assert!(canonical_thumbnail.is_file());
+        assert!(fixture.cleanup_paths().is_empty());
+        assert_eq!(fixture.migration_state().0, "complete");
     }
 
     #[test]
