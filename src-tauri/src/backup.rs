@@ -213,28 +213,30 @@ fn validate_legacy_bmp_filename(filename: &str) -> Result<(), String> {
     {
         return Err("legacy blob path must be a safe single filename".to_string());
     }
-    let stem = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or_default()
-        .trim_end_matches(['.', ' '])
-        .to_ascii_uppercase();
-    let is_windows_device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || stem
-            .strip_prefix("COM")
-            .or_else(|| stem.strip_prefix("LPT"))
-            .is_some_and(|suffix| {
-                matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
-            });
-    if is_windows_device {
-        return Err("legacy blob filename must not use a Windows device alias".to_string());
-    }
     let is_bmp = path
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("bmp"));
     if !is_bmp {
         return Err("legacy blob filename must use the .bmp extension".to_string());
+    }
+    let device_base = filename
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(['.', ' '])
+        .to_ascii_uppercase();
+    let is_windows_device = matches!(
+        device_base.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$"
+    ) || device_base
+        .strip_prefix("COM")
+        .or_else(|| device_base.strip_prefix("LPT"))
+        .is_some_and(|suffix| {
+            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+        });
+    if is_windows_device {
+        return Err("legacy blob filename must not use a Windows device alias".to_string());
     }
     Ok(())
 }
@@ -1347,6 +1349,12 @@ mod tests {
             "image.png",
             "image.bmp:stream.bmp",
             "CON.bmp",
+            "CON.foo.bmp",
+            "COM1.foo.bmp",
+            "LPT9.backup.bmp",
+            "CLOCK$.log.bmp",
+            "CON .foo.bmp",
+            "COM1..backup.bmp",
         ] {
             write_legacy_json(
                 &path,
@@ -1374,6 +1382,18 @@ mod tests {
         assert!(
             parse_backup_info_path(&path).is_err(),
             "case-insensitive legacy blob aliases must fail"
+        );
+
+        write_legacy_json(
+            &path,
+            "1.0",
+            0,
+            Vec::new(),
+            vec![legacy_blob("console.foo.bmp", "AA==")],
+        );
+        assert!(
+            parse_backup_info_path(&path).is_ok(),
+            "ordinary names with a device prefix must remain valid"
         );
 
         fs::remove_dir_all(root).expect("cleanup");
