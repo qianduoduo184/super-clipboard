@@ -3786,6 +3786,7 @@ dependencies = [
  "time",
  "uuid",
  "windows-sys 0.59.0",
+ "zip",
 ]
 
 [[package]]

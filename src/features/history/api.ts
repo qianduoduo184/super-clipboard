@@ -1,5 +1,10 @@
 import { invoke } from '@tauri-apps/api/core';
 import {
+  mapBackendBackupInfo,
+  type BackendBackupInfo,
+  type BackupInfo,
+} from '../../lib/backup-model';
+import {
   mapBackendCapacityStatus,
   mapBackendItemDetailToViewItem,
   mapBackendItemToViewItem,
@@ -148,11 +153,7 @@ export async function updateStorageSettings(customDataDir: string | null, custom
 }
 
 // 导入/导出备份
-export type BackupInfo = {
-  created_at: string;
-  item_count: number;
-  version: string;
-};
+export type { BackupInfo } from '../../lib/backup-model';
 
 export async function exportBackup() {
   return invoke<string>('export_backup');
@@ -163,7 +164,8 @@ export async function selectBackupFile() {
 }
 
 export async function parseBackupInfo(backupPath: string) {
-  return invoke<BackupInfo>('parse_backup_info', { backupPath });
+  const info = await invoke<BackendBackupInfo>('parse_backup_info', { backupPath });
+  return mapBackendBackupInfo(info);
 }
 
 export async function importBackup(backupPath: string, merge: boolean) {

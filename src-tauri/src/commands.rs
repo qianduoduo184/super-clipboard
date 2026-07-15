@@ -4,7 +4,7 @@ use tauri_plugin_updater::UpdaterExt;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
@@ -845,18 +845,16 @@ pub fn update_storage_settings(
 pub async fn export_backup(state: State<'_, AppState>) -> Result<String, String> {
     use chrono::Utc;
     use rfd::FileDialog;
-    use std::fs;
 
-    // 选择保存路径
     let default_filename = format!(
-        "super-clipboard-backup-{}.json",
+        "super-clipboard-backup-{}.zip",
         Utc::now().format("%Y%m%d-%H%M%S")
     );
 
     let save_path = FileDialog::new()
         .set_title("导出备份")
         .set_file_name(&default_filename)
-        .add_filter("JSON 文件", &["json"])
+        .add_filter("ZIP 备份", &["zip"])
         .save_file();
 
     let Some(save_path) = save_path else {
@@ -864,81 +862,9 @@ pub async fn export_backup(state: State<'_, AppState>) -> Result<String, String>
     };
 
     crate::diagnostics::info(format!("export_backup: path={}", save_path.display()));
-
-    // 读取所有数据
-    let repository = state.repository.lock().map_err(|e| e.to_string())?;
-    let mut all_items = repository
-        .list_items_for_backup(100000)
-        .map_err(|e| format!("读取数据失败: {}", e))?;
-
-    drop(repository);
-
-    // 收集关联的 blob 文件
-    let mut blobs = Vec::new();
-    for item in &mut all_items {
-        if let Some(content_path) = &item.content_path {
-            let content_path = Path::new(content_path);
-            let blob_path = if content_path.is_absolute() {
-                content_path.to_path_buf()
-            } else {
-                state.blob_dir.join(content_path)
-            };
-            if blob_path.exists() {
-                let Some(filename) = blob_path
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .map(str::to_string)
-                else {
-                    crate::diagnostics::warn(format!(
-                        "export_backup: skipped blob with invalid filename {}",
-                        blob_path.display()
-                    ));
-                    item.content_path = None;
-                    continue;
-                };
-                match fs::read(&blob_path) {
-                    Ok(data) => {
-                        blobs.push(BlobData {
-                            item_id: item.id.clone(),
-                            filename: filename.clone(),
-                            data_base64: base64_encode(&data),
-                        });
-                        item.content_path = Some(filename);
-                    }
-                    Err(e) => {
-                        crate::diagnostics::warn(format!(
-                            "export_backup: failed to read blob {}: {}",
-                            blob_path.display(),
-                            e
-                        ));
-                        item.content_path = None;
-                    }
-                }
-            }
-        }
-    }
-
-    // 构建备份数据
-    let backup = BackupData {
-        metadata: BackupMetadata {
-            version: "1.0".to_string(),
-            created_at: Utc::now().to_rfc3339(),
-            item_count: all_items.len(),
-        },
-        items: all_items,
-        blobs,
-    };
-
-    // 写入文件
-    let json = serde_json::to_string_pretty(&backup).map_err(|e| format!("序列化失败: {}", e))?;
-
-    fs::write(&save_path, json).map_err(|e| format!("写入文件失败: {}", e))?;
-
-    crate::diagnostics::info(format!(
-        "export_backup: success, {} items, {} blobs",
-        backup.metadata.item_count,
-        backup.blobs.len()
-    ));
+    crate::backup::export_zip_to(&save_path, &state.repository, &state.image_store)
+        .map_err(|error| format!("导出备份失败: {error:#}"))?;
+    crate::diagnostics::info("export_backup: streaming ZIP export succeeded");
 
     Ok(save_path.to_string_lossy().to_string())
 }
@@ -949,7 +875,9 @@ pub async fn select_backup_file() -> Result<Option<String>, String> {
 
     let selected = FileDialog::new()
         .set_title("选择备份文件")
-        .add_filter("JSON 文件", &["json"])
+        .add_filter("备份文件", &["zip", "json"])
+        .add_filter("ZIP 备份", &["zip"])
+        .add_filter("旧版 JSON 备份", &["json"])
         .pick_file();
 
     Ok(selected.map(|path| path.to_string_lossy().to_string()))
@@ -957,19 +885,20 @@ pub async fn select_backup_file() -> Result<Option<String>, String> {
 
 #[tauri::command]
 pub async fn parse_backup_info(backup_path: String) -> Result<BackupInfo, String> {
-    use std::fs;
+    crate::backup::parse_backup_info_path(Path::new(&backup_path))
+        .map_err(|error| format!("解析备份文件失败: {error:#}"))
+}
 
-    let content =
-        fs::read_to_string(&backup_path).map_err(|e| format!("读取备份文件失败: {}", e))?;
-
-    let backup: BackupData =
-        serde_json::from_str(&content).map_err(|e| format!("解析备份文件失败: {}", e))?;
-
-    Ok(BackupInfo {
-        created_at: backup.metadata.created_at,
-        item_count: backup.metadata.item_count,
-        version: backup.metadata.version,
-    })
+fn ensure_legacy_json_import(path: &Path) -> Result<(), String> {
+    let mut file = fs::File::open(path).map_err(|error| format!("读取备份文件失败: {error}"))?;
+    let mut magic = [0u8; 4];
+    let count = file
+        .read(&mut magic)
+        .map_err(|error| format!("读取备份文件失败: {error}"))?;
+    if count == magic.len() && crate::backup::is_zip_magic(magic) {
+        return Err("ZIP import requires transactional importer".to_string());
+    }
+    Ok(())
 }
 
 fn import_backup_data_with(
@@ -1155,6 +1084,8 @@ pub async fn import_backup(
         backup_path, merge
     ));
 
+    ensure_legacy_json_import(Path::new(&backup_path))?;
+
     // 读取备份文件
     let content =
         fs::read_to_string(&backup_path).map_err(|e| format!("读取备份文件失败: {}", e))?;
@@ -1210,6 +1141,7 @@ pub async fn import_backup(
     Ok(imported_count)
 }
 
+#[cfg(test)]
 fn base64_encode(data: &[u8]) -> String {
     use base64::{engine::general_purpose, Engine as _};
     general_purpose::STANDARD.encode(data)
@@ -1230,9 +1162,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        clear_history_with, copy_image_blob_with, delete_item_with, html_to_plain_text,
-        import_backup_data_with, load_item_for_copy, mutate_and_cleanup_blobs, prune_history_with,
-        safe_backup_blob_filename, validate_migration_paths, BackupData, BackupMetadata, BlobData,
+        clear_history_with, copy_image_blob_with, delete_item_with, ensure_legacy_json_import,
+        html_to_plain_text, import_backup_data_with, load_item_for_copy, mutate_and_cleanup_blobs,
+        prune_history_with, safe_backup_blob_filename, validate_migration_paths, BackupData,
+        BackupMetadata, BlobData,
     };
     use crate::blobs::image::stage_dib;
     use crate::blobs::store::ImageBlobStore;
@@ -1249,6 +1182,20 @@ mod tests {
         dib[20..24].copy_from_slice(&4u32.to_le_bytes());
         dib.extend_from_slice(&[30, 20, 10, 255]);
         dib
+    }
+
+    #[test]
+    fn zip_import_requires_transactional_importer() {
+        let path = std::env::temp_dir().join(format!(
+            "super-clipboard-zip-import-{}.zip",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, b"PK\x03\x04not a complete archive").expect("write ZIP fixture");
+
+        let error = ensure_legacy_json_import(&path).expect_err("ZIP import must be rejected");
+
+        assert_eq!(error, "ZIP import requires transactional importer");
+        std::fs::remove_file(path).expect("cleanup");
     }
 
     fn imported_image_item(id: &str, hash: &str, filename: &str) -> ClipboardItem {

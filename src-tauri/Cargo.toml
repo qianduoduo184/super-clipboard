@@ -26,6 +26,7 @@ tauri-plugin-updater = "2.0.0"
 thiserror = "1.0"
 time = "=0.3.36"
 uuid = { version = "1.10", default-features = false, features = ["v4", "serde"] }
+zip = { version = "4.6.1", default-features = false }
 windows-sys = { version = ">=0.59, <=0.61", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",

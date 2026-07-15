@@ -28,6 +28,7 @@ import {
   type AppSettings,
 } from '../../lib/settings-model';
 import { getCurrentVersion } from '../../lib/version';
+import { getBackupFormat } from '../../lib/backup-model';
 
 type SettingsViewProps = {
   recording: boolean;
@@ -361,7 +362,7 @@ export default function SettingsView({
       setStatus('正在解析备份文件...');
       const info = await parseBackupInfo(selected);
       setPendingBackup({ path: selected, info });
-      setStatus(`已选择备份: ${info.item_count} 条记录`);
+      setStatus(`已选择${getBackupFormat(selected)}备份: ${info.itemCount} 条记录`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setStatus(`解析备份文件失败: ${message}`);
@@ -379,8 +380,8 @@ export default function SettingsView({
 
     const confirmed = window.confirm(
       `即将${action}导入备份：\n\n` +
-      `创建时间: ${new Date(pendingBackup.info.created_at).toLocaleString()}\n` +
-      `数据条数: ${pendingBackup.info.item_count}\n` +
+      `创建时间: ${new Date(pendingBackup.info.createdAt).toLocaleString()}\n` +
+      `数据条数: ${pendingBackup.info.itemCount}\n` +
       `备份版本: ${pendingBackup.info.version}\n\n` +
       `${warning}\n\n` +
       `是否继续？`
@@ -599,7 +600,7 @@ export default function SettingsView({
           <span className="setting-icon"><Download size={18} /></span>
           <span>
             <strong>导出备份</strong>
-            <small>将剪贴板历史导出为 JSON 文件</small>
+            <small>将剪贴板历史和图片流式导出为 ZIP 备份</small>
           </span>
           <button onClick={handleExportBackup}>
             <Download size={14} style={{ marginRight: '4px' }} />
@@ -613,8 +614,8 @@ export default function SettingsView({
             <strong>导入备份</strong>
             <small>
               {pendingBackup
-                ? `${pendingBackup.info.item_count} 条记录 (${new Date(pendingBackup.info.created_at).toLocaleDateString()})`
-                : '从备份文件恢复剪贴板历史'}
+                ? `${getBackupFormat(pendingBackup.path)} · ${pendingBackup.info.itemCount} 条记录 (${new Date(pendingBackup.info.createdAt).toLocaleDateString()})`
+                : '从 ZIP 备份或旧版 JSON 备份恢复剪贴板历史'}
             </small>
           </span>
           <div style={{ display: 'flex', gap: '6px' }}>
