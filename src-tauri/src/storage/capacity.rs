@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 
 use crate::blobs::store::ImageBlobStore;
 use crate::storage::repository::{ClipboardItem, ClipboardRepository};
@@ -15,6 +16,81 @@ pub const MAX_IMAGE_ALLOCATION: u64 = 100 * 1024 * 1024;
 pub const MANAGED_BLOB_QUOTA: u64 = 5 * 1024 * 1024 * 1024;
 pub const THUMBNAIL_RESERVATION: u64 = 1024 * 1024;
 pub const PRUNE_INTERVAL: Duration = Duration::from_secs(600);
+pub const CAPACITY_STATUS_MESSAGE: &str =
+    "图片未保存：剪贴板图片存储空间已满，请取消收藏或删除历史图片。";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardCapacityStatus {
+    pub blocked: bool,
+    pub message: String,
+    pub revision: u64,
+}
+
+pub fn current_capacity_status(
+    state: &Mutex<ClipboardCapacityStatus>,
+) -> anyhow::Result<ClipboardCapacityStatus> {
+    state
+        .lock()
+        .map(|status| status.clone())
+        .map_err(|error| anyhow!("clipboard capacity status lock poisoned: {error}"))
+}
+
+pub fn update_capacity_status_with(
+    state: &Mutex<ClipboardCapacityStatus>,
+    blocked: bool,
+    emit: impl FnOnce(&ClipboardCapacityStatus) -> anyhow::Result<()>,
+) -> anyhow::Result<ClipboardCapacityStatus> {
+    let next = {
+        let mut current = state
+            .lock()
+            .map_err(|error| anyhow!("clipboard capacity status lock poisoned: {error}"))?;
+        if current.blocked == blocked {
+            return Ok(current.clone());
+        }
+        let revision = current
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("clipboard capacity status revision overflow"))?;
+        *current = ClipboardCapacityStatus {
+            blocked,
+            message: if blocked {
+                CAPACITY_STATUS_MESSAGE.to_string()
+            } else {
+                String::new()
+            },
+            revision,
+        };
+        current.clone()
+    };
+    emit(&next)?;
+    Ok(next)
+}
+
+pub fn publish_capacity_status(
+    app_handle: &tauri::AppHandle,
+    state: &Mutex<ClipboardCapacityStatus>,
+    blocked: bool,
+) -> anyhow::Result<ClipboardCapacityStatus> {
+    use tauri::Emitter;
+
+    update_capacity_status_with(state, blocked, |status| {
+        app_handle
+            .emit("clipboard-status", status)
+            .map_err(Into::into)
+    })
+}
+
+pub fn clear_capacity_status_if_recovered(
+    app_handle: &tauri::AppHandle,
+    state: &Mutex<ClipboardCapacityStatus>,
+    image_store: &ImageBlobStore,
+) -> anyhow::Result<ClipboardCapacityStatus> {
+    if image_store.managed_usage()? <= MANAGED_BLOB_QUOTA {
+        publish_capacity_status(app_handle, state, false)
+    } else {
+        current_capacity_status(state)
+    }
+}
 
 #[derive(Debug)]
 pub struct PruneThrottle {
@@ -141,6 +217,7 @@ pub(crate) fn prune_for_capacity_locked(
     additional: u64,
     quota: u64,
 ) -> anyhow::Result<u64> {
+    crate::commands::cleanup_pending_blobs(repository, blob_dir)?;
     let items = {
         let repository = repository
             .lock()
@@ -427,8 +504,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        build_capacity_prune_plan, capture_reservation, exact_bmp_size, managed_usage,
-        prune_for_capacity_with_quota, PruneThrottle,
+        build_capacity_prune_plan, capture_reservation, current_capacity_status, exact_bmp_size,
+        managed_usage, prune_for_capacity_with_quota, update_capacity_status_with,
+        ClipboardCapacityStatus, PruneThrottle,
     };
     use crate::blobs::store::ImageBlobStore;
     use crate::clipboard::types::{ClipboardItemDraft, ClipboardItemType};
@@ -709,6 +787,80 @@ mod tests {
         drop(repository);
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn pending_cleanup_is_recovered_before_capacity_planning() {
+        let root = temp_dir("pending-first");
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let pending_bmp = store.blob_dir().join("pending.bmp");
+        let pending_thumbnail = crate::blobs::thumbnail_path_for(&pending_bmp);
+        let absent = store.blob_dir().join("absent.bmp");
+        fs::write(&pending_bmp, b"12345").expect("pending bmp");
+        fs::write(&pending_thumbnail, b"67890").expect("pending thumbnail");
+        repository
+            .lock()
+            .expect("repository lock")
+            .update_image_references_and_enqueue_cleanup(
+                &[],
+                &[pending_bmp.clone(), absent],
+            )
+            .expect("enqueue pending cleanup");
+
+        let usage = prune_for_capacity_with_quota(&repository, &store, 0, 0, 6, 6)
+            .expect("pending cleanup should restore capacity first");
+
+        assert_eq!(usage, 0);
+        assert!(!pending_bmp.exists());
+        assert!(!pending_thumbnail.exists());
+        assert!(repository
+            .lock()
+            .expect("repository lock")
+            .pending_cleanup_paths()
+            .expect("cleanup queue")
+            .is_empty());
+        drop(repository);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn capacity_status_persists_emits_and_clears_by_revision() {
+        let state = Mutex::new(ClipboardCapacityStatus::default());
+        let emitted = std::cell::RefCell::new(Vec::new());
+
+        let blocked = update_capacity_status_with(&state, true, |status| {
+            emitted.borrow_mut().push(status.clone());
+            Ok(())
+        })
+        .expect("blocked status");
+
+        assert!(blocked.blocked);
+        assert!(!blocked.message.is_empty());
+        assert_eq!(blocked.revision, 1);
+        assert_eq!(current_capacity_status(&state).expect("query"), blocked);
+        assert_eq!(&*emitted.borrow(), &[blocked.clone()]);
+
+        let unchanged = update_capacity_status_with(&state, true, |_| {
+            panic!("unchanged status must not emit")
+        })
+        .expect("unchanged status");
+        assert_eq!(unchanged.revision, 1);
+
+        let cleared = update_capacity_status_with(&state, false, |status| {
+            emitted.borrow_mut().push(status.clone());
+            Ok(())
+        })
+        .expect("clear status");
+
+        assert!(!cleared.blocked);
+        assert!(cleared.message.is_empty());
+        assert_eq!(cleared.revision, 2);
+        assert_eq!(current_capacity_status(&state).expect("query clear"), cleared);
+        assert_eq!(emitted.borrow().len(), 2);
     }
 
     #[test]

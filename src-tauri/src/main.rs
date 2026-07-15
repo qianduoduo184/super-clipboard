@@ -26,6 +26,7 @@ pub struct AppState {
     pub settings_path: PathBuf,
     pub blob_dir: PathBuf,
     pub image_store: Arc<ImageBlobStore>,
+    pub capacity_status: Arc<Mutex<storage::capacity::ClipboardCapacityStatus>>,
     pub log_path: PathBuf,
 }
 
@@ -33,6 +34,13 @@ pub struct AppState {
 struct StartupCapacityState {
     usage: u64,
     blocked: bool,
+}
+
+fn initialize_startup_capacity_status(
+    state: &Mutex<storage::capacity::ClipboardCapacityStatus>,
+    capacity: StartupCapacityState,
+) -> anyhow::Result<storage::capacity::ClipboardCapacityStatus> {
+    storage::capacity::update_capacity_status_with(state, capacity.blocked, |_| Ok(()))
 }
 
 fn run_startup_capacity_then<T>(
@@ -143,6 +151,9 @@ fn main() {
             };
             let settings = Arc::new(Mutex::new(loaded_settings));
             let current_shortcut = Arc::new(Mutex::new(None));
+            let capacity_status = Arc::new(Mutex::new(
+                storage::capacity::ClipboardCapacityStatus::default(),
+            ));
             diagnostics::info("setup: settings loaded");
             if let Some(window) = app.get_webview_window("main") {
                 let window_for_close = window.clone();
@@ -154,17 +165,6 @@ fn main() {
                     }
                 });
             }
-            app.manage(AppState {
-                repository: repository.clone(),
-                settings: settings.clone(),
-                current_shortcut: current_shortcut.clone(),
-                app_data_dir: app_data.clone(),
-                settings_path: settings_path.clone(),
-                blob_dir: blob_dir.clone(),
-                image_store: image_store.clone(),
-                log_path,
-            });
-
             let startup_settings = settings
                 .lock()
                 .map(|settings| settings.clone())
@@ -176,21 +176,36 @@ fn main() {
                 startup_settings.retention_days,
                 |_| {},
                 |capacity| {
+                    let initial_status =
+                        initialize_startup_capacity_status(&capacity_status, capacity)?;
                     diagnostics::info(format!(
                         "setup: startup capacity prune completed, managed_usage={}, migration_quota_blocked={}, image_capture_blocked={}",
                         capacity.usage, migration_outcome.quota_blocked, capacity.blocked
                     ));
-                    if capacity.blocked {
-                        let _ = app.handle().emit(
-                            "clipboard-status",
-                            "图片未保存：剪贴板图片存储空间已满，请取消收藏或删除历史图片。",
-                        );
+                    app.manage(AppState {
+                        repository: repository.clone(),
+                        settings: settings.clone(),
+                        current_shortcut: current_shortcut.clone(),
+                        app_data_dir: app_data.clone(),
+                        settings_path: settings_path.clone(),
+                        blob_dir: blob_dir.clone(),
+                        image_store: image_store.clone(),
+                        capacity_status: capacity_status.clone(),
+                        log_path: log_path.clone(),
+                    });
+                    if initial_status.blocked {
+                        if let Err(error) = app.handle().emit("clipboard-status", &initial_status) {
+                            diagnostics::warn(format!(
+                                "setup: failed to emit initial capacity status: {error}"
+                            ));
+                        }
                     }
                     if let Err(error) = clipboard::start_background_listener(
                         app.handle().clone(),
                         repository.clone(),
                         settings.clone(),
                         image_store.clone(),
+                        capacity_status.clone(),
                     ) {
                         diagnostics::error(format!("setup: clipboard listener failed: {error}"));
                     } else {
@@ -236,6 +251,7 @@ fn main() {
             commands::reorder_items,
             commands::set_recording_enabled,
             commands::get_settings,
+            commands::get_clipboard_status,
             commands::update_settings,
             commands::set_global_shortcut,
             commands::clear_history,
@@ -262,7 +278,7 @@ mod startup_capacity_tests {
 
     use uuid::Uuid;
 
-    use super::run_startup_capacity_then;
+    use super::{initialize_startup_capacity_status, run_startup_capacity_then};
     use crate::blobs::store::ImageBlobStore;
     use crate::storage::repository::ClipboardRepository;
 
@@ -301,6 +317,49 @@ mod startup_capacity_tests {
         .expect("startup chain");
 
         assert_eq!(&*events.borrow(), &["prune", "usage", "listener"]);
+        drop(repository);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn startup_blocked_status_is_queryable_before_listener_starts() {
+        let root = std::env::temp_dir().join(format!(
+            "super-clipboard-startup-blocked-status-{}",
+            Uuid::new_v4()
+        ));
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        fs::File::create(store.blob_dir().join("startup-orphan.tmp"))
+            .expect("startup orphan")
+            .set_len(crate::storage::capacity::MANAGED_BLOB_QUOTA + 1)
+            .expect("sparse startup orphan");
+        let status_state = Mutex::new(
+            crate::storage::capacity::ClipboardCapacityStatus::default(),
+        );
+
+        run_startup_capacity_then(
+            &repository,
+            &store,
+            10_000,
+            30,
+            |_| {},
+            |capacity| {
+                let initialized =
+                    initialize_startup_capacity_status(&status_state, capacity)?;
+                assert!(initialized.blocked);
+                assert_eq!(initialized.revision, 1);
+                assert_eq!(
+                    crate::storage::capacity::current_capacity_status(&status_state)?,
+                    initialized
+                );
+                Ok(())
+            },
+        )
+        .expect("blocked startup chain");
+
         drop(repository);
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");

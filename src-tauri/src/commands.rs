@@ -334,9 +334,20 @@ pub fn toggle_pin(state: State<'_, AppState>, id: String) -> Result<(), String> 
 }
 
 #[tauri::command]
-pub fn delete_item(state: State<'_, AppState>, id: String) -> Result<(), String> {
+pub fn delete_item(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
     crate::diagnostics::info(format!("command: delete_item id={id}"));
-    delete_item_with(&state.repository, &state.image_store, &id).map_err(|error| error.to_string())
+    delete_item_with(&state.repository, &state.image_store, &id)
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = crate::storage::capacity::clear_capacity_status_if_recovered(
+        &app,
+        &state.capacity_status,
+        &state.image_store,
+    ) {
+        crate::diagnostics::warn(format!(
+            "command: failed to refresh capacity status after delete: {error}"
+        ));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -364,6 +375,14 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
     crate::diagnostics::info("command: get_settings");
     let settings = state.settings.lock().map_err(|error| error.to_string())?;
     Ok(settings.clone())
+}
+
+#[tauri::command]
+pub fn get_clipboard_status(
+    state: State<'_, AppState>,
+) -> Result<crate::storage::capacity::ClipboardCapacityStatus, String> {
+    crate::storage::capacity::current_capacity_status(&state.capacity_status)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -544,9 +563,19 @@ pub fn set_global_shortcut(
 }
 
 #[tauri::command]
-pub fn clear_history(state: State<'_, AppState>) -> Result<(), String> {
+pub fn clear_history(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     crate::diagnostics::warn("command: clear_history");
-    clear_history_with(&state.repository, &state.image_store).map_err(|error| error.to_string())
+    clear_history_with(&state.repository, &state.image_store).map_err(|error| error.to_string())?;
+    if let Err(error) = crate::storage::capacity::clear_capacity_status_if_recovered(
+        &app,
+        &state.capacity_status,
+        &state.image_store,
+    ) {
+        crate::diagnostics::warn(format!(
+            "command: failed to refresh capacity status after clear: {error}"
+        ));
+    }
+    Ok(())
 }
 
 #[tauri::command]

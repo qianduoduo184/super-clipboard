@@ -57,17 +57,6 @@ use crate::{
 };
 use tauri::{AppHandle, Emitter};
 
-const CAPACITY_STATUS_MESSAGE: &str =
-    "图片未保存：剪贴板图片存储空间已满，请取消收藏或删除历史图片。";
-
-fn emit_capacity_status(app_handle: &AppHandle) {
-    if let Err(error) = app_handle.emit("clipboard-status", CAPACITY_STATUS_MESSAGE) {
-        crate::diagnostics::warn(format!(
-            "clipboard: failed to emit capacity status event: {error}"
-        ));
-    }
-}
-
 fn image_draft(
     content_hash: &str,
     content_path: &std::path::Path,
@@ -182,6 +171,7 @@ struct StoredCaptureOutcome {
     item: Option<ClipboardItem>,
     created: bool,
     retention_pruned: bool,
+    image: bool,
 }
 
 fn store_clipboard_capture_with_retention(
@@ -202,6 +192,7 @@ fn store_clipboard_capture_with_retention(
                 item: Some(item),
                 created,
                 retention_pruned: false,
+                image: false,
             })
         }
         ClipboardCapture::ImageDib(dib) => {
@@ -218,6 +209,7 @@ fn store_clipboard_capture_with_retention(
                 item: Some(item),
                 created,
                 retention_pruned: created,
+                image: true,
             })
         }
     }
@@ -372,6 +364,7 @@ pub fn start_background_listener(
     repository: Arc<Mutex<ClipboardRepository>>,
     settings: Arc<Mutex<AppSettings>>,
     image_store: Arc<ImageBlobStore>,
+    capacity_status: Arc<Mutex<crate::storage::capacity::ClipboardCapacityStatus>>,
 ) -> anyhow::Result<()> {
     crate::diagnostics::info(format!(
         "clipboard: preparing listener with blob_dir={}",
@@ -455,13 +448,34 @@ pub fn start_background_listener(
                         .downcast_ref::<crate::storage::capacity::CapacityError>()
                         .is_some()
                     {
-                        emit_capacity_status(&app_handle);
+                        if let Err(status_error) = crate::storage::capacity::publish_capacity_status(
+                            &app_handle,
+                            &capacity_status,
+                            true,
+                        ) {
+                            crate::diagnostics::warn(format!(
+                                "clipboard: failed to publish capacity status: {status_error}"
+                            ));
+                        }
                     }
                     crate::diagnostics::error(format!(
                         "clipboard: failed to store clipboard item: {error}"
                     ));
                 }
                 Ok(outcome) => {
+                    if outcome.image {
+                        if let Err(status_error) =
+                            crate::storage::capacity::clear_capacity_status_if_recovered(
+                                &app_handle,
+                                &capacity_status,
+                                &image_store,
+                            )
+                        {
+                            crate::diagnostics::warn(format!(
+                                "clipboard: failed to clear capacity status: {status_error}"
+                            ));
+                        }
+                    }
                     stored_any |= outcome.item.is_some();
                 }
             }

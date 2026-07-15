@@ -1,5 +1,18 @@
 const SUPPORTED_TYPES = new Set(['text', 'html', 'image', 'files']);
 
+export function mapBackendCapacityStatus(status) {
+  const blocked = status?.blocked === true;
+  return {
+    blocked,
+    message: blocked ? String(status?.message ?? '') : '',
+    revision: Number.isSafeInteger(status?.revision) ? status.revision : 0,
+  };
+}
+
+export function reduceCapacityStatus(current, incoming) {
+  return incoming.revision > current.revision ? incoming : current;
+}
+
 export function formatBytes(value) {
   if (value < 1024) {
     return `${value} B`;

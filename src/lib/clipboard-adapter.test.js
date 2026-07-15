@@ -10,13 +10,48 @@ const {
   formatBytes,
   getDetailDisplayContent,
   getImageFallbackPath,
+  mapBackendCapacityStatus,
   mapBackendItemDetailToViewItem,
   mapBackendItemToViewItem,
   reconcileDetailSlot,
   reconcileImageFallbackState,
   resolveDetailResponse,
+  reduceCapacityStatus,
   selectDetailLoadStatus,
 } = clipboardAdapter;
+
+test('capacity status maps snake_case backend payload', () => {
+  assert.deepEqual(
+    mapBackendCapacityStatus({ blocked: true, message: '存储空间已满', revision: 7 }),
+    { blocked: true, message: '存储空间已满', revision: 7 },
+  );
+  assert.deepEqual(
+    mapBackendCapacityStatus({ blocked: false, message: 'stale', revision: 8 }),
+    { blocked: false, message: '', revision: 8 },
+  );
+});
+
+test('capacity status reducer keeps the newest revision across event and query races', () => {
+  const initial = { blocked: false, message: '', revision: -1 };
+  const event = reduceCapacityStatus(initial, {
+    blocked: true,
+    message: '存储空间已满',
+    revision: 2,
+  });
+  const staleQuery = reduceCapacityStatus(event, {
+    blocked: false,
+    message: '',
+    revision: 1,
+  });
+  const recovered = reduceCapacityStatus(staleQuery, {
+    blocked: false,
+    message: '',
+    revision: 3,
+  });
+
+  assert.equal(staleQuery, event);
+  assert.deepEqual(recovered, { blocked: false, message: '', revision: 3 });
+});
 
 test('formatBytes renders compact byte labels', () => {
   assert.equal(formatBytes(12), '12 B');

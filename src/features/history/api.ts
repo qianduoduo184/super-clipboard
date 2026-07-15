@@ -1,9 +1,12 @@
 import { invoke } from '@tauri-apps/api/core';
 import {
+  mapBackendCapacityStatus,
   mapBackendItemDetailToViewItem,
   mapBackendItemToViewItem,
+  type BackendClipboardCapacityStatus,
   type BackendClipboardItemDetail,
   type BackendClipboardItemSummary,
+  type ClipboardCapacityStatus,
   type ViewClipboardItem,
   type ViewClipboardItemDetail,
 } from '../../lib/clipboard-adapter';
@@ -100,6 +103,11 @@ export async function setRecordingEnabled(enabled: boolean) {
 
 export async function getSettings() {
   return invoke<AppSettings>('get_settings');
+}
+
+export async function getClipboardStatus(): Promise<ClipboardCapacityStatus> {
+  const status = await invoke<BackendClipboardCapacityStatus>('get_clipboard_status');
+  return mapBackendCapacityStatus(status);
 }
 
 export async function updateSettings(nextSettings: AppSettings) {

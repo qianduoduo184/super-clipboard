@@ -30,10 +30,14 @@ import {
   getDetailDisplayContent,
   getImageFallbackPath,
   isDetailResponseCurrent,
+  mapBackendCapacityStatus,
   reconcileDetailSlot,
   reconcileImageFallbackState,
   resolveDetailResponse,
+  reduceCapacityStatus,
   selectDetailLoadStatus,
+  type BackendClipboardCapacityStatus,
+  type ClipboardCapacityStatus,
   type DetailLoadStatus,
   type DetailRequest,
   type DetailSlot,
@@ -44,6 +48,7 @@ import {
   copyItem,
   checkForUpdates,
   deleteItem as deleteBackendItem,
+  getClipboardStatus,
   getItemDetail,
   getSettings,
   installUpdate,
@@ -182,6 +187,11 @@ export default function App() {
   const [scrollTop, setScrollTop] = useState(0);
   const [backendAvailable, setBackendAvailable] = useState(true);
   const [statusMessage, setStatusMessage] = useState('正在连接本地剪贴板服务');
+  const [capacityStatus, setCapacityStatus] = useState<ClipboardCapacityStatus>({
+    blocked: false,
+    message: '',
+    revision: -1,
+  });
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [navFiltersConfig, setNavFiltersConfig] = useState<{ visible: string[] }>({ visible: ['all', 'favorites', 'text', 'image', 'files'] });
@@ -237,6 +247,42 @@ export default function App() {
       .catch(() => {
         applyThemeMode('light');
       });
+  }, []);
+
+  useEffect(() => {
+    let ignore = false;
+    let unlistenCapacity: (() => void) | undefined;
+    const applyCapacityStatus = (status: ClipboardCapacityStatus) => {
+      setCapacityStatus((current) => reduceCapacityStatus(current, status));
+    };
+
+    async function subscribeThenQueryCapacityStatus() {
+      try {
+        const nextUnlisten = await listen<BackendClipboardCapacityStatus>(
+          'clipboard-status',
+          ({ payload }) => applyCapacityStatus(mapBackendCapacityStatus(payload)),
+        );
+        if (ignore) {
+          nextUnlisten();
+          return;
+        }
+        unlistenCapacity = nextUnlisten;
+      } catch {
+        // Query still provides the persisted startup state when event registration fails.
+      }
+      try {
+        const queried = await getClipboardStatus();
+        if (!ignore) applyCapacityStatus(queried);
+      } catch {
+        // Other backend calls own the connection fallback; keep the latest event/status here.
+      }
+    }
+
+    void subscribeThenQueryCapacityStatus();
+    return () => {
+      ignore = true;
+      unlistenCapacity?.();
+    };
   }, []);
 
   useEffect(() => {
@@ -722,7 +768,13 @@ export default function App() {
           </div>
           <div>
             <h1>super-clipboard</h1>
-            <p>{recording ? statusMessage : '已暂停记录'}</p>
+            <p role="status" aria-live="polite">
+              {capacityStatus.blocked
+                ? capacityStatus.message
+                : recording
+                  ? statusMessage
+                  : '已暂停记录'}
+            </p>
           </div>
         </div>
         <div className="toolbar-actions">

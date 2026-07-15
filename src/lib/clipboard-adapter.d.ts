@@ -19,6 +19,14 @@ export type BackendClipboardItemDetail = BackendClipboardItemSummary & {
 
 export type BackendClipboardItem = BackendClipboardItemDetail;
 
+export type BackendClipboardCapacityStatus = {
+  blocked: boolean;
+  message: string;
+  revision: number;
+};
+
+export type ClipboardCapacityStatus = BackendClipboardCapacityStatus;
+
 export type ViewClipboardItem = {
   id: string;
   hash: string;
@@ -66,6 +74,15 @@ export type ImageFallbackState = {
 };
 
 export function formatBytes(value: number): string;
+
+export function mapBackendCapacityStatus(
+  status: BackendClipboardCapacityStatus,
+): ClipboardCapacityStatus;
+
+export function reduceCapacityStatus(
+  current: ClipboardCapacityStatus,
+  incoming: ClipboardCapacityStatus,
+): ClipboardCapacityStatus;
 
 export function mapBackendItemToViewItem(item: BackendClipboardItemSummary): ViewClipboardItem;
 
