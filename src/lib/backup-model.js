@@ -1,9 +1,8 @@
 export const BACKUP_FILE_EXTENSIONS = Object.freeze(['zip', 'json']);
 
-export function getBackupFormat(path) {
-  const extension = String(path).split('.').pop()?.toLowerCase();
-  if (extension === 'zip') return 'ZIP';
-  if (extension === 'json') return '旧版 JSON';
+export function getBackupFormat(info) {
+  if (info.version === '2') return 'ZIP';
+  if (info.version === '1.0') return '旧版 JSON';
   return '未知格式';
 }
 

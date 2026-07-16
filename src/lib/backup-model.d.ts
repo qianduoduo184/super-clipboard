@@ -12,5 +12,5 @@ export type BackupInfo = {
   version: string;
 };
 
-export function getBackupFormat(path: string): 'ZIP' | '旧版 JSON' | '未知格式';
+export function getBackupFormat(info: Pick<BackupInfo, 'version'>): 'ZIP' | '旧版 JSON' | '未知格式';
 export function mapBackendBackupInfo(info: BackendBackupInfo): BackupInfo;

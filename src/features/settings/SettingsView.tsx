@@ -362,7 +362,7 @@ export default function SettingsView({
       setStatus('正在解析备份文件...');
       const info = await parseBackupInfo(selected);
       setPendingBackup({ path: selected, info });
-      setStatus(`已选择${getBackupFormat(selected)}备份: ${info.itemCount} 条记录`);
+      setStatus(`已选择${getBackupFormat(info)}备份: ${info.itemCount} 条记录`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setStatus(`解析备份文件失败: ${message}`);
@@ -614,7 +614,7 @@ export default function SettingsView({
             <strong>导入备份</strong>
             <small>
               {pendingBackup
-                ? `${getBackupFormat(pendingBackup.path)} · ${pendingBackup.info.itemCount} 条记录 (${new Date(pendingBackup.info.createdAt).toLocaleDateString()})`
+                ? `${getBackupFormat(pendingBackup.info)} · ${pendingBackup.info.itemCount} 条记录 (${new Date(pendingBackup.info.createdAt).toLocaleDateString()})`
                 : '从 ZIP 备份或旧版 JSON 备份恢复剪贴板历史'}
             </small>
           </span>

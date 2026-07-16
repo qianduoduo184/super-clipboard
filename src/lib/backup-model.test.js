@@ -8,9 +8,20 @@ import {
 
 test('backup file filters include ZIP export and legacy JSON import', () => {
   assert.deepEqual(BACKUP_FILE_EXTENSIONS, ['zip', 'json']);
-  assert.equal(getBackupFormat('C:\\backup\\history.ZIP'), 'ZIP');
-  assert.equal(getBackupFormat('/backup/legacy.json'), '旧版 JSON');
-  assert.equal(getBackupFormat('/backup/unknown.txt'), '未知格式');
+});
+
+test('backup format follows parsed version when the file extension is misleading', () => {
+  const zipRenamedAsJson = {
+    path: '/backup/history.json',
+    info: { createdAt: '2026-07-15T00:00:00Z', itemCount: 42, version: '2' },
+  };
+  const legacyRenamedAsZip = {
+    path: '/backup/legacy.zip',
+    info: { createdAt: '2026-07-15T00:00:00Z', itemCount: 42, version: '1.0' },
+  };
+
+  assert.equal(getBackupFormat(zipRenamedAsJson.info), 'ZIP');
+  assert.equal(getBackupFormat(legacyRenamedAsZip.info), '旧版 JSON');
 });
 
 test('backup info maps the backend snake_case contract for settings preview', () => {

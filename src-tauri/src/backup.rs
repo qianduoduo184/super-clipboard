@@ -291,7 +291,336 @@ pub(crate) fn is_zip_magic(magic: [u8; 4]) -> bool {
     )
 }
 
-fn parse_zip_info(file: File) -> anyhow::Result<crate::commands::BackupInfo> {
+const MAX_ZIP_ENTRIES: u64 = 100_001;
+const MAX_CENTRAL_DIRECTORY_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ZIP_ENTRY_NAME_BYTES: usize = 1024;
+const ZIP32_EOCD_LEN: u64 = 22;
+const ZIP64_LOCATOR_LEN: u64 = 20;
+const CENTRAL_HEADER_LEN: u64 = 46;
+
+struct RawCentralDirectory {
+    entry_count: u64,
+    offset: u64,
+    size: u64,
+    metadata_offset: u64,
+}
+
+fn le_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(bytes[offset..offset + 2].try_into().expect("fixed ZIP u16"))
+}
+
+fn le_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("fixed ZIP u32"))
+}
+
+fn le_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("fixed ZIP u64"))
+}
+
+fn read_zip_bytes<const LEN: usize>(file: &mut File, offset: u64) -> anyhow::Result<[u8; LEN]> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = [0u8; LEN];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn find_standard_eocd(file: &mut File, file_len: u64) -> anyhow::Result<(u64, [u8; 22])> {
+    anyhow::ensure!(
+        file_len >= ZIP32_EOCD_LEN,
+        "ZIP file is shorter than the EOCD"
+    );
+    let search_len = file_len.min(ZIP32_EOCD_LEN + u64::from(u16::MAX));
+    let search_start = file_len - search_len;
+    file.seek(SeekFrom::Start(search_start))?;
+    let mut tail = vec![0u8; usize::try_from(search_len).expect("bounded EOCD search")];
+    file.read_exact(&mut tail)?;
+    for index in (0..=tail.len() - ZIP32_EOCD_LEN as usize).rev() {
+        if &tail[index..index + 4] != b"PK\x05\x06" {
+            continue;
+        }
+        let comment_len = usize::from(le_u16(&tail, index + 20));
+        if index
+            .checked_add(ZIP32_EOCD_LEN as usize)
+            .and_then(|end| end.checked_add(comment_len))
+            == Some(tail.len())
+        {
+            let mut eocd = [0u8; 22];
+            eocd.copy_from_slice(&tail[index..index + 22]);
+            return Ok((search_start + index as u64, eocd));
+        }
+    }
+    Err(anyhow::anyhow!(
+        "ZIP EOCD was not found at the end of the file"
+    ))
+}
+
+fn read_raw_central_directory(
+    file: &mut File,
+    file_len: u64,
+) -> anyhow::Result<RawCentralDirectory> {
+    let (eocd_offset, eocd) = find_standard_eocd(file, file_len)?;
+    anyhow::ensure!(
+        le_u16(&eocd, 4) == 0 && le_u16(&eocd, 6) == 0,
+        "multi-disk ZIP archives are not supported"
+    );
+    let entries_on_disk = le_u16(&eocd, 8);
+    let entries = le_u16(&eocd, 10);
+    let size32 = le_u32(&eocd, 12);
+    let offset32 = le_u32(&eocd, 16);
+
+    let locator = eocd_offset
+        .checked_sub(ZIP64_LOCATOR_LEN)
+        .and_then(|offset| {
+            read_zip_bytes::<20>(file, offset)
+                .ok()
+                .map(|bytes| (offset, bytes))
+        })
+        .filter(|(_, bytes)| &bytes[..4] == b"PK\x06\x07");
+    let requires_zip64 = size32 == u32::MAX || offset32 == u32::MAX;
+    if requires_zip64 {
+        anyhow::ensure!(locator.is_some(), "ZIP64 locator is missing");
+    }
+
+    if let Some((locator_offset, locator)) = locator {
+        anyhow::ensure!(
+            le_u32(&locator, 4) == 0 && le_u32(&locator, 16) == 1,
+            "multi-disk ZIP64 archives are not supported"
+        );
+        let zip64_offset = le_u64(&locator, 8);
+        anyhow::ensure!(
+            zip64_offset < locator_offset,
+            "ZIP64 EOCD offset is outside the ZIP file"
+        );
+        let zip64 =
+            read_zip_bytes::<56>(file, zip64_offset).context("read ZIP64 EOCD fixed fields")?;
+        anyhow::ensure!(&zip64[..4] == b"PK\x06\x06", "invalid ZIP64 EOCD signature");
+        let record_size = le_u64(&zip64, 4);
+        anyhow::ensure!(record_size >= 44, "ZIP64 EOCD record is too short");
+        let record_end = zip64_offset
+            .checked_add(12)
+            .and_then(|offset| offset.checked_add(record_size))
+            .ok_or_else(|| anyhow::anyhow!("ZIP64 EOCD bounds overflow"))?;
+        anyhow::ensure!(
+            record_end == locator_offset,
+            "ZIP64 EOCD must end at its locator"
+        );
+        anyhow::ensure!(
+            le_u32(&zip64, 16) == 0 && le_u32(&zip64, 20) == 0,
+            "multi-disk ZIP64 archives are not supported"
+        );
+        let entries_on_disk = le_u64(&zip64, 24);
+        let entries = le_u64(&zip64, 32);
+        anyhow::ensure!(
+            entries_on_disk == entries,
+            "ZIP64 entry counts differ across disks"
+        );
+        return Ok(RawCentralDirectory {
+            entry_count: entries,
+            size: le_u64(&zip64, 40),
+            offset: le_u64(&zip64, 48),
+            metadata_offset: zip64_offset,
+        });
+    }
+
+    anyhow::ensure!(
+        entries_on_disk == entries,
+        "ZIP entry counts differ across disks"
+    );
+    Ok(RawCentralDirectory {
+        entry_count: u64::from(entries),
+        size: u64::from(size32),
+        offset: u64::from(offset32),
+        metadata_offset: eocd_offset,
+    })
+}
+
+fn normalize_raw_zip_name(name: &[u8]) -> anyhow::Result<String> {
+    anyhow::ensure!(!name.is_empty(), "ZIP entry name is empty");
+    anyhow::ensure!(
+        name.len() <= MAX_ZIP_ENTRY_NAME_BYTES,
+        "ZIP entry name exceeds the bounded backup path limit"
+    );
+    anyhow::ensure!(name.is_ascii(), "ZIP entry name must be ASCII");
+    anyhow::ensure!(
+        !matches!(name.first(), Some(b'/') | Some(b'\\'))
+            && !matches!(name.last(), Some(b'/') | Some(b'\\')),
+        "ZIP entry name must be a relative file path"
+    );
+    let name = std::str::from_utf8(name).expect("ASCII ZIP name");
+    let mut normalized = Vec::new();
+    for component in name.split(['/', '\\']) {
+        anyhow::ensure!(
+            !component.is_empty() && component != "." && component != "..",
+            "ZIP entry name contains an unsafe path component"
+        );
+        normalized.push(component);
+    }
+    Ok(normalized.join("/"))
+}
+
+fn zip64_local_header_offset(fixed: &[u8; 46], extra: &[u8]) -> anyhow::Result<u64> {
+    let raw_offset = le_u32(fixed, 42);
+    if raw_offset != u32::MAX {
+        return Ok(u64::from(raw_offset));
+    }
+    let need_uncompressed = le_u32(fixed, 24) == u32::MAX;
+    let need_compressed = le_u32(fixed, 20) == u32::MAX;
+    let mut cursor = 0usize;
+    while cursor < extra.len() {
+        let header_end = cursor
+            .checked_add(4)
+            .ok_or_else(|| anyhow::anyhow!("ZIP extra field bounds overflow"))?;
+        anyhow::ensure!(
+            header_end <= extra.len(),
+            "truncated ZIP extra field header"
+        );
+        let tag = le_u16(extra, cursor);
+        let len = usize::from(le_u16(extra, cursor + 2));
+        let value_end = header_end
+            .checked_add(len)
+            .ok_or_else(|| anyhow::anyhow!("ZIP extra field bounds overflow"))?;
+        anyhow::ensure!(value_end <= extra.len(), "truncated ZIP extra field value");
+        if tag == 0x0001 {
+            let mut value_cursor = header_end;
+            if need_uncompressed {
+                value_cursor = value_cursor
+                    .checked_add(8)
+                    .ok_or_else(|| anyhow::anyhow!("ZIP64 extra field bounds overflow"))?;
+            }
+            if need_compressed {
+                value_cursor = value_cursor
+                    .checked_add(8)
+                    .ok_or_else(|| anyhow::anyhow!("ZIP64 extra field bounds overflow"))?;
+            }
+            let offset_end = value_cursor
+                .checked_add(8)
+                .ok_or_else(|| anyhow::anyhow!("ZIP64 extra field bounds overflow"))?;
+            anyhow::ensure!(offset_end <= value_end, "ZIP64 local offset is missing");
+            return Ok(le_u64(extra, value_cursor));
+        }
+        cursor = value_end;
+    }
+    Err(anyhow::anyhow!("ZIP64 local offset extra field is missing"))
+}
+
+fn preflight_raw_zip(file: &mut File) -> anyhow::Result<()> {
+    let file_len = file.metadata()?.len();
+    let directory = read_raw_central_directory(file, file_len)?;
+    anyhow::ensure!(
+        directory.entry_count <= MAX_ZIP_ENTRIES,
+        "ZIP entry count exceeds the backup limit"
+    );
+    anyhow::ensure!(
+        directory.size <= MAX_CENTRAL_DIRECTORY_BYTES,
+        "ZIP central directory exceeds the backup limit"
+    );
+    let minimum_size = directory
+        .entry_count
+        .checked_mul(CENTRAL_HEADER_LEN)
+        .ok_or_else(|| anyhow::anyhow!("ZIP central directory entry count overflow"))?;
+    anyhow::ensure!(
+        minimum_size <= directory.size,
+        "ZIP entry count exceeds declared central directory size"
+    );
+    let central_end = directory
+        .offset
+        .checked_add(directory.size)
+        .ok_or_else(|| anyhow::anyhow!("ZIP central directory bounds overflow"))?;
+    anyhow::ensure!(
+        central_end == directory.metadata_offset && central_end <= file_len,
+        "ZIP central directory is outside the ZIP file"
+    );
+
+    let mut cursor = directory.offset;
+    let mut names = HashSet::new();
+    let mut previous_local_offset = None;
+    for index in 0..directory.entry_count {
+        let fixed_end = cursor
+            .checked_add(CENTRAL_HEADER_LEN)
+            .ok_or_else(|| anyhow::anyhow!("ZIP central header bounds overflow"))?;
+        anyhow::ensure!(fixed_end <= central_end, "truncated ZIP central header");
+        let fixed = read_zip_bytes::<46>(file, cursor)?;
+        anyhow::ensure!(
+            &fixed[..4] == b"PK\x01\x02",
+            "invalid ZIP central header signature"
+        );
+        let name_len = usize::from(le_u16(&fixed, 28));
+        let extra_len = usize::from(le_u16(&fixed, 30));
+        let comment_len = usize::from(le_u16(&fixed, 32));
+        anyhow::ensure!(
+            le_u16(&fixed, 34) == 0,
+            "multi-disk ZIP entries are not supported"
+        );
+        let variable_len = name_len
+            .checked_add(extra_len)
+            .and_then(|length| length.checked_add(comment_len))
+            .ok_or_else(|| anyhow::anyhow!("ZIP central entry length overflow"))?;
+        let entry_end = fixed_end
+            .checked_add(variable_len as u64)
+            .ok_or_else(|| anyhow::anyhow!("ZIP central entry bounds overflow"))?;
+        anyhow::ensure!(
+            entry_end <= central_end,
+            "ZIP central entry exceeds declared bounds"
+        );
+
+        file.seek(SeekFrom::Start(fixed_end))?;
+        let mut raw_name = vec![0u8; name_len];
+        file.read_exact(&mut raw_name)?;
+        let name = normalize_raw_zip_name(&raw_name)?;
+        anyhow::ensure!(
+            names.insert(name.clone()),
+            "duplicate normalized ZIP entry: {name}"
+        );
+        if index == 0 {
+            anyhow::ensure!(
+                name == "manifest.json",
+                "manifest.json must be the first ZIP entry"
+            );
+        }
+
+        let mut extra = vec![0u8; extra_len];
+        file.read_exact(&mut extra)?;
+        let local_offset = zip64_local_header_offset(&fixed, &extra)?;
+        anyhow::ensure!(
+            local_offset < directory.offset,
+            "ZIP local header is outside the file data region"
+        );
+        if let Some(previous) = previous_local_offset {
+            anyhow::ensure!(
+                local_offset > previous,
+                "ZIP local header order does not match the central directory"
+            );
+        } else {
+            anyhow::ensure!(local_offset == 0, "manifest local header must be first");
+        }
+        let local = read_zip_bytes::<30>(file, local_offset)?;
+        anyhow::ensure!(
+            &local[..4] == b"PK\x03\x04",
+            "invalid ZIP local header signature"
+        );
+        let local_name_len = usize::from(le_u16(&local, 26));
+        let local_extra_len = usize::from(le_u16(&local, 28));
+        let local_end = local_offset
+            .checked_add(30)
+            .and_then(|offset| offset.checked_add(local_name_len as u64))
+            .and_then(|offset| offset.checked_add(local_extra_len as u64))
+            .ok_or_else(|| anyhow::anyhow!("ZIP local header bounds overflow"))?;
+        anyhow::ensure!(
+            local_end <= directory.offset,
+            "ZIP local header exceeds file data bounds"
+        );
+        previous_local_offset = Some(local_offset);
+        cursor = entry_end;
+    }
+    anyhow::ensure!(
+        cursor == central_end,
+        "ZIP central directory size does not match entries"
+    );
+    Ok(())
+}
+
+fn parse_zip_info(mut file: File) -> anyhow::Result<crate::commands::BackupInfo> {
+    preflight_raw_zip(&mut file).context("preflight raw ZIP metadata")?;
     let mut archive = zip::ZipArchive::new(file).context("parse ZIP backup")?;
     anyhow::ensure!(!archive.is_empty(), "ZIP backup is empty");
     let first_name = archive.by_index(0)?.name().to_string();
@@ -430,6 +759,14 @@ fn write_backup_atomically(
     target: &Path,
     write: impl FnOnce(&mut File) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    write_backup_atomically_with_installer(target, write, replace_target)
+}
+
+fn write_backup_atomically_with_installer(
+    target: &Path,
+    write: impl FnOnce(&mut File) -> anyhow::Result<()>,
+    install: impl FnOnce(&Path, &Path) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let file_name = target
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("backup target must have a file name"))?;
@@ -465,55 +802,57 @@ fn write_backup_atomically(
     file.flush()?;
     file.sync_all()?;
     drop(file);
-    replace_target(&temp_path, &target)?;
+    install(&temp_path, &target)?;
     temp.keep = true;
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
 fn replace_target(temp_path: &Path, target: &Path) -> anyhow::Result<()> {
-    if !target.exists() {
-        return fs::rename(temp_path, target).with_context(|| {
-            format!(
-                "install backup {} as {}",
-                temp_path.display(),
-                target.display()
-            )
-        });
-    }
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+    replace_target_with(temp_path, target, |temp_path, target, flags| {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
 
-    let target_wide = target
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let temp_wide = temp_path
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let replaced = unsafe {
-        ReplaceFileW(
-            target_wide.as_ptr(),
-            temp_wide.as_ptr(),
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            std::ptr::null(),
-        )
+        let target_wide = target
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let temp_wide = temp_path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let moved = unsafe { MoveFileExW(temp_wide.as_ptr(), target_wide.as_ptr(), flags) };
+        if moved == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn replace_target_with(
+    temp_path: &Path,
+    target: &Path,
+    move_file: impl FnOnce(&Path, &Path, u32) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
-    if replaced == 0 {
-        return Err(std::io::Error::last_os_error()).with_context(|| {
-            format!(
-                "replace backup {} with {}",
-                target.display(),
-                temp_path.display()
-            )
-        });
-    }
-    Ok(())
+
+    move_file(
+        temp_path,
+        target,
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+    )
+    .with_context(|| {
+        format!(
+            "install backup {} as {}",
+            temp_path.display(),
+            target.display()
+        )
+    })
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -524,7 +863,17 @@ fn replace_target(temp_path: &Path, target: &Path) -> anyhow::Result<()> {
             temp_path.display(),
             target.display()
         )
-    })
+    })?;
+    #[cfg(unix)]
+    File::open(
+        target
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("backup target parent is missing"))?,
+    )
+    .context("open backup parent directory for synchronization")?
+    .sync_all()
+    .context("synchronize backup parent directory")?;
+    Ok(())
 }
 
 pub fn export_zip_to(
@@ -550,9 +899,37 @@ fn export_zip_to_with_hook(
 
 fn export_snapshot_to_with_hook(
     path: &Path,
+    items: Vec<ClipboardItem>,
+    blob_store: &ImageBlobStore,
+    hook: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    export_snapshot_to_with_io(
+        path,
+        items,
+        blob_store,
+        hook,
+        |path| File::open(path),
+        |_| Ok(()),
+    )
+}
+
+trait BlobReadHandle: Read + Seek {
+    fn metadata(&self) -> std::io::Result<fs::Metadata>;
+}
+
+impl BlobReadHandle for File {
+    fn metadata(&self) -> std::io::Result<fs::Metadata> {
+        File::metadata(self)
+    }
+}
+
+fn export_snapshot_to_with_io<R: BlobReadHandle>(
+    path: &Path,
     mut items: Vec<ClipboardItem>,
     blob_store: &ImageBlobStore,
     hook: impl FnOnce() -> anyhow::Result<()>,
+    mut open_blob: impl FnMut(&Path) -> std::io::Result<R>,
+    mut after_validate: impl FnMut(&Path) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     blob_store.with_read(|blob_dir| {
         let mut seen_hashes = HashSet::new();
@@ -595,18 +972,7 @@ fn export_snapshot_to_with_hook(
             let archive_path = format!("blobs/{content_hash}.bmp");
             item.content_path = Some(archive_path.clone());
             if seen_hashes.insert(content_hash.to_string()) {
-                let mut file = File::open(&source_path)
-                    .with_context(|| format!("open image blob {}", source_path.display()))?;
-                let metadata = file.metadata().with_context(|| {
-                    format!("inspect open image blob {}", source_path.display())
-                })?;
-                anyhow::ensure!(
-                    metadata.is_file(),
-                    "image blob handle must be a regular file"
-                );
-                crate::blobs::validate_bmp_file_header(&mut file, metadata.len())
-                    .with_context(|| format!("validate image blob {}", source_path.display()))?;
-                blobs.push((archive_path, source_path, file));
+                blobs.push((archive_path, source_path, content_hash.to_string()));
             }
         }
         hook()?;
@@ -623,11 +989,36 @@ fn export_snapshot_to_with_hook(
                 SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
             archive.start_file("manifest.json", options)?;
             serde_json::to_writer(&mut archive, &manifest)?;
-            for (archive_path, source_path, mut file) in blobs {
+            for (archive_path, source_path, expected_hash) in blobs {
+                let mut file = open_blob(&source_path)
+                    .with_context(|| format!("open image blob {}", source_path.display()))?;
+                let metadata = file.metadata().with_context(|| {
+                    format!("inspect open image blob {}", source_path.display())
+                })?;
+                anyhow::ensure!(
+                    metadata.is_file(),
+                    "image blob handle must be a regular file"
+                );
+                let expected_len = metadata.len();
+                crate::blobs::validate_bmp_file_header(&mut file, expected_len)
+                    .with_context(|| format!("validate image blob {}", source_path.display()))?;
+                after_validate(&source_path)?;
                 file.seek(SeekFrom::Start(0))
                     .with_context(|| format!("rewind image blob {}", source_path.display()))?;
-                write_blob_entry(&mut archive, &archive_path, &mut file)
+                let written = write_blob_entry(&mut archive, &archive_path, &mut file)
                     .with_context(|| format!("archive image blob {}", source_path.display()))?;
+                anyhow::ensure!(
+                    written == expected_len,
+                    "image blob length changed during export: {expected_hash}"
+                );
+                let final_len = file
+                    .metadata()
+                    .with_context(|| format!("reinspect image blob {}", source_path.display()))?
+                    .len();
+                anyhow::ensure!(
+                    final_len == expected_len,
+                    "image blob length changed during export: {expected_hash}"
+                );
             }
             archive.finish()?;
             Ok(())
@@ -639,6 +1030,7 @@ fn export_snapshot_to_with_hook(
 mod tests {
     use std::fs;
     use std::io::{Cursor, Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
     use std::time::Duration;
@@ -646,9 +1038,12 @@ mod tests {
     use crate::clipboard::types::{ClipboardItemDraft, ClipboardItemType};
     use crate::storage::repository::{ClipboardItem, ClipboardRepository};
 
+    #[cfg(target_os = "windows")]
+    use super::replace_target_with;
     use super::{
-        export_snapshot_to_with_hook, export_zip_to, export_zip_to_with_hook,
-        parse_backup_info_path, write_backup_atomically, write_blob_entry, MAX_MANIFEST_BYTES,
+        export_snapshot_to_with_hook, export_snapshot_to_with_io, export_zip_to,
+        export_zip_to_with_hook, parse_backup_info_path, write_backup_atomically,
+        write_backup_atomically_with_installer, write_blob_entry, MAX_MANIFEST_BYTES,
     };
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
@@ -683,6 +1078,70 @@ mod tests {
         bmp
     }
 
+    fn opaque_image_item(
+        store: &crate::blobs::store::ImageBlobStore,
+        content_hash: &str,
+        fill: u8,
+    ) -> (ClipboardItem, std::path::PathBuf, Vec<u8>) {
+        let source_path = store.blob_dir().join(format!("{content_hash}.bmp"));
+        let mut bytes = opaque_bmp(64);
+        bytes[14..].fill(fill);
+        fs::write(&source_path, &bytes).expect("opaque image blob");
+        let item = ClipboardItem {
+            id: format!("item-{fill}"),
+            hash: format!("record-{fill}"),
+            item_type: "image".to_string(),
+            content: None,
+            content_path: Some(source_path.to_string_lossy().into_owned()),
+            content_hash: Some(content_hash.to_string()),
+            preview: format!("image-{fill}"),
+            source_app: None,
+            favorite: false,
+            pinned: false,
+            size_bytes: i64::try_from(bytes.len()).expect("image size"),
+            created_at: 1,
+            updated_at: 1,
+        };
+        (item, source_path, bytes)
+    }
+
+    struct TrackedFile {
+        inner: fs::File,
+        active: Arc<AtomicUsize>,
+    }
+
+    impl TrackedFile {
+        fn new(inner: fs::File, active: Arc<AtomicUsize>, max_active: &AtomicUsize) -> Self {
+            let active_count = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active.fetch_max(active_count, Ordering::SeqCst);
+            Self { inner, active }
+        }
+    }
+
+    impl Drop for TrackedFile {
+        fn drop(&mut self) {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Read for TrackedFile {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buffer)
+        }
+    }
+
+    impl std::io::Seek for TrackedFile {
+        fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
+
+    impl super::BlobReadHandle for TrackedFile {
+        fn metadata(&self) -> std::io::Result<fs::Metadata> {
+            self.inner.metadata()
+        }
+    }
+
     fn write_test_zip(path: &std::path::Path, manifest: &serde_json::Value, entries: &[&str]) {
         let file = fs::File::create(path).expect("create test zip");
         let mut archive = zip::ZipWriter::new(file);
@@ -697,6 +1156,106 @@ mod tests {
             archive.write_all(b"blob").expect("write entry");
         }
         archive.finish().expect("finish test zip");
+    }
+
+    fn read_u16_le(bytes: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes(bytes[offset..offset + 2].try_into().expect("u16 field"))
+    }
+
+    fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("u32 field"))
+    }
+
+    fn standard_eocd_offset(bytes: &[u8]) -> usize {
+        bytes
+            .windows(4)
+            .rposition(|window| window == b"PK\x05\x06")
+            .expect("standard EOCD")
+    }
+
+    fn duplicate_raw_central_entry(path: &std::path::Path, duplicate_name: &str) {
+        duplicate_raw_central_entry_as(path, duplicate_name, duplicate_name);
+    }
+
+    fn duplicate_raw_central_entry_as(
+        path: &std::path::Path,
+        duplicate_name: &str,
+        replacement_name: &str,
+    ) {
+        assert_eq!(duplicate_name.len(), replacement_name.len());
+        let mut bytes = fs::read(path).expect("read ZIP fixture");
+        let eocd = standard_eocd_offset(&bytes);
+        let central_start =
+            usize::try_from(read_u32_le(&bytes, eocd + 16)).expect("central start fits usize");
+        let mut cursor = central_start;
+        let mut duplicate = None;
+        while cursor < eocd {
+            assert_eq!(&bytes[cursor..cursor + 4], b"PK\x01\x02");
+            let name_len = usize::from(read_u16_le(&bytes, cursor + 28));
+            let extra_len = usize::from(read_u16_le(&bytes, cursor + 30));
+            let comment_len = usize::from(read_u16_le(&bytes, cursor + 32));
+            let entry_end = cursor + 46 + name_len + extra_len + comment_len;
+            if &bytes[cursor + 46..cursor + 46 + name_len] == duplicate_name.as_bytes() {
+                duplicate = Some(bytes[cursor..entry_end].to_vec());
+                break;
+            }
+            cursor = entry_end;
+        }
+        let mut duplicate = duplicate.expect("central entry to duplicate");
+        duplicate[46..46 + replacement_name.len()].copy_from_slice(replacement_name.as_bytes());
+        bytes.splice(eocd..eocd, duplicate.iter().copied());
+        let new_eocd = eocd + duplicate.len();
+        let count = read_u16_le(&bytes, new_eocd + 10)
+            .checked_add(1)
+            .expect("entry count");
+        bytes[new_eocd + 8..new_eocd + 10].copy_from_slice(&count.to_le_bytes());
+        bytes[new_eocd + 10..new_eocd + 12].copy_from_slice(&count.to_le_bytes());
+        let central_size = read_u32_le(&bytes, new_eocd + 12)
+            .checked_add(u32::try_from(duplicate.len()).expect("central entry length"))
+            .expect("central size");
+        bytes[new_eocd + 12..new_eocd + 16].copy_from_slice(&central_size.to_le_bytes());
+        fs::write(path, bytes).expect("write duplicate central entry");
+    }
+
+    fn convert_standard_fixture_to_zip64(
+        path: &std::path::Path,
+        entry_count: u64,
+        central_size: u64,
+        central_offset: u64,
+    ) {
+        let mut bytes = fs::read(path).expect("read standard ZIP fixture");
+        let eocd = standard_eocd_offset(&bytes);
+        let mut standard_eocd = bytes[eocd..].to_vec();
+        standard_eocd[8..12].fill(0xff);
+        standard_eocd[12..20].fill(0xff);
+
+        bytes.truncate(eocd);
+        bytes.extend_from_slice(b"PK\x06\x06");
+        bytes.extend_from_slice(&44u64.to_le_bytes());
+        bytes.extend_from_slice(&45u16.to_le_bytes());
+        bytes.extend_from_slice(&45u16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&entry_count.to_le_bytes());
+        bytes.extend_from_slice(&entry_count.to_le_bytes());
+        bytes.extend_from_slice(&central_size.to_le_bytes());
+        bytes.extend_from_slice(&central_offset.to_le_bytes());
+        bytes.extend_from_slice(b"PK\x06\x07");
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&(eocd as u64).to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&standard_eocd);
+        fs::write(path, bytes).expect("write ZIP64 fixture");
+    }
+
+    fn standard_central_metadata(path: &std::path::Path) -> (u64, u64, u64) {
+        let bytes = fs::read(path).expect("read standard ZIP metadata");
+        let eocd = standard_eocd_offset(&bytes);
+        (
+            u64::from(read_u16_le(&bytes, eocd + 10)),
+            u64::from(read_u32_le(&bytes, eocd + 12)),
+            u64::from(read_u32_le(&bytes, eocd + 16)),
+        )
     }
 
     fn manifest_image(path: &str, content_hash: &str) -> serde_json::Value {
@@ -962,11 +1521,18 @@ mod tests {
         let archive_path = root.join("backup.zip");
         let moved_original = root.join("opened-original.bmp");
 
-        export_snapshot_to_with_hook(&archive_path, vec![item], &store, || {
-            fs::rename(&source_path, &moved_original)?;
-            fs::rename(&replacement_path, &source_path)?;
-            Ok(())
-        })
+        export_snapshot_to_with_io(
+            &archive_path,
+            vec![item],
+            &store,
+            || Ok(()),
+            |path| fs::File::open(path),
+            |_| {
+                fs::rename(&source_path, &moved_original)?;
+                fs::rename(&replacement_path, &source_path)?;
+                Ok(())
+            },
+        )
         .expect("export");
 
         let file = fs::File::open(&archive_path).expect("archive");
@@ -980,6 +1546,108 @@ mod tests {
         assert_eq!(archived, original_bytes);
 
         drop(archive);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn export_opens_at_most_one_blob_handle_at_a_time() {
+        let root = temp_dir("one-open-blob");
+        let store =
+            crate::blobs::store::ImageBlobStore::new(root.join("blobs"), root.join("stage"))
+                .expect("store");
+        let (first, _, _) = opaque_image_item(&store, &"3".repeat(64), 0x33);
+        let (second, _, _) = opaque_image_item(&store, &"4".repeat(64), 0x44);
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let opener_active = Arc::clone(&active);
+        let opener_max = Arc::clone(&max_active);
+
+        export_snapshot_to_with_io(
+            &root.join("backup.zip"),
+            vec![first, second],
+            &store,
+            || Ok(()),
+            move |path| {
+                fs::File::open(path).map(|file| {
+                    TrackedFile::new(file, Arc::clone(&opener_active), opener_max.as_ref())
+                })
+            },
+            |_| Ok(()),
+        )
+        .expect("export");
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn export_rejects_blob_length_changes_after_handle_validation() {
+        let root = temp_dir("blob-length-race");
+        let store =
+            crate::blobs::store::ImageBlobStore::new(root.join("blobs"), root.join("stage"))
+                .expect("store");
+        let (item, source_path, original_bytes) = opaque_image_item(&store, &"5".repeat(64), 0x55);
+        let target = root.join("backup.zip");
+        let existing_target = b"existing complete backup";
+
+        fs::write(&target, existing_target).expect("existing target");
+        let error = export_snapshot_to_with_io(
+            &target,
+            vec![item.clone()],
+            &store,
+            || Ok(()),
+            |path| fs::File::open(path),
+            |path| {
+                fs::OpenOptions::new().write(true).open(path)?.set_len(20)?;
+                Ok(())
+            },
+        )
+        .expect_err("truncate after validation must fail");
+        assert!(
+            format!("{error:#}").contains("blob length changed"),
+            "unexpected truncate error: {error:#}"
+        );
+        assert_eq!(
+            fs::read(&target).expect("target after truncate"),
+            existing_target
+        );
+
+        fs::write(&source_path, &original_bytes).expect("restore source blob");
+        fs::write(&target, existing_target).expect("restore existing target");
+        let error = export_snapshot_to_with_io(
+            &target,
+            vec![item],
+            &store,
+            || Ok(()),
+            |path| fs::File::open(path),
+            |path| {
+                let mut file = fs::OpenOptions::new().append(true).open(path)?;
+                file.write_all(&[0x66; 16])?;
+                file.flush()?;
+                Ok(())
+            },
+        )
+        .expect_err("append after validation must fail");
+        assert!(
+            format!("{error:#}").contains("blob length changed"),
+            "unexpected append error: {error:#}"
+        );
+        assert_eq!(
+            fs::read(&target).expect("target after append"),
+            existing_target
+        );
+
+        let leftovers = fs::read_dir(&root)
+            .expect("read root")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
+
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -1021,6 +1689,71 @@ mod tests {
         let archive = zip::ZipArchive::new(file).expect("zip");
         assert_eq!(archive.len(), 2, "manifest plus one unique blob");
         drop(archive);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn export_orders_equal_rank_items_and_first_blob_references_by_id() {
+        let root = temp_dir("deterministic-order");
+        let store =
+            crate::blobs::store::ImageBlobStore::new(root.join("blobs"), root.join("stage"))
+                .expect("store");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        for (id, hash_byte) in [("c", 'c'), ("a", 'a'), ("b", 'b')] {
+            let content_hash = hash_byte.to_string().repeat(64);
+            let source_path = store.blob_dir().join(format!("{content_hash}.bmp"));
+            fs::write(&source_path, opaque_bmp(64)).expect("source blob");
+            repository
+                .lock()
+                .expect("repository lock")
+                .insert_imported_item(&ClipboardItem {
+                    id: id.to_string(),
+                    hash: format!("record-{id}"),
+                    item_type: "image".to_string(),
+                    content: None,
+                    content_path: Some(source_path.to_string_lossy().into_owned()),
+                    content_hash: Some(content_hash),
+                    preview: id.to_string(),
+                    source_app: None,
+                    favorite: false,
+                    pinned: false,
+                    size_bytes: 78,
+                    created_at: 1,
+                    updated_at: 1,
+                })
+                .expect("insert equal-rank item");
+        }
+
+        let expected_ids = ["a", "b", "c"];
+        let expected_entries = vec![
+            "manifest.json".to_string(),
+            format!("blobs/{}.bmp", "a".repeat(64)),
+            format!("blobs/{}.bmp", "b".repeat(64)),
+            format!("blobs/{}.bmp", "c".repeat(64)),
+        ];
+        for run in 0..3 {
+            let archive_path = root.join(format!("backup-{run}.zip"));
+            export_zip_to(&archive_path, &repository, &store).expect("deterministic export");
+            let file = fs::File::open(&archive_path).expect("archive");
+            let mut archive = zip::ZipArchive::new(file).expect("ZIP");
+            let manifest: serde_json::Value =
+                serde_json::from_reader(archive.by_name("manifest.json").expect("manifest"))
+                    .expect("manifest JSON");
+            let ids = manifest["items"]
+                .as_array()
+                .expect("manifest items")
+                .iter()
+                .map(|item| item["id"].as_str().expect("item id"))
+                .collect::<Vec<_>>();
+            assert_eq!(ids, expected_ids);
+            let entries = archive.file_names().map(str::to_string).collect::<Vec<_>>();
+            assert_eq!(entries, expected_entries);
+        }
+
+        drop(repository);
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -1150,6 +1883,7 @@ mod tests {
         );
         let (hook_entered_tx, hook_entered_rx) = mpsc::channel();
         let (release_hook_tx, release_hook_rx) = mpsc::channel();
+        let (writer_attempted_tx, writer_attempted_rx) = mpsc::channel();
         let (writer_entered_tx, writer_entered_rx) = mpsc::channel();
         let worker_repository = Arc::clone(&repository);
         let worker_store = Arc::clone(&store);
@@ -1171,14 +1905,21 @@ mod tests {
 
         let writer_store = Arc::clone(&store);
         let writer = thread::spawn(move || {
+            writer_attempted_tx
+                .send(())
+                .expect("signal writer write-lease attempt");
             writer_store.with_write(|_, _| {
                 writer_entered_tx.send(()).expect("signal writer");
                 Ok(())
             })
         });
-        assert!(writer_entered_rx
-            .recv_timeout(Duration::from_millis(100))
-            .is_err());
+        writer_attempted_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("writer attempted write lease");
+        assert!(matches!(
+            writer_entered_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         release_hook_tx.send(()).expect("release exporter");
         writer_entered_rx
             .recv_timeout(Duration::from_secs(2))
@@ -1215,6 +1956,78 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
             .count();
         assert_eq!(leftovers, 0);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn atomic_install_failure_preserves_existing_and_absent_targets() {
+        for existing in [false, true] {
+            let root = temp_dir(if existing {
+                "install-failure-existing"
+            } else {
+                "install-failure-new"
+            });
+            fs::create_dir_all(&root).expect("root");
+            let target = root.join("backup.zip");
+            if existing {
+                fs::write(&target, b"existing complete backup").expect("existing target");
+            }
+
+            let error = write_backup_atomically_with_installer(
+                &target,
+                |file| {
+                    file.write_all(b"complete new backup")?;
+                    Ok(())
+                },
+                |_, _| Err(anyhow::anyhow!("injected install failure")),
+            )
+            .expect_err("install failure must propagate");
+
+            assert!(format!("{error:#}").contains("injected install failure"));
+            if existing {
+                assert_eq!(
+                    fs::read(&target).expect("existing target after failure"),
+                    b"existing complete backup"
+                );
+            } else {
+                assert!(!target.exists());
+            }
+            let leftovers = fs::read_dir(&root)
+                .expect("read root")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+                .count();
+            assert_eq!(leftovers, 0);
+            fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_atomic_install_requests_replace_and_write_through() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+
+        let root = temp_dir("install-flags");
+        fs::create_dir_all(&root).expect("root");
+        let temp = root.join("backup.tmp");
+        let target = root.join("backup.zip");
+        let observed = AtomicUsize::new(0);
+
+        let error = replace_target_with(&temp, &target, |source, destination, flags| {
+            assert_eq!(source, temp);
+            assert_eq!(destination, target);
+            observed.store(flags as usize, Ordering::SeqCst);
+            Err(std::io::Error::other("injected move failure"))
+        })
+        .expect_err("injected move must fail");
+
+        assert!(format!("{error:#}").contains("injected move failure"));
+        assert_eq!(
+            observed.load(Ordering::SeqCst) as u32,
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -1465,6 +2278,156 @@ mod tests {
             parse_backup_info_path(&path).is_err(),
             "traversal path must fail"
         );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn parse_backup_info_rejects_duplicate_raw_zip_entry_names() {
+        let root = temp_dir("parse-raw-duplicates");
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("backup.zip");
+
+        write_test_zip(
+            &path,
+            &serde_json::json!({
+                "version": 2,
+                "exported_at": "2026-07-15T00:00:00Z",
+                "item_count": 0,
+                "items": []
+            }),
+            &[],
+        );
+        duplicate_raw_central_entry(&path, "manifest.json");
+        assert!(
+            parse_backup_info_path(&path).is_err(),
+            "duplicate raw manifest entries must fail"
+        );
+
+        let hash = "0".repeat(64);
+        let blob_name = format!("blobs/{hash}.bmp");
+        write_test_zip(
+            &path,
+            &serde_json::json!({
+                "version": 2,
+                "exported_at": "2026-07-15T00:00:00Z",
+                "item_count": 1,
+                "items": [manifest_image(&blob_name, &hash)]
+            }),
+            &[&blob_name],
+        );
+        duplicate_raw_central_entry(&path, &blob_name);
+        assert!(
+            parse_backup_info_path(&path).is_err(),
+            "duplicate raw blob entries must fail"
+        );
+
+        write_test_zip(
+            &path,
+            &serde_json::json!({
+                "version": 2,
+                "exported_at": "2026-07-15T00:00:00Z",
+                "item_count": 1,
+                "items": [manifest_image(&blob_name, &hash)]
+            }),
+            &[&blob_name],
+        );
+        let backslash_name = blob_name.replace('/', "\\");
+        duplicate_raw_central_entry_as(&path, &blob_name, &backslash_name);
+        assert!(
+            parse_backup_info_path(&path).is_err(),
+            "normalized duplicate raw blob entries must fail"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn parse_backup_info_preflights_standard_zip_counts_and_bounds() {
+        let root = temp_dir("parse-standard-preflight");
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("backup.zip");
+        let manifest = serde_json::json!({
+            "version": 2,
+            "exported_at": "2026-07-15T00:00:00Z",
+            "item_count": 0,
+            "items": []
+        });
+
+        write_test_zip(&path, &manifest, &[]);
+        let mut bytes = fs::read(&path).expect("read count fixture");
+        let eocd = standard_eocd_offset(&bytes);
+        bytes[eocd + 8..eocd + 10].copy_from_slice(&60_000u16.to_le_bytes());
+        bytes[eocd + 10..eocd + 12].copy_from_slice(&60_000u16.to_le_bytes());
+        fs::write(&path, bytes).expect("patch entry count");
+        let error = parse_backup_info_path(&path).expect_err("impossible entry count must fail");
+        assert!(format!("{error:#}").contains("entry count exceeds declared central directory"));
+
+        write_test_zip(&path, &manifest, &[]);
+        let mut bytes = fs::read(&path).expect("read central size fixture");
+        let eocd = standard_eocd_offset(&bytes);
+        bytes[eocd + 12..eocd + 16].copy_from_slice(&(64u32 * 1024 * 1024 + 1).to_le_bytes());
+        fs::write(&path, bytes).expect("patch central size");
+        let error =
+            parse_backup_info_path(&path).expect_err("oversize central directory must fail");
+        assert!(format!("{error:#}").contains("central directory exceeds"));
+
+        write_test_zip(&path, &manifest, &[]);
+        let mut bytes = fs::read(&path).expect("read central offset fixture");
+        let eocd = standard_eocd_offset(&bytes);
+        bytes[eocd + 16..eocd + 20].copy_from_slice(&0xffff_fffeu32.to_le_bytes());
+        fs::write(&path, bytes).expect("patch central offset");
+        let error =
+            parse_backup_info_path(&path).expect_err("out-of-range central offset must fail");
+        assert!(format!("{error:#}").contains("central directory is outside the ZIP file"));
+
+        write_test_zip(&path, &manifest, &[]);
+        let mut bytes = fs::read(&path).expect("read multi-disk fixture");
+        let eocd = standard_eocd_offset(&bytes);
+        let central_start = usize::try_from(read_u32_le(&bytes, eocd + 16)).expect("central start");
+        bytes[central_start + 34..central_start + 36].copy_from_slice(&1u16.to_le_bytes());
+        fs::write(&path, bytes).expect("patch central disk number");
+        let error = parse_backup_info_path(&path).expect_err("multi-disk entry must fail");
+        assert!(format!("{error:#}").contains("multi-disk ZIP"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn parse_backup_info_preflights_zip64_counts_and_bounds() {
+        let root = temp_dir("parse-zip64-preflight");
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("backup.zip");
+        let manifest = serde_json::json!({
+            "version": 2,
+            "exported_at": "2026-07-15T00:00:00Z",
+            "item_count": 0,
+            "items": []
+        });
+
+        write_test_zip(&path, &manifest, &[]);
+        let (count, central_size, central_offset) = standard_central_metadata(&path);
+        convert_standard_fixture_to_zip64(&path, count, central_size, central_offset);
+        let info = parse_backup_info_path(&path).expect("valid synthetic ZIP64 metadata");
+        assert_eq!(info.version, "2");
+
+        write_test_zip(&path, &manifest, &[]);
+        let (_, central_size, central_offset) = standard_central_metadata(&path);
+        convert_standard_fixture_to_zip64(&path, 100_002, central_size, central_offset);
+        let error = parse_backup_info_path(&path).expect_err("ZIP64 entry bomb must fail");
+        assert!(format!("{error:#}").contains("ZIP entry count exceeds"));
+
+        write_test_zip(&path, &manifest, &[]);
+        let (count, _, _) = standard_central_metadata(&path);
+        convert_standard_fixture_to_zip64(&path, count, 100, u64::MAX - 10);
+        let error = parse_backup_info_path(&path).expect_err("overflowing ZIP64 bounds must fail");
+        assert!(format!("{error:#}").contains("central directory bounds overflow"));
+
+        write_test_zip(&path, &manifest, &[]);
+        let (count, _, central_offset) = standard_central_metadata(&path);
+        convert_standard_fixture_to_zip64(&path, count, 64u64 * 1024 * 1024 + 1, central_offset);
+        let error = parse_backup_info_path(&path).expect_err("oversize ZIP64 central must fail");
+        assert!(format!("{error:#}").contains("central directory exceeds"));
 
         fs::remove_dir_all(root).expect("cleanup");
     }

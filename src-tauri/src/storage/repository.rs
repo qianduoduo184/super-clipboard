@@ -1715,7 +1715,7 @@ impl ClipboardRepository {
             "SELECT id, hash, item_type, content, content_path, preview, source_app, favorite, pinned, size_bytes, created_at, updated_at, content_hash
              FROM clipboard_items
              WHERE deleted_at IS NULL
-             ORDER BY pinned DESC, COALESCE(sort_rank, updated_at) DESC, updated_at DESC
+             ORDER BY pinned DESC, COALESCE(sort_rank, updated_at) DESC, updated_at DESC, id ASC
              LIMIT ?1",
         )?;
         let rows = statement.query_map(params![limit], Self::map_item)?;
