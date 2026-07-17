@@ -214,6 +214,12 @@ export default function App() {
     ...getVisibleFilters(navFiltersConfig),
   ] as Array<{ key: FilterType; label: string }>;
 
+  const statusTone = capacityStatus.blocked || !backendAvailable
+    ? 'warning'
+    : recording
+      ? 'connected'
+      : 'paused';
+
   useEffect(() => {
     getSettings()
       .then((settings) => {
@@ -769,20 +775,28 @@ export default function App() {
           </div>
           <div>
             <h1>super-clipboard</h1>
-            <p role="status" aria-live="polite">
-              {capacityStatus.blocked
-                ? capacityStatus.message
-                : recording
-                  ? statusMessage
-                  : '已暂停记录'}
-            </p>
+            <div className={`app-status ${statusTone}`}>
+              <span className="status-dot" aria-hidden="true" />
+              <p role="status" aria-live="polite">
+                {capacityStatus.blocked
+                  ? capacityStatus.message
+                  : recording
+                    ? statusMessage
+                    : '已暂停记录'}
+              </p>
+            </div>
           </div>
         </div>
         <div className="toolbar-actions">
-          <button className="icon-button" title={recording ? '暂停记录' : '恢复记录'} onClick={() => void handleRecordingChange(!recording)}>
+          <button
+            className="icon-button"
+            title={recording ? '暂停记录' : '恢复记录'}
+            aria-label={recording ? '暂停记录' : '恢复记录'}
+            onClick={() => void handleRecordingChange(!recording)}
+          >
             {recording ? <Pause size={17} /> : <Play size={17} />}
           </button>
-          <button className="icon-button" title="设置" onClick={() => setSettingsOpen(true)}>
+          <button className="icon-button" title="设置" aria-label="打开设置" onClick={() => setSettingsOpen(true)}>
             <Settings size={17} />
           </button>
         </div>
@@ -794,6 +808,7 @@ export default function App() {
           value={query}
           onChange={(event) => setQuery(event.target.value)}
           placeholder="搜索文本、文件名或来源"
+          aria-label="搜索剪贴板记录"
           autoFocus
         />
       </section>
@@ -811,6 +826,7 @@ export default function App() {
         <button
           className="filter-chip nav-config-btn"
           title="配置导航过滤器"
+          aria-label="配置导航过滤器"
           onClick={() => setNavConfigOpen(!navConfigOpen)}
         >
           <SlidersHorizontal size={16} />
@@ -822,7 +838,12 @@ export default function App() {
           <div className="nav-config-panel" onClick={(e) => e.stopPropagation()}>
             <div className="nav-config-header">
               <h2>导航过滤器设置</h2>
-              <button className="icon-button" onClick={() => setNavConfigOpen(false)}>
+              <button
+                className="icon-button"
+                title="关闭"
+                aria-label="关闭导航过滤器设置"
+                onClick={() => setNavConfigOpen(false)}
+              >
                 <X size={16} />
               </button>
             </div>
@@ -868,7 +889,9 @@ export default function App() {
                       }}
                       onDragEnd={() => setDraggingFilterKey(null)}
                     >
-                      <span className={`drag-handle ${isAll ? 'disabled' : ''}`}>::</span>
+                      <span className={`drag-handle ${isAll ? 'disabled' : ''}`} aria-hidden="true">
+                        <GripVertical size={16} />
+                      </span>
                       <label>
                         <input
                           type="checkbox"
@@ -891,7 +914,9 @@ export default function App() {
                 .filter((f) => !navFiltersConfig.visible.includes(f.key))
                 .map((filter) => (
                   <div key={filter.key} className="nav-config-item not-draggable">
-                    <span className="drag-handle" style={{ opacity: 0.3 }}>::</span>
+                    <span className="drag-handle" style={{ opacity: 0.3 }} aria-hidden="true">
+                      <GripVertical size={16} />
+                    </span>
                     <label>
                       <input
                         type="checkbox"
@@ -1038,7 +1063,7 @@ export default function App() {
               <span className="item-main">
                 <span className="item-preview">{getVisualPreview(item)}</span>
                 <span className="item-meta">
-                  {formatTime(item.updatedAt)}
+                  {[item.source, formatTime(item.updatedAt), item.size].filter(Boolean).join(' · ')}
                 </span>
               </span>
               <span className="item-indicators">
@@ -1050,7 +1075,13 @@ export default function App() {
           })}
             </div>
           </div>
-          {visibleItems.length === 0 ? <div className="empty-state">没有匹配的剪贴板记录</div> : null}
+          {visibleItems.length === 0 ? (
+            <div className="empty-state">
+              <span className="empty-state-icon" aria-hidden="true"><Clipboard size={20} /></span>
+              <strong>没有匹配的剪贴板记录</strong>
+              <p>尝试调整关键词或筛选条件</p>
+            </div>
+          ) : null}
         </div>
 
         {previewEnabled ? (
@@ -1063,22 +1094,33 @@ export default function App() {
             {selectedItem ? (
               <>
                 <div className="detail-header">
-                  <span className="detail-type">{getTypeLabel(selectedItem.type)}</span>
-                  <span role="status" aria-live="polite">
+                  <div className="detail-heading">
+                    <span className="detail-overline">当前记录</span>
+                    <strong>内容详情</strong>
+                  </div>
+                  <div className="detail-header-meta">
+                    <span className="detail-type">{getTypeLabel(selectedItem.type)}</span>
+                    <span role="status" aria-live="polite">
                     {selectedDetailLoadStatus.loading
                       ? '正在加载完整内容…'
                       : selectedDetailLoadStatus.error ?? selectedItem.size}
-                  </span>
+                    </span>
+                  </div>
                 </div>
                 {selectedItem.type === 'image' && detailImagePath ? (
                   <div className="image-preview">
                     <img src={convertFileSrc(detailImagePath)} alt="剪贴板图片预览" />
                   </div>
                 ) : (
-                  <pre aria-busy={selectedDetailLoadStatus.loading}>{detailDisplayContent}</pre>
+                  <pre
+                    className={selectedDetailLoadStatus.loading ? 'detail-content is-loading' : 'detail-content'}
+                    aria-busy={selectedDetailLoadStatus.loading}
+                  >
+                    {detailDisplayContent}
+                  </pre>
                 )}
                 <div className="detail-actions">
-                  <button onClick={() => void pasteSelectedItem()}>
+                  <button className="primary-action" onClick={() => void pasteSelectedItem()}>
                     <Pin size={16} />
                     粘贴
                   </button>
@@ -1101,7 +1143,11 @@ export default function App() {
                 </div>
               </>
             ) : (
-              <div className="empty-state">选择一条记录查看详情</div>
+              <div className="empty-state">
+                <span className="empty-state-icon" aria-hidden="true"><Clipboard size={20} /></span>
+                <strong>选择一条记录</strong>
+                <p>选中后可预览并快速粘贴</p>
+              </div>
             )}
           </aside>
           </>
