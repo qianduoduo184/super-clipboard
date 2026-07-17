@@ -26,6 +26,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -46,43 +49,17 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Calculate version-specific build number
-        id: build-number
+      - name: Calculate and synchronize release version
+        id: version
         shell: pwsh
         run: |
-          # Read current version from tauri.conf.json
-          $config = Get-Content "src-tauri\tauri.conf.json" -Raw | ConvertFrom-Json
-          $version = $config.version
-          Write-Host "Current version: $version"
-
-          # Get all tags for this version
-          git fetch --tags
-          $tags = git tag -l "super-clipboard-v${version}-*" | Sort-Object
-
-          if ($tags) {
-            # Extract build numbers and find the highest
-            $buildNumbers = $tags | ForEach-Object {
-              if ($_ -match "super-clipboard-v${version}-(\d+)") {
-                [int]$matches[1]
-              }
-            }
-            $maxBuild = ($buildNumbers | Measure-Object -Maximum).Maximum
-            $nextBuild = $maxBuild + 1
-          } else {
-            # First build for this version
-            $nextBuild = 1
+          git fetch --tags --force
+          $version = node scripts/versioning.mjs
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            throw "Versioning script did not return a release version."
           }
-
-          Write-Host "Next build number: $nextBuild"
-          "build_number=$nextBuild" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-          # Update version in tauri.conf.json to include build number
-          # Tauri requires build metadata to be numeric-only, so use "+5" instead of "+build.5"
-          $fullVersion = "${version}+${nextBuild}"
-          $config.version = $fullVersion
-          $config | ConvertTo-Json -Depth 100 | Set-Content "src-tauri\tauri.conf.json" -Encoding utf8
-          Write-Host "Updated tauri.conf.json version to: $fullVersion"
+          Write-Host "Release version: $version"
 
       - name: Run frontend checks
         run: npm run ci:frontend
@@ -109,12 +86,12 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: super-clipboard-v__VERSION__-${{ steps.build-number.outputs.build_number }}
-          releaseName: super-clipboard v__VERSION__ build ${{ steps.build-number.outputs.build_number }}
+          tagName: super-clipboard-v__VERSION__
+          releaseName: super-clipboard v__VERSION__
           releaseBody: |
-            自动发版：本预发布版由 GitHub Actions 在 main 分支提交后生成。
+            自动发版：本版本由 GitHub Actions 在 main 分支提交后生成。
 
-            **版本**: v${{ steps.build-number.outputs.version }} build ${{ steps.build-number.outputs.build_number }}
+            **版本**: v${{ steps.version.outputs.version }}
 
             验证内容：
             - npm test
@@ -131,6 +108,7 @@ jobs:
         run: |
           Write-Warning "TAURI_SIGNING_PRIVATE_KEY is not configured. Building the NSIS installer without updater artifacts."
           $configPath = "src-tauri\tauri.conf.json"
+          Copy-Item $configPath "$env:RUNNER_TEMP\tauri.release.conf.json"
           $config = Get-Content $configPath -Raw | ConvertFrom-Json
           $config.bundle.createUpdaterArtifacts = $false
           $config | ConvertTo-Json -Depth 100 | Set-Content $configPath -Encoding utf8
@@ -141,12 +119,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: super-clipboard-v__VERSION__-${{ steps.build-number.outputs.build_number }}
-          releaseName: super-clipboard v__VERSION__ build ${{ steps.build-number.outputs.build_number }}
+          tagName: super-clipboard-v__VERSION__
+          releaseName: super-clipboard v__VERSION__
           releaseBody: |
             自动发版：本版本由 GitHub Actions 在 main 分支提交后生成。
 
-            **版本**: v${{ steps.build-number.outputs.version }} build ${{ steps.build-number.outputs.build_number }}
+            **版本**: v${{ steps.version.outputs.version }}
 
             验证内容：
             - npm test
@@ -156,3 +134,28 @@ jobs:
             注意：仓库未配置 TAURI_SIGNING_PRIVATE_KEY，本次 Release 只上传 Windows 安装包，不生成 updater artifacts。配置 updater signing Secret 后，后续 Release 会恢复自动更新产物。
           releaseDraft: false
           prerelease: false
+
+      - name: Restore updater configuration
+        if: steps.signing-secrets.outputs.available != 'true' && always()
+        shell: pwsh
+        run: |
+          $savedConfig = "$env:RUNNER_TEMP\tauri.release.conf.json"
+          if (Test-Path $savedConfig) {
+            Copy-Item $savedConfig "src-tauri\tauri.conf.json" -Force
+          }
+
+      - name: Persist released version
+        if: success()
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
+          if (git diff --cached --quiet) {
+            Write-Host "Version files already contain $env:RELEASE_VERSION."
+            exit 0
+          }
+          git commit -m "chore: bump version to $env:RELEASE_VERSION [skip ci]"
+          git push origin HEAD:main

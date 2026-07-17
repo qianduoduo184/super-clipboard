@@ -4,7 +4,11 @@ super-clipboard 使用 GitHub Actions 自动构建 Windows 成品并上传到 Gi
 
 ## 自动发版策略
 
-每次推送到 `main` 分支后会触发 `.github/workflows/release.yml`。如果仓库还没有配置 updater signing Secret，workflow 会临时关闭 updater artifacts，仍然构建并上传 Windows 安装包；配置好 Secret 后会额外生成自动更新所需的签名产物。
+每次推送到 `main` 分支后会触发 `.github/workflows/release.yml`。Release workflow 会根据仓库清单版本和已有 Release tag 自动选择下一个稳定 PATCH 版本。例如当前最高版本为 `1.1.1` 时，下一次成功构建会发布 `1.1.2`。如果仓库清单已被人工提升到更高的 MINOR 或 MAJOR 版本，则优先采用该显式版本。
+
+版本会在构建前同步到 `package.json`、`package-lock.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 和 `src-tauri/Cargo.lock`。Release 创建成功后，GitHub Actions 会将这些版本文件提交回 `main`，提交消息带有 `[skip ci]`，因此不会递归触发下一轮构建。
+
+如果仓库还没有配置 updater signing Secret，workflow 会临时关闭 updater artifacts，仍然构建并上传 Windows 安装包；构建结束后会恢复配置，避免把临时关闭状态提交回仓库。配置好 Secret 后会额外生成自动更新所需的签名产物。
 
 完整发布流程：
 
@@ -12,24 +16,26 @@ super-clipboard 使用 GitHub Actions 自动构建 Windows 成品并上传到 Gi
 2. 安装 Node.js 22。
 3. 安装 Rust stable。
 4. 执行 `npm ci`。
-5. 执行 `npm test`。
-6. 执行 `npx tsc --noEmit`。
-7. 检查 updater signing Secret 是否存在。
-8. Secret 存在时，预检 updater 私钥格式和密码。
-9. Secret 缺失时，临时关闭 `bundle.createUpdaterArtifacts`。
-10. 使用 `tauri-apps/tauri-action@v0` 构建 Tauri Windows 应用。
-11. 创建 GitHub Release，并上传 Tauri 生成的安装包。
+5. 计算下一个稳定版本并同步全部版本文件。
+6. 执行 `npm test`。
+7. 执行 `npx tsc --noEmit`。
+8. 检查 updater signing Secret 是否存在。
+9. Secret 存在时，预检 updater 私钥格式和密码。
+10. Secret 缺失时，临时关闭 `bundle.createUpdaterArtifacts`。
+11. 使用 `tauri-apps/tauri-action@v0` 构建 Tauri Windows 应用。
+12. 创建 GitHub Release，并上传 Tauri 生成的安装包。
+13. 将成功发布的版本号提交回 `main`。
 
 自动发版 tag 格式：
 
 ```text
-super-clipboard-v<应用版本>-<GitHub Actions run number>
+super-clipboard-v<应用版本>
 ```
 
 示例：
 
 ```text
-super-clipboard-v0.1.0-12
+super-clipboard-v1.1.2
 ```
 
 ## 手动发版
@@ -82,6 +88,8 @@ src-tauri/target/release/bundle/
 
 - 每次任务产生代码或文档修改后，完成验证即提交并推送。
 - 每次推送到 `main` 后，由 GitHub Actions 自动生成正式 Release。
+- 未明确指定版本类型时，“构建”或“发版”默认自动递增 PATCH 版本。
+- 如需 MINOR 或 MAJOR 版本，先显式同步仓库中的五个版本文件；Action 会尊重高于现有 Release tag 的显式版本。
 - 自动更新依赖 GitHub latest release endpoint；如果改回 prerelease，需要同步调整 updater endpoint。
 
 ## 自动更新签名
