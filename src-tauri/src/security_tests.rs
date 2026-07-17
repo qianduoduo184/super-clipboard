@@ -1,8 +1,6 @@
 #[cfg(test)]
 mod security_tests {
     use std::fs;
-    use std::path::Path;
-
     /// Test that path traversal attacks are blocked in blob reading
     #[test]
     fn test_blob_path_traversal_blocked() {
@@ -43,7 +41,10 @@ mod security_tests {
         use crate::storage::repository::ClipboardRepository;
         use uuid::Uuid;
 
-        let path = std::env::temp_dir().join(format!("super-clipboard-fts-security-{}.sqlite3", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!(
+            "super-clipboard-fts-security-{}.sqlite3",
+            Uuid::new_v4()
+        ));
         let repository = ClipboardRepository::open(path.clone()).expect("open repository");
 
         // Insert test data
@@ -104,9 +105,21 @@ mod security_tests {
 
         // Verify that our limits are reasonable for normal use
         // but prevent extreme cases
-        assert!(MAX_TEXT_SIZE > 10_000_000, "Should allow large text (10M+ chars)");
-        assert!(MAX_TEXT_SIZE < 1_000_000_000, "Should prevent extreme text (1B+ chars)");
-        assert!(MAX_BLOB_SIZE > 50_000_000, "Should allow large images (50MB+)");
-        assert!(MAX_BLOB_SIZE < 5_000_000_000, "Should prevent extreme blobs (5GB+)");
+        assert!(
+            MAX_TEXT_SIZE > 10_000_000,
+            "Should allow large text (10M+ chars)"
+        );
+        assert!(
+            MAX_TEXT_SIZE < 1_000_000_000,
+            "Should prevent extreme text (1B+ chars)"
+        );
+        assert!(
+            MAX_BLOB_SIZE > 50_000_000,
+            "Should allow large images (50MB+)"
+        );
+        assert!(
+            MAX_BLOB_SIZE < 5_000_000_000,
+            "Should prevent extreme blobs (5GB+)"
+        );
     }
 }
