@@ -123,4 +123,3 @@ All behavior changes follow test-driven development. Tests cover:
 - Repository lock release around slow I/O where testable through extracted units.
 
 Final verification runs frontend tests, TypeScript type checking, Rust tests, frontend production build, and Rust release build. Ignored real-clipboard tests are run serially only when explicitly allowed because they overwrite the user's clipboard.
-
