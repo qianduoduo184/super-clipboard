@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -749,7 +750,7 @@ mod tests {
         // With trigram tokenizer, search for shorter substrings (3+ chars) from the URL
         let url_results = repository
             .search(
-                "example".to_string(),  // Search for domain name keyword instead of full URL
+                "example".to_string(), // Search for domain name keyword instead of full URL
                 SearchFilters {
                     item_type: Some("text".to_string()),
                     favorites_only: false,
@@ -784,27 +785,25 @@ mod tests {
         conn.execute(
             "CREATE VIRTUAL TABLE test_fts USING fts5(content, tokenize='trigram')",
             [],
-        ).expect("create table");
+        )
+        .expect("create table");
 
         conn.execute(
             "INSERT INTO test_fts(content) VALUES (?)",
             ["同步组织排序码到云之家"],
-        ).expect("insert");
+        )
+        .expect("insert");
 
         // First, check if data is actually in the table
-        let row_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM test_fts",
-            [],
-            |row| row.get(0),
-        ).expect("count");
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM test_fts", [], |row| row.get(0))
+            .expect("count");
         println!("Total rows in FTS table: {}", row_count);
 
         // Check the actual content
-        let content: String = conn.query_row(
-            "SELECT content FROM test_fts",
-            [],
-            |row| row.get(0),
-        ).expect("get content");
+        let content: String = conn
+            .query_row("SELECT content FROM test_fts", [], |row| row.get(0))
+            .expect("get content");
         println!("Stored content: {}", content);
 
         // Test trigram tokenizer with CJK text
@@ -812,29 +811,35 @@ mod tests {
 
         // Test 1: Exact substring match (trigram should handle this)
         let q1 = r#""云之家""#;
-        let c1: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM test_fts WHERE test_fts MATCH ?",
-            [q1],
-            |row| row.get(0),
-        ).unwrap_or(0);
+        let c1: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM test_fts WHERE test_fts MATCH ?",
+                [q1],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
         println!("Query '{}' -> {}", q1, c1);
 
         // Test 2: Single character
         let q2 = r#""云""#;
-        let c2: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM test_fts WHERE test_fts MATCH ?",
-            [q2],
-            |row| row.get(0),
-        ).unwrap_or(0);
+        let c2: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM test_fts WHERE test_fts MATCH ?",
+                [q2],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
         println!("Query '{}' -> {}", q2, c2);
 
         // Test 3: Two characters
         let q3 = r#""云之""#;
-        let c3: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM test_fts WHERE test_fts MATCH ?",
-            [q3],
-            |row| row.get(0),
-        ).unwrap_or(0);
+        let c3: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM test_fts WHERE test_fts MATCH ?",
+                [q3],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
         println!("Query '{}' -> {}", q3, c3);
 
         assert!(c1 > 0, "Trigram tokenizer should match CJK substring");
@@ -904,12 +909,25 @@ mod tests {
                 None,
             )
             .expect("2-char search");
-        assert_eq!(results_2char.len(), 2, "Should find 'ab' substring in two items (123ab332sddsdf and test ab content)");
+        assert_eq!(
+            results_2char.len(),
+            2,
+            "Should find 'ab' substring in two items (123ab332sddsdf and test ab content)"
+        );
 
         // Verify the specific items found
-        let found_previews: Vec<&str> = results_2char.iter().map(|item| item.preview.as_str()).collect();
-        assert!(found_previews.contains(&"123ab332sddsdf"), "Should find '123ab332sddsdf'");
-        assert!(found_previews.contains(&"test ab content"), "Should find 'test ab content'");
+        let found_previews: Vec<&str> = results_2char
+            .iter()
+            .map(|item| item.preview.as_str())
+            .collect();
+        assert!(
+            found_previews.contains(&"123ab332sddsdf"),
+            "Should find '123ab332sddsdf'"
+        );
+        assert!(
+            found_previews.contains(&"test ab content"),
+            "Should find 'test ab content'"
+        );
 
         // Test 3-char query (should use FTS5 trigram)
         let results_3char = repository
@@ -923,7 +941,11 @@ mod tests {
                 None,
             )
             .expect("3-char search");
-        assert_eq!(results_3char.len(), 1, "Should find '3ab' in one item via trigram");
+        assert_eq!(
+            results_3char.len(),
+            1,
+            "Should find '3ab' in one item via trigram"
+        );
         assert_eq!(results_3char[0].preview, "123ab332sddsdf");
 
         // Test substring in middle
@@ -938,7 +960,11 @@ mod tests {
                 None,
             )
             .expect("middle substring search");
-        assert_eq!(results_middle.len(), 1, "Should find 'ab3' substring via trigram");
+        assert_eq!(
+            results_middle.len(),
+            1,
+            "Should find 'ab3' substring via trigram"
+        );
         assert_eq!(results_middle[0].preview, "123ab332sddsdf");
     }
 
@@ -1101,7 +1127,10 @@ mod tests {
         let start = std::time::Instant::now();
         for i in 0..1000 {
             repository
-                .insert_or_touch(text_draft(&format!("测试条目 {}: 这是一段中文内容用于测试搜索性能", i)))
+                .insert_or_touch(text_draft(&format!(
+                    "测试条目 {}: 这是一段中文内容用于测试搜索性能",
+                    i
+                )))
                 .expect("insert");
         }
         let insert_duration = start.elapsed();
@@ -1111,7 +1140,7 @@ mod tests {
         let search_start = std::time::Instant::now();
         let results = repository
             .search(
-                "测试条目".to_string(),  // Trigram requires 3+ characters
+                "测试条目".to_string(), // Trigram requires 3+ characters
                 SearchFilters {
                     item_type: Some("text".to_string()),
                     favorites_only: false,
@@ -1124,9 +1153,15 @@ mod tests {
         println!("搜索耗时: {:?}, 结果数: {}", search_duration, results.len());
 
         // Performance assertions
-        assert!(insert_duration.as_millis() < 5000, "插入 1,000 条应在 5 秒内完成");
+        assert!(
+            insert_duration.as_millis() < 5000,
+            "插入 1,000 条应在 5 秒内完成"
+        );
         assert!(search_duration.as_millis() < 100, "搜索应在 100ms 内完成");
-        assert!(results.len() >= 50, "应至少返回 50 条结果（trigram 需要 3+ 字符查询）");
+        assert!(
+            results.len() >= 50,
+            "应至少返回 50 条结果（trigram 需要 3+ 字符查询）"
+        );
     }
 
     #[test]
@@ -1195,7 +1230,11 @@ mod tests {
             )
             .expect("fts search");
         let fts_duration = fts_start.elapsed();
-        println!("FTS 搜索耗时: {:?}, 结果数: {}", fts_duration, search_results.len());
+        println!(
+            "FTS 搜索耗时: {:?}, 结果数: {}",
+            fts_duration,
+            search_results.len()
+        );
 
         // Performance assertions
         assert!(query_duration.as_millis() < 50, "分页查询应在 50ms 内完成");
@@ -1254,6 +1293,18 @@ pub struct SearchFilters {
 pub struct ClipboardRepository {
     conn: Connection,
     database_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RepositoryImportMode {
+    Merge,
+    Overwrite,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RepositoryImportResult {
+    pub imported: usize,
+    pub skipped: usize,
 }
 
 impl ClipboardRepository {
@@ -1908,6 +1959,98 @@ impl ClipboardRepository {
         Ok(())
     }
 
+    pub fn import_items_transactionally(
+        &self,
+        items: &[ClipboardItem],
+        mode: RepositoryImportMode,
+    ) -> anyhow::Result<RepositoryImportResult> {
+        let transaction = self.conn.unchecked_transaction()?;
+        if mode == RepositoryImportMode::Overwrite {
+            let final_paths = items
+                .iter()
+                .filter(|item| item.item_type == "image")
+                .filter_map(|item| item.content_path.as_deref())
+                .map(PathBuf::from)
+                .collect::<HashSet<_>>();
+            let old_paths = active_blob_paths_on(&transaction)?
+                .into_iter()
+                .filter(|path| !final_paths.contains(path))
+                .collect::<Vec<_>>();
+            enqueue_cleanup_paths(&transaction, &old_paths)?;
+            transaction.execute("DELETE FROM clipboard_items_fts", [])?;
+            transaction.execute("DELETE FROM clipboard_items", [])?;
+        }
+
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        for item in items {
+            if mode == RepositoryImportMode::Merge {
+                let hash_exists = transaction
+                    .query_row(
+                        "SELECT 1 FROM clipboard_items WHERE hash = ?1 AND deleted_at IS NULL",
+                        params![item.hash],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if hash_exists {
+                    skipped = skipped
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("import skipped count overflow"))?;
+                    continue;
+                }
+                let id_exists = transaction
+                    .query_row(
+                        "SELECT 1 FROM clipboard_items WHERE id = ?1",
+                        params![item.id],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                anyhow::ensure!(
+                    !id_exists,
+                    "import item id conflicts with existing row: {}",
+                    item.id
+                );
+            }
+            insert_imported_item_on(&transaction, item)?;
+            Self::rebuild_fts_for_item_on(&transaction, &item.id)?;
+            imported = imported
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("imported item count overflow"))?;
+        }
+        transaction.commit()?;
+        Ok(RepositoryImportResult { imported, skipped })
+    }
+
+    pub fn any_active_blob_path(&self, paths: &[PathBuf]) -> anyhow::Result<bool> {
+        for path in paths {
+            if self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM clipboard_items
+                     WHERE item_type = 'image' AND content_path = ?1 AND deleted_at IS NULL
+                     LIMIT 1",
+                    params![path.to_string_lossy()],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn active_hashes(&self) -> anyhow::Result<HashSet<String>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT hash FROM clipboard_items WHERE deleted_at IS NULL")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<HashSet<_>, _>>().map_err(Into::into)
+    }
+
     fn rebuild_fts_for_item(&self, id: &str) -> anyhow::Result<()> {
         Self::rebuild_fts_for_item_on(&self.conn, id)
     }
@@ -2156,5 +2299,43 @@ fn enqueue_cleanup_paths(conn: &Connection, paths: &[PathBuf]) -> anyhow::Result
             )?;
         }
     }
+    Ok(())
+}
+
+fn active_blob_paths_on(conn: &Connection) -> anyhow::Result<Vec<PathBuf>> {
+    let mut statement = conn.prepare(
+        "SELECT DISTINCT content_path
+         FROM clipboard_items
+         WHERE item_type = 'image' AND content_path IS NOT NULL AND deleted_at IS NULL",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    rows.map(|row| row.map(PathBuf::from))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn insert_imported_item_on(conn: &Connection, item: &ClipboardItem) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO clipboard_items
+         (id, hash, item_type, content, content_path, content_hash, preview, source_app,
+          favorite, pinned, size_bytes, sort_rank, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            item.id,
+            item.hash,
+            item.item_type,
+            item.content,
+            item.content_path,
+            item.content_hash,
+            item.preview,
+            item.source_app,
+            item.favorite,
+            item.pinned,
+            item.size_bytes,
+            item.updated_at,
+            item.created_at,
+            item.updated_at,
+        ],
+    )?;
     Ok(())
 }

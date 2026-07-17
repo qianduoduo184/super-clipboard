@@ -2,10 +2,15 @@ use tauri::{AppHandle, State};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_updater::UpdaterExt;
 
-use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
+#[cfg(test)]
 use std::io::{Read, Write};
-use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::storage::repository::{ClipboardItem, ClipboardItemSummary, SearchFilters};
@@ -692,6 +697,7 @@ fn validate_migration_paths(old_dir: &Path, new_dir: &Path) -> Result<(), String
     Ok(())
 }
 
+#[cfg(test)]
 fn safe_backup_blob_filename(filename: &str) -> Result<String, String> {
     let path = Path::new(filename);
     if path.is_absolute() {
@@ -889,6 +895,7 @@ pub async fn parse_backup_info(backup_path: String) -> Result<BackupInfo, String
         .map_err(|error| format!("解析备份文件失败: {error:#}"))
 }
 
+#[cfg(test)]
 fn ensure_legacy_json_import(path: &Path) -> Result<(), String> {
     let mut file = fs::File::open(path).map_err(|error| format!("读取备份文件失败: {error}"))?;
     let mut magic = [0u8; 4];
@@ -901,6 +908,7 @@ fn ensure_legacy_json_import(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn import_backup_data_with(
     repository: &Mutex<crate::storage::repository::ClipboardRepository>,
     image_store: &crate::blobs::store::ImageBlobStore,
@@ -1070,67 +1078,49 @@ fn import_backup_data_with(
         .map_err(|error| error.to_string())
 }
 
+fn import_backup_path_with(
+    repository: &Mutex<crate::storage::repository::ClipboardRepository>,
+    image_store: &crate::blobs::store::ImageBlobStore,
+    app_data_dir: &Path,
+    backup_path: &Path,
+    merge: bool,
+) -> Result<usize, String> {
+    let mode = if merge {
+        crate::backup::ImportMode::Merge
+    } else {
+        crate::backup::ImportMode::Overwrite
+    };
+    crate::backup::import_backup_from_path(
+        backup_path,
+        mode,
+        repository,
+        image_store,
+        &app_data_dir.join("safety-backups"),
+    )
+    .map(|result| result.imported)
+    .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 pub async fn import_backup(
     state: State<'_, AppState>,
     backup_path: String,
     merge: bool,
 ) -> Result<usize, String> {
-    use chrono::Utc;
-    use std::fs;
-
     crate::diagnostics::info(format!(
         "import_backup: path={} merge={}",
         backup_path, merge
     ));
 
-    ensure_legacy_json_import(Path::new(&backup_path))?;
-
-    // 读取备份文件
-    let content =
-        fs::read_to_string(&backup_path).map_err(|e| format!("读取备份文件失败: {}", e))?;
-
-    let backup: BackupData =
-        serde_json::from_str(&content).map_err(|e| format!("解析备份文件失败: {}", e))?;
-
-    // 创建临时备份（防止误操作）
+    let imported_count = import_backup_path_with(
+        &state.repository,
+        &state.image_store,
+        &state.app_data_dir,
+        Path::new(&backup_path),
+        merge,
+    )?;
     if !merge {
-        let temp_backup_path = state.app_data_dir.join(format!(
-            "temp-backup-before-import-{}.json",
-            Utc::now().format("%Y%m%d-%H%M%S")
-        ));
-
-        let repository = state.repository.lock().map_err(|e| e.to_string())?;
-        let current_items = repository
-            .list_items_for_backup(100000)
-            .map_err(|e| format!("创建临时备份失败: {}", e))?;
-        drop(repository);
-
-        let temp_backup = BackupData {
-            metadata: BackupMetadata {
-                version: "1.0".to_string(),
-                created_at: Utc::now().to_rfc3339(),
-                item_count: current_items.len(),
-            },
-            items: current_items,
-            blobs: vec![],
-        };
-
-        let temp_json = serde_json::to_string_pretty(&temp_backup)
-            .map_err(|e| format!("序列化临时备份失败: {}", e))?;
-
-        fs::write(&temp_backup_path, temp_json).map_err(|e| format!("写入临时备份失败: {}", e))?;
-
-        crate::diagnostics::info(format!(
-            "import_backup: temp backup created at {}",
-            temp_backup_path.display()
-        ));
-    }
-
-    let imported_count =
-        import_backup_data_with(&state.repository, &state.image_store, backup, merge)?;
-    if !merge {
-        crate::diagnostics::info("import_backup: existing data cleared");
+        crate::diagnostics::info("import_backup: overwrite transaction committed");
     }
 
     crate::diagnostics::info(format!(
@@ -1147,6 +1137,7 @@ fn base64_encode(data: &[u8]) -> String {
     general_purpose::STANDARD.encode(data)
 }
 
+#[cfg(test)]
 fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
     use base64::{engine::general_purpose, Engine as _};
     general_purpose::STANDARD
@@ -1163,9 +1154,9 @@ mod tests {
 
     use super::{
         clear_history_with, copy_image_blob_with, delete_item_with, ensure_legacy_json_import,
-        html_to_plain_text, import_backup_data_with, load_item_for_copy, mutate_and_cleanup_blobs,
-        prune_history_with, safe_backup_blob_filename, validate_migration_paths, BackupData,
-        BackupMetadata, BlobData,
+        html_to_plain_text, import_backup_data_with, import_backup_path_with, load_item_for_copy,
+        mutate_and_cleanup_blobs, prune_history_with, safe_backup_blob_filename,
+        validate_migration_paths, BackupData, BackupMetadata, BlobData,
     };
     use crate::blobs::image::stage_dib;
     use crate::blobs::store::ImageBlobStore;
@@ -1196,6 +1187,60 @@ mod tests {
 
         assert_eq!(error, "ZIP import requires transactional importer");
         std::fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn command_import_path_uses_transactional_legacy_pipeline() {
+        let root = std::env::temp_dir().join(format!(
+            "super-clipboard-command-import-path-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("root");
+        let path = root.join("legacy.json");
+        let backup = BackupData {
+            metadata: BackupMetadata {
+                version: "1.0".to_string(),
+                created_at: "2026-07-16T00:00:00Z".to_string(),
+                item_count: 1,
+            },
+            items: vec![ClipboardItem {
+                id: "command-legacy-text".to_string(),
+                hash: "command-legacy-hash".to_string(),
+                item_type: "text".to_string(),
+                content: Some("command legacy content".to_string()),
+                content_path: None,
+                content_hash: None,
+                preview: "command legacy content".to_string(),
+                source_app: None,
+                favorite: false,
+                pinned: false,
+                size_bytes: 22,
+                created_at: 1,
+                updated_at: 1,
+            }],
+            blobs: Vec::new(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&backup).expect("legacy JSON"))
+            .expect("write legacy JSON");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+
+        assert_eq!(
+            import_backup_path_with(&repository, &store, &root, &path, true)
+                .expect("transactional command import"),
+            1
+        );
+        assert!(repository
+            .lock()
+            .expect("repository lock")
+            .get_item("command-legacy-text")
+            .expect("query")
+            .is_some());
+        drop(repository);
+        drop(store);
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     fn imported_image_item(id: &str, hash: &str, filename: &str) -> ClipboardItem {

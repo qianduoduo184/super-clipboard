@@ -1,7 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::Context;
@@ -708,6 +708,562 @@ fn is_valid_content_hash(content_hash: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ImportMode {
+    Merge,
+    Overwrite,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ImportResult {
+    pub imported: usize,
+    pub skipped: usize,
+    pub safety_backup: Option<std::path::PathBuf>,
+}
+
+pub fn import_backup_from_path(
+    path: &Path,
+    mode: ImportMode,
+    repository: &Mutex<ClipboardRepository>,
+    blob_store: &ImageBlobStore,
+    safety_backup_dir: &Path,
+) -> anyhow::Result<ImportResult> {
+    let mut file = File::open(path).with_context(|| format!("open backup {}", path.display()))?;
+    let mut magic = [0u8; 4];
+    let count = file.read(&mut magic)?;
+    file.seek(SeekFrom::Start(0))?;
+    if count == magic.len() && is_zip_magic(magic) {
+        return import_zip_backup_from_path(path, mode, repository, blob_store, safety_backup_dir);
+    }
+    import_legacy_backup_as_zip(file, path, mode, repository, blob_store, safety_backup_dir)
+}
+
+fn import_legacy_backup_as_zip(
+    file: File,
+    path: &Path,
+    mode: ImportMode,
+    repository: &Mutex<ClipboardRepository>,
+    blob_store: &ImageBlobStore,
+    safety_backup_dir: &Path,
+) -> anyhow::Result<ImportResult> {
+    let backup: crate::commands::BackupData = serde_json::from_reader(file)
+        .with_context(|| format!("parse legacy backup {}", path.display()))?;
+    anyhow::ensure!(
+        backup.metadata.version == "1.0",
+        "unsupported legacy backup version"
+    );
+    anyhow::ensure!(
+        backup.metadata.item_count == backup.items.len(),
+        "legacy backup item_count does not match items"
+    );
+
+    let temp_zip = blob_store
+        .stage_dir()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".legacy-import-{}.zip", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut normalized_items = backup.items;
+        let mut staged_by_hash = HashMap::new();
+        let normalize_result = (|| {
+            for item in &mut normalized_items {
+                if item.item_type != "image" {
+                    continue;
+                }
+                let filename = item.content_path.clone().ok_or_else(|| {
+                    anyhow::anyhow!("legacy image item {} is missing content_path", item.id)
+                })?;
+                validate_legacy_bmp_filename(&filename).map_err(|error| anyhow::anyhow!(error))?;
+                let blob = backup
+                    .blobs
+                    .iter()
+                    .find(|blob| blob.item_id == item.id && blob.filename == filename)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("legacy image item {} is missing blob", item.id)
+                    })?;
+                let bmp = base64::Engine::decode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &blob.data_base64,
+                )
+                .with_context(|| format!("decode legacy image blob {filename}"))?;
+                anyhow::ensure!(
+                    bmp.len() >= 14 && &bmp[..2] == b"BM",
+                    "legacy blob {filename} is not a BMP"
+                );
+                let staged =
+                    crate::blobs::image::stage_dib(blob_store.stage_dir(), bmp[14..].to_vec())
+                        .with_context(|| format!("stage legacy image {filename}"))?;
+                let content_hash = staged.content_hash().to_string();
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    staged_by_hash.entry(content_hash.clone())
+                {
+                    entry.insert(staged);
+                } else {
+                    fs::remove_dir_all(staged.stage_dir()).with_context(|| {
+                        format!(
+                            "remove duplicate normalized legacy image stage {}",
+                            staged.stage_dir().display()
+                        )
+                    })?;
+                }
+                item.hash = format!("image:{content_hash}");
+                item.content_hash = Some(content_hash.clone());
+                item.content_path = Some(format!("blobs/{content_hash}.bmp"));
+            }
+            Ok::<(), anyhow::Error>(())
+        })();
+        if let Err(error) = normalize_result {
+            return Err(combine_with_stage_cleanup(error, &staged_by_hash));
+        }
+
+        let write_result = (|| {
+            let file = File::create(&temp_zip).with_context(|| {
+                format!("create normalized legacy backup {}", temp_zip.display())
+            })?;
+            let mut archive = ZipWriter::new(file);
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            archive.start_file("manifest.json", options)?;
+            let manifest = BackupManifest {
+                version: 2,
+                exported_at: backup.metadata.created_at,
+                item_count: normalized_items.len(),
+                items: normalized_items,
+            };
+            serde_json::to_writer(&mut archive, &manifest)?;
+            let mut content_hashes = staged_by_hash.keys().cloned().collect::<Vec<_>>();
+            content_hashes.sort_unstable();
+            for content_hash in content_hashes {
+                let staged = staged_by_hash
+                    .get(&content_hash)
+                    .expect("selected normalized legacy image exists");
+                archive.start_file(format!("blobs/{content_hash}.bmp"), options)?;
+                let mut normalized_bmp = File::open(staged.bmp_path())
+                    .with_context(|| format!("open normalized legacy image {content_hash}"))?;
+                std::io::copy(&mut normalized_bmp, &mut archive)
+                    .with_context(|| format!("stream normalized legacy image {content_hash}"))?;
+            }
+            archive.finish()?;
+            Ok::<(), anyhow::Error>(())
+        })();
+        if let Err(error) = write_result {
+            return Err(combine_with_stage_cleanup(error, &staged_by_hash));
+        }
+        cleanup_import_stages(&staged_by_hash)?;
+        import_zip_backup_from_path(&temp_zip, mode, repository, blob_store, safety_backup_dir)
+    })();
+    finalize_temp_import_cleanup(result, fs::remove_file(&temp_zip), &temp_zip)
+}
+
+fn cleanup_import_stages(
+    staged_by_hash: &HashMap<String, crate::blobs::image::StagedImage>,
+) -> anyhow::Result<()> {
+    let mut first_error = None;
+    for staged in staged_by_hash.values() {
+        if let Err(error) = fs::remove_dir_all(staged.stage_dir()) {
+            if error.kind() != std::io::ErrorKind::NotFound && first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error).context("remove normalized legacy image stages"),
+        None => Ok(()),
+    }
+}
+
+fn combine_with_stage_cleanup(
+    error: anyhow::Error,
+    staged_by_hash: &HashMap<String, crate::blobs::image::StagedImage>,
+) -> anyhow::Error {
+    match cleanup_import_stages(staged_by_hash) {
+        Ok(()) => error,
+        Err(cleanup_error) => anyhow::anyhow!(
+            "{error:#}; additionally failed to remove normalized legacy image stages: {cleanup_error:#}"
+        ),
+    }
+}
+
+fn finalize_temp_import_cleanup(
+    result: anyhow::Result<ImportResult>,
+    cleanup_result: std::io::Result<()>,
+    temp_zip: &Path,
+) -> anyhow::Result<ImportResult> {
+    match result {
+        Ok(value) => {
+            if let Err(error) = cleanup_result {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    crate::diagnostics::warn(format!(
+                        "backup: committed legacy import but failed to remove normalized backup {}: {}",
+                        temp_zip.display(),
+                        error
+                    ));
+                }
+            }
+            Ok(value)
+        }
+        Err(error) => match cleanup_result {
+            Ok(()) => Err(error),
+            Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => Err(error),
+            Err(cleanup_error) => Err(anyhow::anyhow!(
+                "{error:#}; additionally failed to remove normalized legacy backup {}: {cleanup_error}",
+                temp_zip.display()
+            )),
+        },
+    }
+}
+
+fn import_zip_backup_from_path(
+    path: &Path,
+    mode: ImportMode,
+    repository: &Mutex<ClipboardRepository>,
+    blob_store: &ImageBlobStore,
+    safety_backup_dir: &Path,
+) -> anyhow::Result<ImportResult> {
+    let mut file = File::open(path).with_context(|| format!("open backup {}", path.display()))?;
+    let mut magic = [0u8; 4];
+    let count = file.read(&mut magic)?;
+    file.seek(SeekFrom::Start(0))?;
+    anyhow::ensure!(
+        count == magic.len() && is_zip_magic(magic),
+        "legacy JSON import is not implemented"
+    );
+    preflight_raw_zip(&mut file).context("preflight raw ZIP metadata")?;
+    let mut archive = zip::ZipArchive::new(file).context("parse ZIP backup")?;
+    anyhow::ensure!(!archive.is_empty(), "ZIP backup is empty");
+    let mut entry_names = HashSet::new();
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index)?;
+        let name = entry.name().to_string();
+        anyhow::ensure!(!entry.is_dir(), "backup ZIP must not contain directories");
+        anyhow::ensure!(
+            name == "manifest.json" || archive_blob_hash(&name).is_some(),
+            "invalid backup ZIP entry path: {name}"
+        );
+        anyhow::ensure!(
+            entry_names.insert(name.clone()),
+            "duplicate ZIP entry: {name}"
+        );
+    }
+    let manifest: BackupManifest = {
+        let manifest_file = archive.by_name("manifest.json")?;
+        anyhow::ensure!(
+            manifest_file.size() <= MAX_MANIFEST_BYTES,
+            "backup manifest exceeds {} bytes",
+            MAX_MANIFEST_BYTES
+        );
+        serde_json::from_reader(manifest_file.take(MAX_MANIFEST_BYTES + 1))
+            .context("parse backup manifest")?
+    };
+    anyhow::ensure!(manifest.version == 2, "unsupported backup manifest version");
+    anyhow::ensure!(
+        manifest.item_count == manifest.items.len(),
+        "backup manifest item_count does not match items"
+    );
+    let mut expected_blob_paths = HashSet::new();
+    for item in &manifest.items {
+        if item.item_type != "image" {
+            continue;
+        }
+        let content_hash = item
+            .content_hash
+            .as_deref()
+            .filter(|value| is_valid_content_hash(value))
+            .ok_or_else(|| anyhow::anyhow!("image item {} has invalid content_hash", item.id))?;
+        let expected_path = format!("blobs/{content_hash}.bmp");
+        anyhow::ensure!(
+            item.content_path.as_deref() == Some(expected_path.as_str()),
+            "image item {} has invalid archive path",
+            item.id
+        );
+        expected_blob_paths.insert(expected_path);
+    }
+    let actual_blob_paths = entry_names
+        .into_iter()
+        .filter(|name| name != "manifest.json")
+        .collect::<HashSet<_>>();
+    anyhow::ensure!(
+        actual_blob_paths == expected_blob_paths,
+        "backup ZIP blob entries do not match manifest image references"
+    );
+
+    let mut staged_by_hash = HashMap::new();
+    let stage_result = (|| {
+        for archive_path in &expected_blob_paths {
+            let content_hash =
+                archive_blob_hash(archive_path).expect("validated archive blob path");
+            let entry = archive.by_name(archive_path)?;
+            let declared_size = entry.size();
+            anyhow::ensure!(
+                declared_size <= crate::storage::capacity::MANAGED_BLOB_QUOTA,
+                "backup image exceeds managed blob quota"
+            );
+            let capacity = usize::try_from(declared_size).context("backup image is too large")?;
+            let mut bmp = Vec::new();
+            bmp.try_reserve_exact(capacity)
+                .context("reserve backup image buffer")?;
+            entry
+                .take(crate::storage::capacity::MANAGED_BLOB_QUOTA + 1)
+                .read_to_end(&mut bmp)?;
+            anyhow::ensure!(
+                bmp.len() as u64 == declared_size,
+                "backup image size does not match ZIP metadata"
+            );
+            anyhow::ensure!(
+                bmp.len() >= 14 && &bmp[..2] == b"BM",
+                "backup image is not a BMP"
+            );
+            let dib = bmp.split_off(14);
+            let staged = crate::blobs::image::stage_dib(blob_store.stage_dir(), dib)?;
+            if staged.content_hash() != content_hash {
+                let stage_dir = staged.stage_dir().to_path_buf();
+                fs::remove_dir_all(&stage_dir).with_context(|| {
+                    format!("remove mismatched image stage {}", stage_dir.display())
+                })?;
+                anyhow::bail!("backup image semantic hash mismatch for {archive_path}");
+            }
+            staged_by_hash.insert(content_hash.to_string(), staged);
+        }
+        Ok::<(), anyhow::Error>(())
+    })();
+    if let Err(stage_error) = stage_result {
+        let mut cleanup_error = None;
+        for staged in staged_by_hash.values() {
+            if let Err(error) = fs::remove_dir_all(staged.stage_dir()) {
+                if cleanup_error.is_none() {
+                    cleanup_error = Some(error);
+                }
+            }
+        }
+        return match cleanup_error {
+            Some(error) => Err(anyhow::anyhow!(
+                "{stage_error:#}; additionally failed to clean image stages: {error}"
+            )),
+            None => Err(stage_error),
+        };
+    }
+
+    let mut normalized_items = manifest.items;
+    for item in &mut normalized_items {
+        if item.item_type != "image" {
+            continue;
+        }
+        let content_hash = item.content_hash.as_deref().expect("validated image hash");
+        item.content_path = Some(
+            crate::blobs::image::canonical_bmp_path(blob_store.blob_dir(), content_hash)?
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+
+    if mode == ImportMode::Merge {
+        let active_hashes = repository
+            .lock()
+            .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?
+            .active_hashes()?;
+        let required_content_hashes = normalized_items
+            .iter()
+            .filter(|item| item.item_type == "image" && !active_hashes.contains(&item.hash))
+            .filter_map(|item| item.content_hash.clone())
+            .collect::<HashSet<_>>();
+        let skipped_content_hashes = staged_by_hash
+            .keys()
+            .filter(|content_hash| !required_content_hashes.contains(*content_hash))
+            .cloned()
+            .collect::<Vec<_>>();
+        for content_hash in skipped_content_hashes {
+            let staged = staged_by_hash
+                .remove(&content_hash)
+                .expect("selected staged image exists");
+            fs::remove_dir_all(staged.stage_dir()).with_context(|| {
+                format!(
+                    "remove duplicate import image stage {}",
+                    staged.stage_dir().display()
+                )
+            })?;
+        }
+    }
+
+    let repository_mode = match mode {
+        ImportMode::Merge => crate::storage::repository::RepositoryImportMode::Merge,
+        ImportMode::Overwrite => crate::storage::repository::RepositoryImportMode::Overwrite,
+    };
+    let safety_backup = if mode == ImportMode::Overwrite {
+        match create_import_safety_backup(safety_backup_dir, repository, blob_store) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                for staged in staged_by_hash.values() {
+                    let _ = fs::remove_dir_all(staged.stage_dir());
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    blob_store.with_write(|blob_dir, stage_root| {
+        crate::commands::cleanup_pending_blobs(repository, blob_dir)?;
+        let usage = crate::storage::capacity::managed_usage(blob_dir)?;
+        let mut additional = 0u64;
+        for staged in staged_by_hash.values() {
+            let canonical_bmp =
+                crate::blobs::image::canonical_bmp_path(blob_dir, staged.content_hash())?;
+            if !canonical_bmp.exists() {
+                additional = additional
+                    .checked_add(staged.bmp_size())
+                    .ok_or_else(|| anyhow::anyhow!("import BMP projection overflow"))?;
+            }
+            let canonical_thumbnail =
+                crate::blobs::image::canonical_thumbnail_path(blob_dir, staged.content_hash())?;
+            if !canonical_thumbnail.exists() {
+                additional = additional
+                    .checked_add(staged.thumbnail_size())
+                    .ok_or_else(|| anyhow::anyhow!("import thumbnail projection overflow"))?;
+            }
+        }
+        let reclaimable = if mode == ImportMode::Overwrite {
+            let final_paths = normalized_items
+                .iter()
+                .filter(|item| item.item_type == "image")
+                .filter_map(|item| item.content_path.as_deref())
+                .map(PathBuf::from)
+                .collect::<HashSet<_>>();
+            let old_paths = repository
+                .lock()
+                .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?
+                .active_blob_paths()?;
+            let mut reclaimable = 0u64;
+            for old_path in old_paths {
+                if !final_paths.contains(&old_path) {
+                    reclaimable = reclaimable
+                        .checked_add(import_reclaimable_image_bytes(blob_dir, &old_path)?)
+                        .ok_or_else(|| anyhow::anyhow!("import reclaimable projection overflow"))?;
+                }
+            }
+            reclaimable
+        } else {
+            0
+        };
+        let projected = usage
+            .checked_sub(reclaimable)
+            .ok_or_else(|| anyhow::anyhow!("import reclaimable usage underflow"))?
+            .checked_add(additional)
+            .ok_or_else(|| anyhow::anyhow!("import managed usage projection overflow"))?;
+        if projected > crate::storage::capacity::MANAGED_BLOB_QUOTA {
+            for staged in staged_by_hash.values() {
+                fs::remove_dir_all(staged.stage_dir()).with_context(|| {
+                    format!(
+                        "remove over-quota image stage {}",
+                        staged.stage_dir().display()
+                    )
+                })?;
+            }
+            anyhow::bail!(
+                "managed blob capacity exceeded: projected={projected}, quota={}",
+                crate::storage::capacity::MANAGED_BLOB_QUOTA
+            );
+        }
+        let mut installed = Vec::new();
+        for staged in staged_by_hash.into_values() {
+            installed.push(crate::blobs::store::install_staged_locked(
+                blob_dir, stage_root, staged,
+            )?);
+        }
+        let transaction_result = repository
+            .lock()
+            .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?
+            .import_items_transactionally(&normalized_items, repository_mode);
+        let result = match transaction_result {
+            Ok(result) => result,
+            Err(error) => {
+                clean_unreferenced_import_installs(repository, &installed)?;
+                return Err(error);
+            }
+        };
+        clean_unreferenced_import_installs(repository, &installed)?;
+        crate::commands::cleanup_pending_blobs(repository, blob_dir)?;
+        Ok(ImportResult {
+            imported: result.imported,
+            skipped: result.skipped,
+            safety_backup,
+        })
+    })
+}
+
+fn import_reclaimable_image_bytes(blob_dir: &Path, bmp_path: &Path) -> anyhow::Result<u64> {
+    let mut bytes = 0u64;
+    for path in [
+        bmp_path.to_path_buf(),
+        crate::blobs::thumbnail_path_for(bmp_path),
+    ] {
+        if !path.is_absolute() || path.parent() != Some(blob_dir) {
+            continue;
+        }
+        match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.file_type().is_file()
+                    && !metadata.file_type().is_symlink()
+                    && !is_reparse_point(&metadata) =>
+            {
+                bytes = bytes
+                    .checked_add(metadata.len())
+                    .ok_or_else(|| anyhow::anyhow!("import reclaimable byte count overflow"))?;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(bytes)
+}
+
+fn create_import_safety_backup(
+    safety_backup_dir: &Path,
+    repository: &Mutex<ClipboardRepository>,
+    blob_store: &ImageBlobStore,
+) -> anyhow::Result<PathBuf> {
+    fs::create_dir_all(safety_backup_dir).with_context(|| {
+        format!(
+            "create import safety backup directory {}",
+            safety_backup_dir.display()
+        )
+    })?;
+    let filename = format!(
+        "super-clipboard-safety-{}-{}.zip",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S-%6f"),
+        uuid::Uuid::new_v4()
+    );
+    let path = safety_backup_dir.join(filename);
+    export_zip_to(&path, repository, blob_store)
+        .with_context(|| format!("create import safety backup {}", path.display()))?;
+    Ok(path)
+}
+
+fn clean_unreferenced_import_installs(
+    repository: &Mutex<ClipboardRepository>,
+    installed: &[crate::blobs::store::InstalledImage],
+) -> anyhow::Result<()> {
+    let repository = repository
+        .lock()
+        .map_err(|error| anyhow::anyhow!("repository lock poisoned: {error}"))?;
+    for image in installed.iter().rev() {
+        if repository.any_active_blob_path(&[image.bmp_path().to_path_buf()])? {
+            continue;
+        }
+        for path in image.created_paths().iter().rev() {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("rollback imported blob {}", path.display()));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "windows")]
 fn is_reparse_point(metadata: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
@@ -1042,8 +1598,9 @@ mod tests {
     use super::replace_target_with;
     use super::{
         export_snapshot_to_with_hook, export_snapshot_to_with_io, export_zip_to,
-        export_zip_to_with_hook, parse_backup_info_path, write_backup_atomically,
-        write_backup_atomically_with_installer, write_blob_entry, MAX_MANIFEST_BYTES,
+        export_zip_to_with_hook, finalize_temp_import_cleanup, import_backup_from_path,
+        parse_backup_info_path, write_backup_atomically, write_backup_atomically_with_installer,
+        write_blob_entry, ImportMode, MAX_MANIFEST_BYTES,
     };
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
@@ -1156,6 +1713,52 @@ mod tests {
             archive.write_all(b"blob").expect("write entry");
         }
         archive.finish().expect("finish test zip");
+    }
+
+    fn write_single_image_zip(
+        path: &std::path::Path,
+        id: &str,
+        record_hash: &str,
+        content_hash: &str,
+        bmp: &[u8],
+    ) {
+        let archive_blob_path = format!("blobs/{content_hash}.bmp");
+        let file = fs::File::create(path).expect("create ZIP");
+        let mut archive = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        archive
+            .start_file("manifest.json", options)
+            .expect("manifest entry");
+        serde_json::to_writer(
+            &mut archive,
+            &serde_json::json!({
+                "version": 2,
+                "exported_at": "2026-07-16T00:00:00Z",
+                "item_count": 1,
+                "items": [{
+                    "id": id,
+                    "hash": record_hash,
+                    "item_type": "image",
+                    "content": null,
+                    "content_path": archive_blob_path,
+                    "content_hash": content_hash,
+                    "preview": "image",
+                    "source_app": null,
+                    "favorite": false,
+                    "pinned": false,
+                    "size_bytes": bmp.len(),
+                    "created_at": 1,
+                    "updated_at": 1
+                }]
+            }),
+        )
+        .expect("manifest");
+        archive
+            .start_file(&archive_blob_path, options)
+            .expect("blob entry");
+        archive.write_all(bmp).expect("blob bytes");
+        archive.finish().expect("finish ZIP");
     }
 
     fn read_u16_le(bytes: &[u8], offset: usize) -> u16 {
@@ -2450,6 +3053,862 @@ mod tests {
         let error = parse_backup_info_path(&path).expect_err("oversize manifest must fail");
         assert!(error.to_string().contains("manifest exceeds"));
 
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn import_legacy_json_normalizes_image_into_canonical_stage_pipeline() {
+        use base64::Engine as _;
+
+        let root = temp_dir("import-legacy-image");
+        fs::create_dir_all(&root).expect("root");
+        let source_stage = root.join("source-stage");
+        let source = crate::blobs::image::stage_dib(&source_stage, dib32([30, 20, 10, 255]))
+            .expect("source image");
+        let content_hash = source.content_hash().to_string();
+        let bmp = fs::read(source.bmp_path()).expect("source BMP");
+        let backup_path = root.join("legacy.json");
+        write_legacy_json(
+            &backup_path,
+            "1.0",
+            1,
+            vec![legacy_item("image", Some("legacy.bmp"))],
+            vec![legacy_blob(
+                "legacy.bmp",
+                &base64::engine::general_purpose::STANDARD.encode(&bmp),
+            )],
+        );
+        fs::remove_dir_all(&source_stage).expect("source stage cleanup");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let store =
+            crate::blobs::store::ImageBlobStore::new(root.join("blobs"), root.join("stage"))
+                .expect("store");
+
+        let result = import_backup_from_path(
+            &backup_path,
+            ImportMode::Merge,
+            &repository,
+            &store,
+            &root.join("safety-backups"),
+        )
+        .expect("legacy staged import");
+
+        assert_eq!(result.imported, 1);
+        let imported = repository
+            .lock()
+            .expect("repository lock")
+            .get_item("legacy-item")
+            .expect("query")
+            .expect("legacy item");
+        assert_eq!(
+            imported.content_hash.as_deref(),
+            Some(content_hash.as_str())
+        );
+        assert_eq!(
+            imported.content_path.as_deref(),
+            Some(
+                crate::blobs::image::canonical_bmp_path(store.blob_dir(), &content_hash)
+                    .expect("canonical path")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert!(fs::read_dir(store.stage_dir())
+            .expect("stage directory")
+            .next()
+            .is_none());
+        drop(repository);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn committed_legacy_import_is_not_reported_failed_when_temp_cleanup_fails() {
+        let expected = super::ImportResult {
+            imported: 2,
+            skipped: 1,
+            safety_backup: None,
+        };
+
+        let result = finalize_temp_import_cleanup(
+            Ok(expected.clone()),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "locked temp file",
+            )),
+            std::path::Path::new("legacy-import.zip"),
+        )
+        .expect("committed import result must win over temp cleanup failure");
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn import_zip_v2_inserts_text_and_fts_in_one_pipeline() {
+        let root = temp_dir("import-zip-text");
+        fs::create_dir_all(&root).expect("root");
+        let archive_path = root.join("backup.zip");
+        let item = serde_json::json!({
+            "id": "zip-text",
+            "hash": "zip-text-hash",
+            "item_type": "text",
+            "content": "transactional searchable content",
+            "content_path": null,
+            "content_hash": null,
+            "preview": "transactional searchable content",
+            "source_app": "fixture",
+            "favorite": true,
+            "pinned": false,
+            "size_bytes": 32,
+            "created_at": 1,
+            "updated_at": 2
+        });
+        write_test_zip(
+            &archive_path,
+            &serde_json::json!({
+                "version": 2,
+                "exported_at": "2026-07-16T00:00:00Z",
+                "item_count": 1,
+                "items": [item]
+            }),
+            &[],
+        );
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let store =
+            crate::blobs::store::ImageBlobStore::new(root.join("blobs"), root.join("stage"))
+                .expect("store");
+
+        let result = import_backup_from_path(
+            &archive_path,
+            ImportMode::Merge,
+            &repository,
+            &store,
+            &root.join("safety-backups"),
+        )
+        .expect("transactional ZIP import");
+
+        assert_eq!(result.imported, 1);
+        assert_eq!(result.skipped, 0);
+        {
+            let repository_guard = repository.lock().expect("repository lock");
+            assert_eq!(
+                repository_guard
+                    .get_item("zip-text")
+                    .expect("get imported")
+                    .expect("imported item")
+                    .content
+                    .as_deref(),
+                Some("transactional searchable content")
+            );
+            assert_eq!(
+                repository_guard
+                    .search(
+                        "searchable".to_string(),
+                        crate::storage::repository::SearchFilters {
+                            item_type: None,
+                            favorites_only: false,
+                        },
+                        10,
+                        None
+                    )
+                    .expect("FTS search")
+                    .len(),
+                1
+            );
+        }
+        drop(repository);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn import_legacy_json_uses_the_same_normalized_pipeline() {
+        use base64::Engine as _;
+
+        let root = temp_dir("import-legacy-normalized");
+        fs::create_dir_all(&root).expect("root");
+        let dib = dib32([30, 20, 10, 255]);
+        let mut bmp = b"BM".to_vec();
+        bmp.extend_from_slice(
+            &u32::try_from(14 + dib.len())
+                .expect("BMP size")
+                .to_le_bytes(),
+        );
+        bmp.extend_from_slice(&[0u8; 4]);
+        bmp.extend_from_slice(&14u32.to_le_bytes());
+        bmp.extend_from_slice(&dib);
+        let archive_path = root.join("legacy.json");
+        fs::write(
+            &archive_path,
+            serde_json::to_vec(&serde_json::json!({
+                "metadata": {
+                    "version": "1.0",
+                    "created_at": "2026-07-16T00:00:00Z",
+                    "item_count": 2
+                },
+                "items": [
+                    {
+                        "id": "legacy-text",
+                        "hash": "legacy-text-hash",
+                        "item_type": "text",
+                        "content": "legacy searchable content",
+                        "content_path": null,
+                        "content_hash": null,
+                        "preview": "legacy searchable content",
+                        "source_app": "fixture",
+                        "favorite": false,
+                        "pinned": false,
+                        "size_bytes": 26,
+                        "created_at": 1,
+                        "updated_at": 1
+                    },
+                    {
+                        "id": "legacy-image",
+                        "hash": "legacy-image-hash",
+                        "item_type": "image",
+                        "content": null,
+                        "content_path": "image.bmp",
+                        "content_hash": null,
+                        "preview": "legacy image",
+                        "source_app": null,
+                        "favorite": false,
+                        "pinned": false,
+                        "size_bytes": bmp.len(),
+                        "created_at": 2,
+                        "updated_at": 2
+                    }
+                ],
+                "blobs": [{
+                    "item_id": "legacy-image",
+                    "filename": "image.bmp",
+                    "data_base64": base64::engine::general_purpose::STANDARD.encode(&bmp)
+                }]
+            }))
+            .expect("legacy JSON"),
+        )
+        .expect("write legacy JSON");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let store =
+            crate::blobs::store::ImageBlobStore::new(root.join("blobs"), root.join("stage"))
+                .expect("store");
+
+        let result = import_backup_from_path(
+            &archive_path,
+            ImportMode::Merge,
+            &repository,
+            &store,
+            &root.join("safety-backups"),
+        )
+        .expect("legacy import");
+
+        assert_eq!(result.imported, 2);
+        let text = repository
+            .lock()
+            .expect("repository lock")
+            .get_item("legacy-text")
+            .expect("text query")
+            .expect("text item");
+        assert_eq!(text.content.as_deref(), Some("legacy searchable content"));
+        let image = repository
+            .lock()
+            .expect("repository lock")
+            .get_item("legacy-image")
+            .expect("image query")
+            .expect("image item");
+        let content_hash = image.content_hash.expect("canonical image hash");
+        assert_eq!(image.hash, format!("image:{content_hash}"));
+        assert!(
+            crate::blobs::image::canonical_bmp_path(store.blob_dir(), &content_hash)
+                .expect("canonical BMP")
+                .is_file()
+        );
+        assert!(fs::read_dir(store.stage_dir())
+            .expect("stage directory")
+            .next()
+            .is_none());
+        drop(repository);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn import_zip_v2_stages_image_and_installs_canonical_files() {
+        let root = temp_dir("import-zip-image");
+        fs::create_dir_all(&root).expect("root");
+        let source_stage = root.join("source-stage");
+        let source = crate::blobs::image::stage_dib(&source_stage, dib32([30, 20, 10, 255]))
+            .expect("source image");
+        let content_hash = source.content_hash().to_string();
+        let bmp = fs::read(source.bmp_path()).expect("source BMP");
+        let archive_path = root.join("backup.zip");
+        let archive_blob_path = format!("blobs/{content_hash}.bmp");
+        let item = serde_json::json!({
+            "id": "zip-image",
+            "hash": "zip-image-record-hash",
+            "item_type": "image",
+            "content": null,
+            "content_path": archive_blob_path,
+            "content_hash": content_hash,
+            "preview": "1 x 1 image",
+            "source_app": "fixture",
+            "favorite": false,
+            "pinned": true,
+            "size_bytes": bmp.len(),
+            "created_at": 3,
+            "updated_at": 4
+        });
+        let file = fs::File::create(&archive_path).expect("create ZIP");
+        let mut archive = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        archive
+            .start_file("manifest.json", options)
+            .expect("manifest entry");
+        serde_json::to_writer(
+            &mut archive,
+            &serde_json::json!({
+                "version": 2,
+                "exported_at": "2026-07-16T00:00:00Z",
+                "item_count": 1,
+                "items": [item]
+            }),
+        )
+        .expect("manifest");
+        archive
+            .start_file(&archive_blob_path, options)
+            .expect("blob entry");
+        archive.write_all(&bmp).expect("blob bytes");
+        archive.finish().expect("finish ZIP");
+        fs::remove_dir_all(&source_stage).expect("source stage cleanup");
+
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let store =
+            crate::blobs::store::ImageBlobStore::new(root.join("blobs"), root.join("stage"))
+                .expect("store");
+
+        let result = import_backup_from_path(
+            &archive_path,
+            ImportMode::Merge,
+            &repository,
+            &store,
+            &root.join("safety-backups"),
+        )
+        .expect("transactional image import");
+
+        assert_eq!(result.imported, 1);
+        assert_eq!(result.skipped, 0);
+        let expected_bmp = crate::blobs::image::canonical_bmp_path(store.blob_dir(), &content_hash)
+            .expect("canonical BMP");
+        let expected_thumbnail =
+            crate::blobs::image::canonical_thumbnail_path(store.blob_dir(), &content_hash)
+                .expect("canonical thumbnail");
+        assert!(expected_bmp.is_file());
+        assert!(expected_thumbnail.is_file());
+        assert!(fs::read_dir(store.stage_dir())
+            .expect("stage directory")
+            .next()
+            .is_none());
+        let imported = repository
+            .lock()
+            .expect("repository lock")
+            .get_item("zip-image")
+            .expect("get imported")
+            .expect("imported image");
+        assert_eq!(
+            imported.content_hash.as_deref(),
+            Some(content_hash.as_str())
+        );
+        assert_eq!(imported.content_path.as_deref(), expected_bmp.to_str());
+        drop(repository);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn import_zip_v2_semantic_hash_mismatch_cleans_stage_without_mutation() {
+        let root = temp_dir("import-zip-image-mismatch");
+        fs::create_dir_all(&root).expect("root");
+        let source_stage = root.join("source-stage");
+        let source = crate::blobs::image::stage_dib(&source_stage, dib32([30, 20, 10, 255]))
+            .expect("source image");
+        let bmp = fs::read(source.bmp_path()).expect("source BMP");
+        let wrong_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let archive_blob_path = format!("blobs/{wrong_hash}.bmp");
+        let archive_path = root.join("backup.zip");
+        let file = fs::File::create(&archive_path).expect("create ZIP");
+        let mut archive = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        archive
+            .start_file("manifest.json", options)
+            .expect("manifest entry");
+        serde_json::to_writer(
+            &mut archive,
+            &serde_json::json!({
+                "version": 2,
+                "exported_at": "2026-07-16T00:00:00Z",
+                "item_count": 1,
+                "items": [{
+                    "id": "mismatched-image",
+                    "hash": "mismatched-record-hash",
+                    "item_type": "image",
+                    "content": null,
+                    "content_path": archive_blob_path,
+                    "content_hash": wrong_hash,
+                    "preview": "mismatch",
+                    "source_app": null,
+                    "favorite": false,
+                    "pinned": false,
+                    "size_bytes": bmp.len(),
+                    "created_at": 1,
+                    "updated_at": 1
+                }]
+            }),
+        )
+        .expect("manifest");
+        archive
+            .start_file(&archive_blob_path, options)
+            .expect("blob entry");
+        archive.write_all(&bmp).expect("blob bytes");
+        archive.finish().expect("finish ZIP");
+        fs::remove_dir_all(&source_stage).expect("source stage cleanup");
+
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let store =
+            crate::blobs::store::ImageBlobStore::new(root.join("blobs"), root.join("stage"))
+                .expect("store");
+
+        import_backup_from_path(
+            &archive_path,
+            ImportMode::Merge,
+            &repository,
+            &store,
+            &root.join("safety-backups"),
+        )
+        .expect_err("semantic mismatch must fail");
+
+        assert!(repository
+            .lock()
+            .expect("repository lock")
+            .get_item("mismatched-image")
+            .expect("query")
+            .is_none());
+        assert!(fs::read_dir(store.blob_dir())
+            .expect("blob directory")
+            .next()
+            .is_none());
+        assert!(fs::read_dir(store.stage_dir())
+            .expect("stage directory")
+            .next()
+            .is_none());
+        drop(repository);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn import_zip_v2_rejects_projected_usage_above_managed_quota() {
+        let root = temp_dir("import-zip-quota");
+        fs::create_dir_all(&root).expect("root");
+        let source_stage = root.join("source-stage");
+        let source = crate::blobs::image::stage_dib(&source_stage, dib32([30, 20, 10, 255]))
+            .expect("source image");
+        let content_hash = source.content_hash().to_string();
+        let bmp = fs::read(source.bmp_path()).expect("source BMP");
+        let archive_path = root.join("backup.zip");
+        write_single_image_zip(
+            &archive_path,
+            "quota-image",
+            "quota-record-hash",
+            &content_hash,
+            &bmp,
+        );
+        fs::remove_dir_all(&source_stage).expect("source stage cleanup");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let store =
+            crate::blobs::store::ImageBlobStore::new(root.join("blobs"), root.join("stage"))
+                .expect("store");
+        let filler = store.blob_dir().join("quota-filler");
+        fs::File::create(&filler)
+            .expect("filler")
+            .set_len(crate::storage::capacity::MANAGED_BLOB_QUOTA)
+            .expect("sparse quota filler");
+
+        import_backup_from_path(
+            &archive_path,
+            ImportMode::Merge,
+            &repository,
+            &store,
+            &root.join("safety-backups"),
+        )
+        .expect_err("projected managed usage must reject import");
+
+        assert!(repository
+            .lock()
+            .expect("repository lock")
+            .get_item("quota-image")
+            .expect("query")
+            .is_none());
+        assert!(filler.is_file());
+        assert!(fs::read_dir(store.stage_dir())
+            .expect("stage directory")
+            .next()
+            .is_none());
+        assert!(
+            !crate::blobs::image::canonical_bmp_path(store.blob_dir(), &content_hash)
+                .expect("canonical BMP")
+                .exists()
+        );
+        drop(repository);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn overwrite_import_aborts_before_mutation_when_safety_backup_fails() {
+        let root = temp_dir("import-overwrite-safety-failure");
+        fs::create_dir_all(&root).expect("root");
+        let archive_path = root.join("backup.zip");
+        write_test_zip(
+            &archive_path,
+            &serde_json::json!({
+                "version": 2,
+                "exported_at": "2026-07-16T00:00:00Z",
+                "item_count": 1,
+                "items": [{
+                    "id": "incoming",
+                    "hash": "incoming-hash",
+                    "item_type": "text",
+                    "content": "incoming",
+                    "content_path": null,
+                    "content_hash": null,
+                    "preview": "incoming",
+                    "source_app": null,
+                    "favorite": false,
+                    "pinned": false,
+                    "size_bytes": 8,
+                    "created_at": 2,
+                    "updated_at": 2
+                }]
+            }),
+            &[],
+        );
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        repository
+            .lock()
+            .expect("repository lock")
+            .insert_imported_item(&ClipboardItem {
+                id: "existing".to_string(),
+                hash: "existing-hash".to_string(),
+                item_type: "text".to_string(),
+                content: Some("keep me".to_string()),
+                content_path: None,
+                content_hash: None,
+                preview: "keep me".to_string(),
+                source_app: None,
+                favorite: false,
+                pinned: false,
+                size_bytes: 7,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("existing item");
+        let store =
+            crate::blobs::store::ImageBlobStore::new(root.join("blobs"), root.join("stage"))
+                .expect("store");
+        let invalid_safety_dir = root.join("not-a-directory");
+        fs::write(&invalid_safety_dir, b"file").expect("invalid safety directory");
+
+        import_backup_from_path(
+            &archive_path,
+            ImportMode::Overwrite,
+            &repository,
+            &store,
+            &invalid_safety_dir,
+        )
+        .expect_err("safety backup failure must abort overwrite");
+
+        let repository_guard = repository.lock().expect("repository lock");
+        assert!(repository_guard
+            .get_item("existing")
+            .expect("existing query")
+            .is_some());
+        assert!(repository_guard
+            .get_item("incoming")
+            .expect("incoming query")
+            .is_none());
+        drop(repository_guard);
+        drop(repository);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn overwrite_import_projects_old_cleanup_and_writes_valid_safety_backup() {
+        let root = temp_dir("import-overwrite-projection");
+        fs::create_dir_all(&root).expect("root");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let store =
+            crate::blobs::store::ImageBlobStore::new(root.join("blobs"), root.join("stage"))
+                .expect("store");
+        let mut old_dib = vec![0u8; 40];
+        old_dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        old_dib[4..8].copy_from_slice(&100i32.to_le_bytes());
+        old_dib[8..12].copy_from_slice(&(-100i32).to_le_bytes());
+        old_dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        old_dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+        old_dib[20..24].copy_from_slice(&40_000u32.to_le_bytes());
+        old_dib.extend(std::iter::repeat([30, 20, 10, 255]).take(10_000).flatten());
+        let old = store
+            .install_staged_with(
+                crate::blobs::image::stage_dib(store.stage_dir(), old_dib).expect("old stage"),
+                |installed| Ok(installed.clone()),
+                |_| Ok(false),
+            )
+            .expect("old install");
+        repository
+            .lock()
+            .expect("repository lock")
+            .insert_imported_item(&ClipboardItem {
+                id: "old-image".to_string(),
+                hash: "old-record-hash".to_string(),
+                item_type: "image".to_string(),
+                content: None,
+                content_path: Some(old.bmp_path().to_string_lossy().into_owned()),
+                content_hash: Some(old.content_hash().to_string()),
+                preview: "old".to_string(),
+                source_app: None,
+                favorite: false,
+                pinned: false,
+                size_bytes: i64::try_from(fs::metadata(old.bmp_path()).expect("old BMP").len())
+                    .expect("old size"),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("old row");
+        let old_total = fs::metadata(old.bmp_path()).expect("old BMP").len()
+            + fs::metadata(old.thumbnail_path())
+                .expect("old thumbnail")
+                .len();
+        fs::File::create(store.blob_dir().join("quota-filler"))
+            .expect("filler")
+            .set_len(crate::storage::capacity::MANAGED_BLOB_QUOTA - old_total)
+            .expect("sparse filler");
+
+        let source_stage = root.join("source-stage");
+        let incoming = crate::blobs::image::stage_dib(&source_stage, dib32([31, 20, 10, 255]))
+            .expect("incoming source");
+        let incoming_hash = incoming.content_hash().to_string();
+        let incoming_bmp = fs::read(incoming.bmp_path()).expect("incoming BMP");
+        let archive_path = root.join("backup.zip");
+        write_single_image_zip(
+            &archive_path,
+            "new-image",
+            "new-record-hash",
+            &incoming_hash,
+            &incoming_bmp,
+        );
+        fs::remove_dir_all(&source_stage).expect("source stage cleanup");
+
+        let result = import_backup_from_path(
+            &archive_path,
+            ImportMode::Overwrite,
+            &repository,
+            &store,
+            &root.join("safety"),
+        )
+        .expect("overwrite fits after projected cleanup");
+
+        let safety = result.safety_backup.expect("safety backup path");
+        assert_eq!(
+            parse_backup_info_path(&safety)
+                .expect("valid safety ZIP")
+                .item_count,
+            1
+        );
+        let repository_guard = repository.lock().expect("repository lock");
+        assert!(repository_guard
+            .get_item("old-image")
+            .expect("old query")
+            .is_none());
+        assert!(repository_guard
+            .get_item("new-image")
+            .expect("new query")
+            .is_some());
+        assert!(repository_guard
+            .pending_cleanup_paths()
+            .expect("cleanup queue")
+            .is_empty());
+        drop(repository_guard);
+        assert!(!old.bmp_path().exists());
+        assert!(!old.thumbnail_path().exists());
+        drop(repository);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn merge_skip_cross_type_hash_removes_unreferenced_image_install() {
+        let root = temp_dir("import-merge-cross-type-skip");
+        fs::create_dir_all(&root).expect("root");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        repository
+            .lock()
+            .expect("repository lock")
+            .insert_imported_item(&ClipboardItem {
+                id: "existing-text".to_string(),
+                hash: "shared-record-hash".to_string(),
+                item_type: "text".to_string(),
+                content: Some("existing".to_string()),
+                content_path: None,
+                content_hash: None,
+                preview: "existing".to_string(),
+                source_app: None,
+                favorite: false,
+                pinned: false,
+                size_bytes: 8,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("existing text");
+        let store =
+            crate::blobs::store::ImageBlobStore::new(root.join("blobs"), root.join("stage"))
+                .expect("store");
+        let source_stage = root.join("source-stage");
+        let source = crate::blobs::image::stage_dib(&source_stage, dib32([30, 20, 10, 255]))
+            .expect("source image");
+        let content_hash = source.content_hash().to_string();
+        let bmp = fs::read(source.bmp_path()).expect("source BMP");
+        let archive_path = root.join("backup.zip");
+        write_single_image_zip(
+            &archive_path,
+            "skipped-image",
+            "shared-record-hash",
+            &content_hash,
+            &bmp,
+        );
+        fs::remove_dir_all(&source_stage).expect("source stage cleanup");
+
+        let result = import_backup_from_path(
+            &archive_path,
+            ImportMode::Merge,
+            &repository,
+            &store,
+            &root.join("safety"),
+        )
+        .expect("merge skip");
+
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.skipped, 1);
+        assert!(repository
+            .lock()
+            .expect("repository lock")
+            .get_item("skipped-image")
+            .expect("query")
+            .is_none());
+        assert!(fs::read_dir(store.blob_dir())
+            .expect("blob directory")
+            .next()
+            .is_none());
+        assert!(fs::read_dir(store.stage_dir())
+            .expect("stage directory")
+            .next()
+            .is_none());
+        drop(repository);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn merge_quota_projection_excludes_cross_type_duplicate_images() {
+        let root = temp_dir("import-merge-duplicate-quota");
+        fs::create_dir_all(&root).expect("root");
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        repository
+            .lock()
+            .expect("repository lock")
+            .insert_imported_item(&ClipboardItem {
+                id: "existing-text".to_string(),
+                hash: "shared-record-hash".to_string(),
+                item_type: "text".to_string(),
+                content: Some("existing".to_string()),
+                content_path: None,
+                content_hash: None,
+                preview: "existing".to_string(),
+                source_app: None,
+                favorite: false,
+                pinned: false,
+                size_bytes: 8,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("existing text");
+        let store =
+            crate::blobs::store::ImageBlobStore::new(root.join("blobs"), root.join("stage"))
+                .expect("store");
+        let filler = store.blob_dir().join("quota-filler");
+        fs::File::create(&filler)
+            .expect("filler")
+            .set_len(crate::storage::capacity::MANAGED_BLOB_QUOTA)
+            .expect("sparse quota filler");
+        let source_stage = root.join("source-stage");
+        let source = crate::blobs::image::stage_dib(&source_stage, dib32([30, 20, 10, 255]))
+            .expect("source image");
+        let content_hash = source.content_hash().to_string();
+        let bmp = fs::read(source.bmp_path()).expect("source BMP");
+        let archive_path = root.join("backup.zip");
+        write_single_image_zip(
+            &archive_path,
+            "skipped-image",
+            "shared-record-hash",
+            &content_hash,
+            &bmp,
+        );
+        fs::remove_dir_all(&source_stage).expect("source stage cleanup");
+
+        let result = import_backup_from_path(
+            &archive_path,
+            ImportMode::Merge,
+            &repository,
+            &store,
+            &root.join("safety"),
+        )
+        .expect("duplicate image should not consume projected quota");
+
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.skipped, 1);
+        assert!(filler.is_file());
+        assert!(
+            !crate::blobs::image::canonical_bmp_path(store.blob_dir(), &content_hash)
+                .expect("canonical BMP")
+                .exists()
+        );
+        assert!(fs::read_dir(store.stage_dir())
+            .expect("stage directory")
+            .next()
+            .is_none());
+        drop(repository);
+        drop(store);
         fs::remove_dir_all(root).expect("cleanup");
     }
 }
