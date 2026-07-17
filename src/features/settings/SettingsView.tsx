@@ -418,17 +418,22 @@ export default function SettingsView({
     <main className="app-shell settings-shell" onKeyDown={handleKeyboard}>
       <section className="toolbar">
         <div className="title-group">
-          <button className="icon-button" title="返回" onClick={onBack}>
+          <button className="icon-button" title="返回" aria-label="返回历史记录" onClick={onBack}>
             <ArrowLeft size={18} />
           </button>
           <div>
             <h1>设置</h1>
-            <p>{status}</p>
+            <div className="app-status connected">
+              <span className="status-dot" aria-hidden="true" />
+              <p role="status" aria-live="polite">{status}</p>
+            </div>
           </div>
         </div>
       </section>
 
       <section className="settings-list">
+        <div className="setting-section-divider">常规</div>
+
         <div className="setting-row">
           <span className="setting-icon"><Sun size={18} /></span>
           <span>
@@ -438,6 +443,7 @@ export default function SettingsView({
           <div className="segmented-control" aria-label="主题模式">
             <button
               className={settings.theme_mode === 'light' ? 'active' : ''}
+              aria-pressed={settings.theme_mode === 'light'}
               onClick={() => void saveSettings(updateSettingValue(settings, 'theme_mode', 'light'))}
             >
               <Sun size={15} />
@@ -445,6 +451,7 @@ export default function SettingsView({
             </button>
             <button
               className={settings.theme_mode === 'dark' ? 'active' : ''}
+              aria-pressed={settings.theme_mode === 'dark'}
               onClick={() => void saveSettings(updateSettingValue(settings, 'theme_mode', 'dark'))}
             >
               <Moon size={15} />
@@ -522,7 +529,7 @@ export default function SettingsView({
           </select>
         </label>
 
-        <div className="setting-row">
+        <div className="setting-row shortcut-setting">
           <span className="setting-icon"><Keyboard size={18} /></span>
           <span>
             <strong>全局快捷键</strong>
@@ -634,7 +641,7 @@ export default function SettingsView({
           </div>
         </div>
 
-        <div className="setting-row">
+        <div className="setting-row danger-setting">
           <span className="setting-icon"><Trash2 size={18} /></span>
           <span>
             <strong>清空历史</strong>
@@ -651,7 +658,9 @@ export default function SettingsView({
           <span className="setting-icon"><Database size={18} /></span>
           <span>
             <strong>数据目录</strong>
-            <small>{pendingDataDir || settings.custom_data_dir || diagnostics?.app_data_dir || '默认路径'}</small>
+            <small title={pendingDataDir || settings.custom_data_dir || diagnostics?.app_data_dir || '默认路径'}>
+              {pendingDataDir || settings.custom_data_dir || diagnostics?.app_data_dir || '默认路径'}
+            </small>
           </span>
           <div style={{ display: 'flex', gap: '6px' }}>
             {pendingDataDir ? (
@@ -672,7 +681,9 @@ export default function SettingsView({
           <span className="setting-icon"><FileText size={18} /></span>
           <span>
             <strong>日志目录</strong>
-            <small>{pendingLogDir || settings.custom_log_dir || (diagnostics?.log_path ? diagnostics.log_path.substring(0, diagnostics.log_path.lastIndexOf('\\')) : '默认路径')}</small>
+            <small title={pendingLogDir || settings.custom_log_dir || (diagnostics?.log_path ? diagnostics.log_path.substring(0, diagnostics.log_path.lastIndexOf('\\')) : '默认路径')}>
+              {pendingLogDir || settings.custom_log_dir || (diagnostics?.log_path ? diagnostics.log_path.substring(0, diagnostics.log_path.lastIndexOf('\\')) : '默认路径')}
+            </small>
           </span>
           <div style={{ display: 'flex', gap: '6px' }}>
             {pendingLogDir ? (
@@ -695,7 +706,7 @@ export default function SettingsView({
           <span className="setting-icon"><FileText size={18} /></span>
           <span>
             <strong>运行日志</strong>
-            <small>{diagnostics?.log_path ?? 'Tauri 后端可用后显示日志路径'}</small>
+            <small title={diagnostics?.log_path ?? undefined}>{diagnostics?.log_path ?? 'Tauri 后端可用后显示日志路径'}</small>
           </span>
         </div>
 
@@ -703,11 +714,11 @@ export default function SettingsView({
           <span className="setting-icon"><Database size={18} /></span>
           <span>
             <strong>数据目录</strong>
-            <small>{diagnostics?.app_data_dir ?? 'Tauri 后端可用后显示数据目录'}</small>
+            <small title={diagnostics?.app_data_dir ?? undefined}>{diagnostics?.app_data_dir ?? 'Tauri 后端可用后显示数据目录'}</small>
           </span>
         </div>
 
-        <div className="setting-section-divider">快捷键说明</div>
+        <div className="setting-section-divider">快捷键</div>
 
         <div className="setting-row shortcut-help">
           <span className="setting-icon"><Keyboard size={18} /></span>
