@@ -18,7 +18,14 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { filterItems, getTypeLabel, getVisibleFilters, getVisualPreview, reorderItemsByDrag } from './lib/clipboard-model';
+import {
+  filterItems,
+  getTypeLabel,
+  getVisibleFilters,
+  getVisualPreview,
+  reorderItemsByDrag,
+  reorderNavFiltersByDrag,
+} from './lib/clipboard-model';
 import { calculateVirtualWindow, moveSelection } from './lib/history-ui';
 import { applyThemeMode, getErrorMessage, mergeSettings, shouldCheckForUpdatesToday, toLocalDateString } from './lib/settings-model';
 import SettingsView from './features/settings/SettingsView';
@@ -705,17 +712,11 @@ export default function App() {
     }
 
     const currentOrder = navFiltersConfig.visible;
-    const dragIndex = currentOrder.indexOf(draggingFilterKey);
-    const targetIndex = currentOrder.indexOf(targetKey);
-
-    if (dragIndex === -1 || targetIndex === -1) {
+    const nextOrder = reorderNavFiltersByDrag(currentOrder, draggingFilterKey, targetKey);
+    if (nextOrder.join('\0') === currentOrder.join('\0')) {
       setDraggingFilterKey(null);
       return;
     }
-
-    const nextOrder = [...currentOrder];
-    nextOrder.splice(dragIndex, 1);
-    nextOrder.splice(targetIndex, 0, draggingFilterKey);
 
     const nextConfig = { visible: nextOrder };
     setNavFiltersConfig(nextConfig);
@@ -817,7 +818,33 @@ export default function App() {
         {filters.map((filter) => (
           <button
             key={filter.key}
-            className={activeFilter === filter.key ? 'filter-chip active' : 'filter-chip'}
+            className={[
+              activeFilter === filter.key ? 'filter-chip active' : 'filter-chip',
+              draggingFilterKey === filter.key ? 'dragging' : '',
+            ].join(' ')}
+            draggable={filter.key !== 'all'}
+            onDragStart={(event) => {
+              if (filter.key === 'all') {
+                event.preventDefault();
+                return;
+              }
+              setDraggingFilterKey(filter.key);
+              event.dataTransfer.effectAllowed = 'move';
+              event.dataTransfer.setData('text/plain', filter.key);
+            }}
+            onDragOver={(event) => {
+              if (draggingFilterKey && draggingFilterKey !== filter.key) {
+                event.preventDefault();
+                event.dataTransfer.dropEffect = 'move';
+              }
+            }}
+            onDrop={(event) => {
+              event.preventDefault();
+              if (draggingFilterKey && draggingFilterKey !== filter.key) {
+                void handleNavFilterReorder(filter.key);
+              }
+            }}
+            onDragEnd={() => setDraggingFilterKey(null)}
             onClick={() => setActiveFilter(filter.key)}
           >
             {filter.label}
@@ -876,14 +903,14 @@ export default function App() {
                         }
                       }}
                       onDragOver={(e) => {
-                        e.preventDefault();
-                        if (!isAll) {
+                        if (draggingFilterKey && draggingFilterKey !== filter.key) {
+                          e.preventDefault();
                           e.dataTransfer.dropEffect = 'move';
                         }
                       }}
                       onDrop={(e) => {
                         e.preventDefault();
-                        if (!isAll && draggingFilterKey && draggingFilterKey !== filter.key) {
+                        if (draggingFilterKey && draggingFilterKey !== filter.key) {
                           void handleNavFilterReorder(filter.key);
                         }
                       }}

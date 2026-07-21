@@ -87,6 +87,20 @@ export function reorderItemsByDrag(ids, draggedId, targetId) {
   return nextIds;
 }
 
+export function reorderNavFiltersByDrag(keys, draggedKey, targetKey) {
+  if (!draggedKey || !targetKey || draggedKey === 'all' || draggedKey === targetKey) {
+    return keys;
+  }
+  if (!keys.includes(draggedKey) || !keys.includes(targetKey)) {
+    return keys;
+  }
+
+  const nextKeys = keys.filter((key) => key !== draggedKey);
+  const targetIndex = nextKeys.indexOf(targetKey);
+  nextKeys.splice(targetIndex + 1, 0, draggedKey);
+  return nextKeys;
+}
+
 export function getTypeLabel(type) {
   const labels = {
     text: '文本',

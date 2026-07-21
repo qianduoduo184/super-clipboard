@@ -8,6 +8,7 @@ import {
   getVisualPreview,
   normalizePreview,
   reorderItemsByDrag,
+  reorderNavFiltersByDrag,
   sortItemsByUpdatedTime,
 } from './clipboard-model.js';
 
@@ -97,6 +98,21 @@ test('reorderItemsByDrag moves an item after the drop target', () => {
     reorderItemsByDrag(['a', 'b', 'c', 'd'], 'd', 'b'),
     ['a', 'b', 'd', 'c'],
   );
+});
+
+test('reorderNavFiltersByDrag moves a filter after its drop target', () => {
+  assert.deepEqual(
+    reorderNavFiltersByDrag(['all', 'favorites', 'text', 'image'], 'favorites', 'image'),
+    ['all', 'text', 'image', 'favorites'],
+  );
+});
+
+test('reorderNavFiltersByDrag keeps all first and rejects invalid drags', () => {
+  const order = ['all', 'favorites', 'text', 'image'];
+  assert.deepEqual(reorderNavFiltersByDrag(order, 'image', 'all'), ['all', 'image', 'favorites', 'text']);
+  assert.deepEqual(reorderNavFiltersByDrag(order, 'all', 'text'), order);
+  assert.deepEqual(reorderNavFiltersByDrag(order, 'missing', 'text'), order);
+  assert.deepEqual(reorderNavFiltersByDrag(order, 'text', 'text'), order);
 });
 
 test('filterItems handles 1,000 copied text records without obvious slowdown', () => {

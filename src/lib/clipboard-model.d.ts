@@ -22,4 +22,6 @@ export function getVisualPreview(item: Pick<ClipboardItemLike, 'type' | 'preview
 
 export function reorderItemsByDrag(ids: string[], draggedId: string, targetId: string): string[];
 
+export function reorderNavFiltersByDrag(keys: string[], draggedKey: string, targetKey: string): string[];
+
 export function getTypeLabel(type: string): string;

@@ -285,6 +285,20 @@ kbd {
   background: var(--primary);
 }
 
+.filter-chip[draggable="true"] {
+  cursor: grab;
+}
+
+.filter-chip[draggable="true"]:active,
+.filter-chip.dragging {
+  cursor: grabbing;
+}
+
+.filter-chip.dragging {
+  opacity: 0.45;
+  border-style: dashed;
+}
+
 .content-grid {
   display: grid;
   grid-template-columns: minmax(300px, 1fr) 4px minmax(360px, 1.12fr);
