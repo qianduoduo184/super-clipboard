@@ -25,6 +25,7 @@ import {
   getVisualPreview,
   reorderItemsByDrag,
   reorderNavFiltersByDrag,
+  sortItemsByUpdatedTime,
 } from './lib/clipboard-model';
 import { calculateVirtualWindow, moveSelection } from './lib/history-ui';
 import { applyThemeMode, getErrorMessage, mergeSettings, shouldCheckForUpdatesToday, toLocalDateString } from './lib/settings-model';
@@ -385,7 +386,8 @@ export default function App() {
         if (ignore) return;
         setBackendAvailable(false);
         setStatusMessage('未连接 Tauri 后端，当前显示示例数据');
-        setItems(filterItems(seedItems, { type: activeFilter, query: debouncedQuery }) as ClipboardItem[]);
+        const orderedSeedItems = sortItemsByUpdatedTime(seedItems);
+        setItems(filterItems(orderedSeedItems, { type: activeFilter, query: debouncedQuery }) as ClipboardItem[]);
       });
 
     return () => {

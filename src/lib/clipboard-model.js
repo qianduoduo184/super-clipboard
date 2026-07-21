@@ -12,7 +12,7 @@ export function sortItemsByUpdatedTime(items) {
 export function filterItems(items, { type, query }) {
   const normalizedQuery = query.trim().toLowerCase();
 
-  return sortItemsByUpdatedTime(items).filter((item) => {
+  return items.filter((item) => {
     const matchesType =
       type === 'all' ||
       (type === 'favorites' && item.favorite) ||

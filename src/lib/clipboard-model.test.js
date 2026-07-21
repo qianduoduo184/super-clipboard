@@ -51,6 +51,11 @@ test('filterItems filters by concrete clipboard type', () => {
   assert.deepEqual(filterItems(items, { type: 'files', query: '' }).map((item) => item.id), ['3']);
 });
 
+test('filterItems preserves the incoming custom order', () => {
+  const customOrder = [items[1], items[2], items[0]];
+  assert.deepEqual(filterItems(customOrder, { type: 'all', query: '' }).map((item) => item.id), ['2', '3', '1']);
+});
+
 test('normalizePreview keeps compact single-line previews', () => {
   assert.equal(normalizePreview(' first line\nsecond line ', 16), 'first line seco...');
 });
