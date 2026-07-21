@@ -19,3 +19,16 @@ export function moveSelection(
   currentId: string | undefined,
   direction: 'up' | 'down',
 ): string | undefined;
+
+export function mergeHistoryPage<T extends { id: string }>(current: T[], incoming: T[]): T[];
+
+export type NextHistoryPageInput = {
+  scrollTop: number;
+  clientHeight: number;
+  scrollHeight: number;
+  hasNextPage: boolean;
+  loading: boolean;
+  threshold?: number;
+};
+
+export function shouldLoadNextHistoryPage(input: NextHistoryPageInput): boolean;

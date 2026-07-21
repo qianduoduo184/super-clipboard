@@ -13,7 +13,7 @@ use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::storage::repository::{ClipboardItem, ClipboardItemSummary, SearchFilters};
+use crate::storage::repository::{ClipboardItem, ClipboardSearchPage, SearchCursor, SearchFilters};
 use crate::system::settings::AppSettings;
 use crate::AppState;
 
@@ -204,8 +204,8 @@ pub fn search_items(
     query: String,
     filters: SearchFilters,
     limit: i64,
-    cursor: Option<i64>,
-) -> Result<Vec<ClipboardItemSummary>, String> {
+    cursor: Option<SearchCursor>,
+) -> Result<ClipboardSearchPage, String> {
     crate::diagnostics::info(format!(
         "command: search_items query_len={} limit={} cursor={cursor:?}",
         query.len(),

@@ -26,6 +26,23 @@ export type SearchFilters = {
   favorites_only: boolean;
 };
 
+export type SearchCursor = {
+  pinned: boolean;
+  effective_rank: number;
+  updated_at: number;
+  id: string;
+};
+
+type BackendClipboardSearchPage = {
+  items: ClipboardSearchItem[];
+  next_cursor: SearchCursor | null;
+};
+
+export type ClipboardSearchPage = {
+  items: ViewClipboardItem[];
+  nextCursor: SearchCursor | null;
+};
+
 export type NavFiltersConfig = {
   visible: string[];
 };
@@ -63,14 +80,21 @@ export function toSearchFilters(filter: ClipboardFilter): SearchFilters {
   };
 }
 
-export async function searchItems(query: string, filter: ClipboardFilter, cursor?: number): Promise<ViewClipboardItem[]> {
-  const items = await invoke<ClipboardSearchItem[]>('search_items', {
+export async function searchItems(
+  query: string,
+  filter: ClipboardFilter,
+  cursor?: SearchCursor | null,
+): Promise<ClipboardSearchPage> {
+  const page = await invoke<BackendClipboardSearchPage>('search_items', {
     query,
     filters: toSearchFilters(filter),
     limit: 50,
     cursor: cursor ?? null,
   });
-  return items.map(mapBackendItemToViewItem);
+  return {
+    items: page.items.map(mapBackendItemToViewItem),
+    nextCursor: page.next_cursor,
+  };
 }
 
 export async function getItemDetail(id: string): Promise<ViewClipboardItemDetail | null> {

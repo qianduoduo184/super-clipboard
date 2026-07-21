@@ -8,24 +8,27 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
+    GetClipboardOwner, GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
     RegisterClipboardFormatW, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
 use windows_sys::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
     VK_CONTROL, VK_V,
 };
 use windows_sys::Win32::UI::Shell::{DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostQuitMessage,
-    RegisterClassW, HWND_MESSAGE, MSG, WM_CLIPBOARDUPDATE, WM_DESTROY, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowThreadProcessId,
+    PostQuitMessage, RegisterClassW, HWND_MESSAGE, MSG, WM_CLIPBOARDUPDATE, WM_DESTROY, WNDCLASSW,
 };
 
 use crate::blobs::image::image_identity_from_dib;
@@ -87,6 +90,7 @@ pub fn read_current_clipboard(event_sequence: u32) -> Result<Option<Vec<Clipboar
         );
         return Ok(Some(Vec::new()));
     }
+    let source_app = current_clipboard_source_app();
 
     // Try reading file list - log error but continue to next format if it fails
     match read_file_list() {
@@ -110,7 +114,7 @@ pub fn read_current_clipboard(event_sequence: u32) -> Result<Option<Vec<Clipboar
                 content: Some(serde_json::to_string(&files)?),
                 content_path: None,
                 content_hash: None,
-                source_app: None,
+                source_app: source_app.clone(),
             })]));
         }
         Ok(None) => {}
@@ -134,7 +138,10 @@ pub fn read_current_clipboard(event_sequence: u32) -> Result<Option<Vec<Clipboar
         },
     ) {
         Ok(Some(dib)) => {
-            return Ok(Some(vec![ClipboardCapture::ImageDib(dib)]));
+            return Ok(Some(vec![ClipboardCapture::ImageDib {
+                dib,
+                source_app: source_app.clone(),
+            }]));
         }
         Ok(None) => {}
         Err(error) => {
@@ -155,7 +162,7 @@ pub fn read_current_clipboard(event_sequence: u32) -> Result<Option<Vec<Clipboar
                 content: Some(text),
                 content_path: None,
                 content_hash: None,
-                source_app: None,
+                source_app,
             })]));
         }
         Ok(_) => {}
@@ -715,6 +722,68 @@ fn keyboard_input(key: VIRTUAL_KEY, key_up: bool) -> INPUT {
 
 fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+struct ProcessHandle(HANDLE);
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+fn executable_name_from_path(value: &str) -> Option<String> {
+    Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+fn current_clipboard_source_app() -> Option<String> {
+    unsafe {
+        let owner = GetClipboardOwner();
+        if owner.is_null() {
+            return None;
+        }
+
+        let mut process_id = 0;
+        GetWindowThreadProcessId(owner, &mut process_id);
+        if process_id == 0 {
+            return None;
+        }
+
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id);
+        if process.is_null() {
+            return None;
+        }
+        let process = ProcessHandle(process);
+        let mut path = vec![0_u16; 32_768];
+        let mut path_length = u32::try_from(path.len()).ok()?;
+        if QueryFullProcessImageNameW(process.0, 0, path.as_mut_ptr(), &mut path_length) == 0 {
+            return None;
+        }
+
+        let path = String::from_utf16(&path[..usize::try_from(path_length).ok()?]).ok()?;
+        executable_name_from_path(&path)
+    }
+}
+
+#[cfg(test)]
+mod source_app_tests {
+    use super::executable_name_from_path;
+
+    #[test]
+    fn source_app_keeps_only_the_executable_file_name() {
+        assert_eq!(
+            executable_name_from_path(r"C:\Program Files\Microsoft VS Code\Code.exe").as_deref(),
+            Some("Code.exe")
+        );
+        assert_eq!(executable_name_from_path(""), None);
+    }
 }
 
 #[cfg(test)]

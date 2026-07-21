@@ -27,7 +27,12 @@ import {
   reorderNavFiltersByDrag,
   sortItemsByUpdatedTime,
 } from './lib/clipboard-model';
-import { calculateVirtualWindow, moveSelection } from './lib/history-ui';
+import {
+  calculateVirtualWindow,
+  mergeHistoryPage,
+  moveSelection,
+  shouldLoadNextHistoryPage,
+} from './lib/history-ui';
 import { applyThemeMode, getErrorMessage, mergeSettings, shouldCheckForUpdatesToday, toLocalDateString } from './lib/settings-model';
 import SettingsView from './features/settings/SettingsView';
 import {
@@ -66,6 +71,7 @@ import {
   setRecordingEnabled,
   toggleFavorite as toggleBackendFavorite,
   togglePin as toggleBackendPin,
+  type SearchCursor,
   updateSettings,
 } from './features/history/api';
 
@@ -202,6 +208,8 @@ export default function App() {
     revision: -1,
   });
   const [refreshVersion, setRefreshVersion] = useState(0);
+  const [nextHistoryCursor, setNextHistoryCursor] = useState<SearchCursor | null>(null);
+  const [loadingMoreHistory, setLoadingMoreHistory] = useState(false);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [navFiltersConfig, setNavFiltersConfig] = useState<{ visible: string[] }>({ visible: ['all', 'favorites', 'text', 'image', 'files'] });
   const [navConfigOpen, setNavConfigOpen] = useState(false);
@@ -211,6 +219,8 @@ export default function App() {
   const [isResizing, setIsResizing] = useState(false);
   const historyListRef = useRef<HTMLDivElement | null>(null);
   const detailRequestRef = useRef<DetailRequest>({ identity: null, generation: 0 });
+  const historyRequestGenerationRef = useRef(0);
+  const loadingMoreHistoryRef = useRef(false);
   const selectedIdentityRef = useRef<ItemIdentity | null>(null);
   const debouncedQuery = useDebouncedValue(query, 100);
 
@@ -366,12 +376,20 @@ export default function App() {
 
   useEffect(() => {
     let ignore = false;
+    const generation = historyRequestGenerationRef.current + 1;
+    historyRequestGenerationRef.current = generation;
+    loadingMoreHistoryRef.current = true;
+    setLoadingMoreHistory(true);
+    setNextHistoryCursor(null);
 
     searchItems(debouncedQuery, activeFilter)
-      .then((backendItems) => {
-        if (ignore) return;
-        const nextItems = backendItems;
+      .then((page) => {
+        if (ignore || historyRequestGenerationRef.current !== generation) return;
+        const nextItems = page.items;
         setItems(nextItems);
+        setNextHistoryCursor(page.nextCursor);
+        loadingMoreHistoryRef.current = false;
+        setLoadingMoreHistory(false);
         setBackendAvailable(true);
         setStatusMessage(nextItems.length === 0 ? '暂无剪贴板记录' : '已连接本地剪贴板服务');
         setScrollTop(0);
@@ -383,8 +401,11 @@ export default function App() {
         }
       })
       .catch(() => {
-        if (ignore) return;
+        if (ignore || historyRequestGenerationRef.current !== generation) return;
         setBackendAvailable(false);
+        setNextHistoryCursor(null);
+        loadingMoreHistoryRef.current = false;
+        setLoadingMoreHistory(false);
         setStatusMessage('未连接 Tauri 后端，当前显示示例数据');
         const orderedSeedItems = sortItemsByUpdatedTime(seedItems);
         setItems(filterItems(orderedSeedItems, { type: activeFilter, query: debouncedQuery }) as ClipboardItem[]);
@@ -394,6 +415,43 @@ export default function App() {
       ignore = true;
     };
   }, [activeFilter, debouncedQuery, refreshVersion]);
+
+  async function loadNextHistoryPage() {
+    const cursor = nextHistoryCursor;
+    if (!backendAvailable || !cursor || loadingMoreHistoryRef.current) return;
+
+    const generation = historyRequestGenerationRef.current;
+    loadingMoreHistoryRef.current = true;
+    setLoadingMoreHistory(true);
+    try {
+      const page = await searchItems(debouncedQuery, activeFilter, cursor);
+      if (historyRequestGenerationRef.current !== generation) return;
+      setItems((current) => mergeHistoryPage(current, page.items));
+      setNextHistoryCursor(page.nextCursor);
+    } catch (error) {
+      if (historyRequestGenerationRef.current === generation) {
+        setStatusMessage(getErrorMessage(error, '加载更多历史记录失败'));
+      }
+    } finally {
+      if (historyRequestGenerationRef.current === generation) {
+        loadingMoreHistoryRef.current = false;
+        setLoadingMoreHistory(false);
+      }
+    }
+  }
+
+  function handleHistoryScroll(container: HTMLDivElement) {
+    setScrollTop(container.scrollTop);
+    if (shouldLoadNextHistoryPage({
+      scrollTop: container.scrollTop,
+      clientHeight: container.clientHeight,
+      scrollHeight: container.scrollHeight,
+      hasNextPage: nextHistoryCursor !== null,
+      loading: loadingMoreHistory,
+    })) {
+      void loadNextHistoryPage();
+    }
+  }
 
   const visibleItems = useMemo(() => filterItems(items, { type: 'all', query: '' }) as ClipboardItem[], [items]);
 
@@ -518,6 +576,9 @@ export default function App() {
     setItems((current) =>
       current.map((item) => (item.id === id ? { ...item, favorite: !item.favorite } : item)),
     );
+    if (backendAvailable) {
+      setRefreshVersion((current) => current + 1);
+    }
   }
 
   async function togglePin(id: string) {
@@ -527,6 +588,9 @@ export default function App() {
     setItems((current) =>
       current.map((item) => (item.id === id ? { ...item, pinned: !item.pinned } : item)),
     );
+    if (backendAvailable) {
+      setRefreshVersion((current) => current + 1);
+    }
   }
 
   async function deleteItem(id: string) {
@@ -602,6 +666,7 @@ export default function App() {
       try {
         await reorderItems(nextIds);
         setStatusMessage('排序已保存');
+        setRefreshVersion((current) => current + 1);
       } catch (error) {
         setStatusMessage(getErrorMessage(error, '排序保存失败'));
         setRefreshVersion((current) => current + 1);
@@ -1024,7 +1089,7 @@ export default function App() {
         <div
           ref={historyListRef}
           className="history-list"
-          onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+          onScroll={(event) => handleHistoryScroll(event.currentTarget)}
         >
           <div className="history-spacer" style={{ height: totalHeight }}>
             <div style={{ transform: `translateY(${virtualWindow.offsetTop}px)` }}>

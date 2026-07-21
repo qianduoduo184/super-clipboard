@@ -78,10 +78,16 @@ mod tests {
 
     #[test]
     fn image_capture_keeps_owned_dib_deferred() {
-        let capture = ClipboardCapture::ImageDib(vec![1, 2, 3, 4]);
+        let capture = ClipboardCapture::ImageDib {
+            dib: vec![1, 2, 3, 4],
+            source_app: Some("SnippingTool.exe".to_string()),
+        };
 
         match capture {
-            ClipboardCapture::ImageDib(dib) => assert_eq!(dib, vec![1, 2, 3, 4]),
+            ClipboardCapture::ImageDib { dib, source_app } => {
+                assert_eq!(dib, vec![1, 2, 3, 4]);
+                assert_eq!(source_app.as_deref(), Some("SnippingTool.exe"));
+            }
             ClipboardCapture::Draft(_) => panic!("image must not be persisted by the adapter"),
         }
     }
@@ -90,5 +96,8 @@ mod tests {
 #[derive(Debug)]
 pub enum ClipboardCapture {
     Draft(ClipboardItemDraft),
-    ImageDib(Vec<u8>),
+    ImageDib {
+        dib: Vec<u8>,
+        source_app: Option<String>,
+    },
 }

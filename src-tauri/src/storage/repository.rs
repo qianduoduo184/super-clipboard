@@ -44,6 +44,37 @@ pub struct ClipboardItemSummary {
     pub thumbnail_path: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchCursor {
+    pub pinned: bool,
+    pub effective_rank: i64,
+    pub updated_at: i64,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClipboardSearchPage {
+    pub items: Vec<ClipboardItemSummary>,
+    pub next_cursor: Option<SearchCursor>,
+}
+
+impl std::ops::Deref for ClipboardSearchPage {
+    type Target = [ClipboardItemSummary];
+
+    fn deref(&self) -> &Self::Target {
+        &self.items
+    }
+}
+
+impl IntoIterator for ClipboardSearchPage {
+    type Item = ClipboardItemSummary;
+    type IntoIter = std::vec::IntoIter<ClipboardItemSummary>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::clipboard::types::{ClipboardItemDraft, ClipboardItemType};
@@ -713,6 +744,7 @@ mod tests {
                 None,
             )
             .expect("first page");
+        let next_cursor = first_page.next_cursor.clone();
         let second_page = repository
             .search(
                 String::new(),
@@ -721,7 +753,7 @@ mod tests {
                     favorites_only: true,
                 },
                 1,
-                Some(first_page[0].updated_at),
+                next_cursor,
             )
             .expect("second page");
 
@@ -736,6 +768,110 @@ mod tests {
         assert_eq!(second_page.len(), 1);
         assert_eq!(second_page[0].id, older.id);
         assert_ne!(second_page[0].id, excluded.id);
+    }
+
+    #[test]
+    fn search_pagination_follows_pinned_order_before_updated_time() {
+        let repository = open_test_repository();
+        let pinned = repository
+            .insert_or_touch(text_draft("pinned older item"))
+            .expect("insert pinned item");
+        let recent = repository
+            .insert_or_touch(text_draft("recent unpinned item"))
+            .expect("insert recent item");
+        repository
+            .conn
+            .execute(
+                "UPDATE clipboard_items
+                 SET pinned = 1, updated_at = 100, sort_rank = 100
+                 WHERE id = ?1",
+                params![pinned.id],
+            )
+            .expect("pin older item");
+        repository
+            .conn
+            .execute(
+                "UPDATE clipboard_items
+                 SET pinned = 0, updated_at = 300, sort_rank = 300
+                 WHERE id = ?1",
+                params![recent.id],
+            )
+            .expect("update recent item");
+
+        let filters = SearchFilters {
+            item_type: None,
+            favorites_only: false,
+        };
+        let first_page = repository
+            .search(String::new(), filters.clone(), 1, None)
+            .expect("first page");
+        let next_cursor = first_page.next_cursor.clone();
+        let second_page = repository
+            .search(String::new(), filters, 1, next_cursor)
+            .expect("second page");
+
+        assert_eq!(first_page[0].id, pinned.id);
+        assert_eq!(second_page.len(), 1);
+        assert_eq!(second_page[0].id, recent.id);
+    }
+
+    #[test]
+    fn search_pagination_follows_manual_sort_rank_without_duplicates() {
+        let repository = open_test_repository();
+        let first = repository
+            .insert_or_touch(text_draft("first by manual rank"))
+            .expect("insert first");
+        let second = repository
+            .insert_or_touch(text_draft("second by manual rank"))
+            .expect("insert second");
+        repository
+            .conn
+            .execute(
+                "UPDATE clipboard_items SET updated_at = 300, sort_rank = 100 WHERE id = ?1",
+                params![first.id],
+            )
+            .expect("rank first");
+        repository
+            .conn
+            .execute(
+                "UPDATE clipboard_items SET updated_at = 100, sort_rank = 300 WHERE id = ?1",
+                params![second.id],
+            )
+            .expect("rank second");
+
+        let filters = SearchFilters {
+            item_type: None,
+            favorites_only: false,
+        };
+        let first_page = repository
+            .search(String::new(), filters.clone(), 1, None)
+            .expect("first page");
+        let second_page = repository
+            .search(String::new(), filters, 1, first_page.next_cursor.clone())
+            .expect("second page");
+
+        assert_eq!(first_page[0].id, second.id);
+        assert_eq!(second_page[0].id, first.id);
+        assert_ne!(first_page[0].id, second_page[0].id);
+    }
+
+    #[test]
+    fn duplicate_capture_refreshes_a_known_source() {
+        let repository = open_test_repository();
+        let mut first_draft = text_draft("same clipboard content");
+        first_draft.source_app = None;
+        let first = repository
+            .insert_or_touch(first_draft)
+            .expect("insert first capture");
+
+        let mut repeated_draft = text_draft("same clipboard content");
+        repeated_draft.source_app = Some("Code.exe".to_string());
+        let repeated = repository
+            .insert_or_touch(repeated_draft)
+            .expect("touch duplicate capture");
+
+        assert_eq!(repeated.id, first.id);
+        assert_eq!(repeated.source_app.as_deref(), Some("Code.exe"));
     }
 
     #[test]
@@ -1197,6 +1333,7 @@ mod tests {
                 None,
             )
             .expect("page 1");
+        let next_cursor = page1.next_cursor.clone();
         let query_duration = query_start.elapsed();
         println!("第一页查询耗时: {:?}", query_duration);
 
@@ -1210,7 +1347,7 @@ mod tests {
                     favorites_only: false,
                 },
                 50,
-                Some(page1.last().unwrap().updated_at),
+                next_cursor,
             )
             .expect("page 2");
         let cursor_duration = cursor_start.elapsed();
@@ -1485,8 +1622,12 @@ impl ClipboardRepository {
             .optional()?
         {
             self.conn.execute(
-                "UPDATE clipboard_items SET updated_at = ?1, sort_rank = ?1 WHERE id = ?2",
-                params![now, existing_id],
+                "UPDATE clipboard_items
+                 SET updated_at = ?1,
+                     sort_rank = ?1,
+                     source_app = COALESCE(NULLIF(TRIM(?2), ''), source_app)
+                 WHERE id = ?3",
+                params![now, draft.source_app.as_deref(), existing_id],
             )?;
             return self
                 .get_item(&existing_id)?
@@ -1560,8 +1701,12 @@ impl ClipboardRepository {
             .optional()?
         {
             conn.execute(
-                "UPDATE clipboard_items SET updated_at = ?1, sort_rank = ?1 WHERE id = ?2",
-                params![now, existing_id],
+                "UPDATE clipboard_items
+                 SET updated_at = ?1,
+                     sort_rank = ?1,
+                     source_app = COALESCE(NULLIF(TRIM(?2), ''), source_app)
+                 WHERE id = ?3",
+                params![now, draft.source_app.as_deref(), existing_id],
             )?;
             existing_id
         } else {
@@ -1701,10 +1846,11 @@ impl ClipboardRepository {
         query: String,
         filters: SearchFilters,
         limit: i64,
-        cursor: Option<i64>,
-    ) -> anyhow::Result<Vec<ClipboardItemSummary>> {
+        cursor: Option<SearchCursor>,
+    ) -> anyhow::Result<ClipboardSearchPage> {
         let mut sql = String::from(
-            "SELECT id, hash, item_type, content_path, preview, source_app, favorite, pinned, size_bytes, created_at, updated_at
+            "SELECT id, hash, item_type, content_path, preview, source_app, favorite, pinned, size_bytes, created_at, updated_at,
+                    COALESCE(sort_rank, updated_at) AS effective_rank
              FROM clipboard_items
              WHERE deleted_at IS NULL",
         );
@@ -1719,8 +1865,26 @@ impl ClipboardRepository {
             sql_params.push(Value::Text(item_type));
         }
         if let Some(cursor) = cursor {
-            sql.push_str(" AND updated_at < ?");
-            sql_params.push(Value::Integer(cursor));
+            sql.push_str(
+                " AND (
+                    pinned < ?
+                    OR (pinned = ? AND (
+                        COALESCE(sort_rank, updated_at) < ?
+                        OR (COALESCE(sort_rank, updated_at) = ? AND (
+                            updated_at < ?
+                            OR (updated_at = ? AND id > ?)
+                        ))
+                    ))
+                )",
+            );
+            let pinned = i64::from(cursor.pinned);
+            sql_params.push(Value::Integer(pinned));
+            sql_params.push(Value::Integer(pinned));
+            sql_params.push(Value::Integer(cursor.effective_rank));
+            sql_params.push(Value::Integer(cursor.effective_rank));
+            sql_params.push(Value::Integer(cursor.updated_at));
+            sql_params.push(Value::Integer(cursor.updated_at));
+            sql_params.push(Value::Text(cursor.id));
         }
 
         // Hybrid search strategy:
@@ -1751,14 +1915,34 @@ impl ClipboardRepository {
         }
 
         sql.push_str(
-            " ORDER BY pinned DESC, COALESCE(sort_rank, updated_at) DESC, updated_at DESC LIMIT ?",
+            " ORDER BY pinned DESC, COALESCE(sort_rank, updated_at) DESC, updated_at DESC, id ASC LIMIT ?",
         );
-        sql_params.push(Value::Integer(limit));
+        sql_params.push(Value::Integer(limit.saturating_add(1)));
 
         let mut statement = self.conn.prepare(&sql)?;
-        let rows = statement.query_map(params_from_iter(sql_params), Self::map_summary)?;
+        let rows = statement.query_map(params_from_iter(sql_params), |row| {
+            Ok((Self::map_summary(row)?, row.get::<_, i64>(11)?))
+        })?;
+        let mut rows = rows.collect::<Result<Vec<_>, _>>()?;
+        let has_more = rows.len() > usize::try_from(limit).unwrap_or(usize::MAX);
+        if has_more {
+            rows.pop();
+        }
+        let next_cursor = if has_more {
+            rows.last().map(|(item, effective_rank)| SearchCursor {
+                pinned: item.pinned,
+                effective_rank: *effective_rank,
+                updated_at: item.updated_at,
+                id: item.id.clone(),
+            })
+        } else {
+            None
+        };
 
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        Ok(ClipboardSearchPage {
+            items: rows.into_iter().map(|(item, _)| item).collect(),
+            next_cursor,
+        })
     }
 
     pub fn list_items_for_backup(&self, limit: i64) -> anyhow::Result<Vec<ClipboardItem>> {

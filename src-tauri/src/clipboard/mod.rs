@@ -57,10 +57,20 @@ use crate::{
 };
 use tauri::{AppHandle, Emitter};
 
+#[cfg(test)]
 fn image_draft(
     content_hash: &str,
     content_path: &std::path::Path,
     size_bytes: i64,
+) -> ClipboardItemDraft {
+    image_draft_with_source(content_hash, content_path, size_bytes, None)
+}
+
+fn image_draft_with_source(
+    content_hash: &str,
+    content_path: &std::path::Path,
+    size_bytes: i64,
+    source_app: Option<String>,
 ) -> ClipboardItemDraft {
     ClipboardItemDraft {
         item_type: ClipboardItemType::Image,
@@ -72,7 +82,7 @@ fn image_draft(
             .and_then(|value| value.to_str())
             .unwrap_or("clipboard-image.bmp")
             .to_string(),
-        source_app: None,
+        source_app,
         size_bytes,
     }
 }
@@ -108,6 +118,7 @@ fn store_image_capture_with_hooks(
         .map(|(item, _)| item)
 }
 
+#[cfg(test)]
 fn store_image_capture_with_retention(
     repository: &Mutex<ClipboardRepository>,
     image_store: &ImageBlobStore,
@@ -117,6 +128,39 @@ fn store_image_capture_with_retention(
     on_existing: impl FnOnce(),
     after_stage: impl FnOnce(),
 ) -> anyhow::Result<(ClipboardItem, bool)> {
+    store_image_capture_with_source_and_retention(
+        repository,
+        image_store,
+        dib,
+        ImageCaptureOptions {
+            source_app: None,
+            max_history_items,
+            retention_days,
+        },
+        on_existing,
+        after_stage,
+    )
+}
+
+struct ImageCaptureOptions {
+    source_app: Option<String>,
+    max_history_items: i64,
+    retention_days: i64,
+}
+
+fn store_image_capture_with_source_and_retention(
+    repository: &Mutex<ClipboardRepository>,
+    image_store: &ImageBlobStore,
+    dib: Vec<u8>,
+    options: ImageCaptureOptions,
+    on_existing: impl FnOnce(),
+    after_stage: impl FnOnce(),
+) -> anyhow::Result<(ClipboardItem, bool)> {
+    let ImageCaptureOptions {
+        source_app,
+        max_history_items,
+        retention_days,
+    } = options;
     let bmp_size = crate::storage::capacity::exact_bmp_size(dib.len())?;
     let size_bytes = i64::try_from(dib.len()).unwrap_or(i64::MAX);
     let identity = image_identity_from_dib(&dib)?;
@@ -130,10 +174,11 @@ fn store_image_capture_with_retention(
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("active image has no blob path"))?;
         return repository_guard
-            .insert_or_touch_image(image_draft(
+            .insert_or_touch_image(image_draft_with_source(
                 &identity.content_hash,
                 std::path::Path::new(content_path),
                 size_bytes,
+                source_app,
             ))
             .map(|item| (item, false));
     }
@@ -154,7 +199,7 @@ fn store_image_capture_with_retention(
         staged.content_hash() == identity.content_hash,
         "staged image identity changed"
     );
-    install_image_capture_outcome(repository, image_store, staged, size_bytes)
+    install_image_capture_outcome(repository, image_store, staged, size_bytes, source_app)
 }
 
 #[cfg(test)]
@@ -195,13 +240,16 @@ fn store_clipboard_capture_with_retention(
                 image: false,
             })
         }
-        ClipboardCapture::ImageDib(dib) => {
-            let (item, created) = store_image_capture_with_retention(
+        ClipboardCapture::ImageDib { dib, source_app } => {
+            let (item, created) = store_image_capture_with_source_and_retention(
                 repository,
                 image_store,
                 dib,
-                max_history_items,
-                retention_days,
+                ImageCaptureOptions {
+                    source_app,
+                    max_history_items,
+                    retention_days,
+                },
                 || {},
                 || {},
             )?;
@@ -233,7 +281,8 @@ fn install_image_capture(
     staged: StagedImage,
     size_bytes: i64,
 ) -> anyhow::Result<ClipboardItem> {
-    install_image_capture_outcome(repository, image_store, staged, size_bytes).map(|(item, _)| item)
+    install_image_capture_outcome(repository, image_store, staged, size_bytes, None)
+        .map(|(item, _)| item)
 }
 
 fn install_image_capture_outcome(
@@ -241,6 +290,7 @@ fn install_image_capture_outcome(
     image_store: &ImageBlobStore,
     staged: StagedImage,
     size_bytes: i64,
+    source_app: Option<String>,
 ) -> anyhow::Result<(ClipboardItem, bool)> {
     let content_hash = staged.content_hash().to_string();
     let result = image_store.install_staged_with_preflight(
@@ -254,10 +304,11 @@ fn install_image_capture_outcome(
                     .content_path
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("active image has no blob path"))?;
-                let winner = repository_guard.insert_or_touch_image(image_draft(
+                let winner = repository_guard.insert_or_touch_image(image_draft_with_source(
                     &content_hash,
                     std::path::Path::new(winner_path),
                     size_bytes,
+                    source_app.clone(),
                 ))?;
                 return Err(ImageCaptureRace(winner).into());
             }
@@ -285,17 +336,19 @@ fn install_image_capture_outcome(
                     .content_path
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("active image has no blob path"))?;
-                let winner = repository.insert_or_touch_image(image_draft(
+                let winner = repository.insert_or_touch_image(image_draft_with_source(
                     &content_hash,
                     std::path::Path::new(winner_path),
                     size_bytes,
+                    source_app.clone(),
                 ))?;
                 return Err(ImageCaptureRace(winner).into());
             }
-            repository.insert_or_touch_image(image_draft(
+            repository.insert_or_touch_image(image_draft_with_source(
                 installed.content_hash(),
                 installed.bmp_path(),
                 size_bytes,
+                source_app.clone(),
             ))
         },
         |installed| {
@@ -521,6 +574,32 @@ mod tests {
     }
 
     #[test]
+    fn image_capture_persists_the_resolved_source_app() {
+        let root =
+            std::env::temp_dir().join(format!("super-clipboard-image-source-{}", Uuid::new_v4()));
+        let repository = Mutex::new(
+            ClipboardRepository::open(root.join("history.sqlite3")).expect("repository"),
+        );
+        let store = ImageBlobStore::new(root.join("blobs"), root.join("stage")).expect("store");
+
+        let stored = store_clipboard_capture(
+            &repository,
+            &store,
+            crate::clipboard::types::ClipboardCapture::ImageDib {
+                dib: dib32(40, [30, 20, 10, 255], 0),
+                source_app: Some("SnippingTool.exe".to_string()),
+            },
+        )
+        .expect("store capture")
+        .expect("stored item");
+
+        assert_eq!(stored.source_app.as_deref(), Some("SnippingTool.exe"));
+        drop(repository);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn quota_blocked_active_duplicate_still_touches_without_pruning() {
         let root =
             std::env::temp_dir().join(format!("super-clipboard-quota-gate-{}", Uuid::new_v4()));
@@ -540,7 +619,10 @@ mod tests {
         let stored = store_clipboard_capture(
             &repository,
             &store,
-            crate::clipboard::types::ClipboardCapture::ImageDib(dib32(124, [30, 20, 10, 255], 64)),
+            crate::clipboard::types::ClipboardCapture::ImageDib {
+                dib: dib32(124, [30, 20, 10, 255], 64),
+                source_app: None,
+            },
         )
         .expect("duplicate touch")
         .expect("stored duplicate");
@@ -571,7 +653,10 @@ mod tests {
         let first_error = store_clipboard_capture(
             &repository,
             &store,
-            crate::clipboard::types::ClipboardCapture::ImageDib(dib32(40, [30, 20, 10, 255], 0)),
+            crate::clipboard::types::ClipboardCapture::ImageDib {
+                dib: dib32(40, [30, 20, 10, 255], 0),
+                source_app: None,
+            },
         )
         .expect_err("full quota must reject new image");
         assert!(first_error
@@ -582,7 +667,10 @@ mod tests {
         let stored = store_clipboard_capture(
             &repository,
             &store,
-            crate::clipboard::types::ClipboardCapture::ImageDib(dib32(40, [8, 7, 6, 255], 0)),
+            crate::clipboard::types::ClipboardCapture::ImageDib {
+                dib: dib32(40, [8, 7, 6, 255], 0),
+                source_app: None,
+            },
         )
         .expect("capture after release")
         .expect("stored after release");
@@ -628,7 +716,10 @@ mod tests {
         let outcome = store_capture_with_throttle(
             &repository,
             &store,
-            crate::clipboard::types::ClipboardCapture::ImageDib(first_dib),
+            crate::clipboard::types::ClipboardCapture::ImageDib {
+                dib: first_dib,
+                source_app: None,
+            },
             &settings,
             &throttle,
             now,

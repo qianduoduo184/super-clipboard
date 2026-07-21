@@ -35,3 +35,20 @@ export function moveSelection(ids, currentId, direction) {
   const nextIndex = Math.min(ids.length - 1, Math.max(0, currentIndex + delta));
   return ids[nextIndex];
 }
+
+export function mergeHistoryPage(current, incoming) {
+  const seen = new Set(current.map((item) => item.id));
+  return current.concat(incoming.filter((item) => !seen.has(item.id)));
+}
+
+export function shouldLoadNextHistoryPage({
+  scrollTop,
+  clientHeight,
+  scrollHeight,
+  hasNextPage,
+  loading,
+  threshold = 200,
+}) {
+  if (!hasNextPage || loading) return false;
+  return scrollTop + clientHeight >= scrollHeight - threshold;
+}

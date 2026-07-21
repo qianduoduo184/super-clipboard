@@ -1,6 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { calculateVirtualWindow, moveSelection } from './history-ui.js';
+import * as historyUi from './history-ui.js';
+
+const {
+  calculateVirtualWindow,
+  mergeHistoryPage,
+  moveSelection,
+  shouldLoadNextHistoryPage,
+} = historyUi;
 
 test('calculateVirtualWindow returns a bounded visible slice', () => {
   const window = calculateVirtualWindow({
@@ -57,4 +64,37 @@ test('calculateVirtualWindow keeps 10,000 item history lists bounded', () => {
     offsetTop: 6402,
   });
   assert.ok(window.endIndex - window.startIndex <= 12);
+});
+
+test('mergeHistoryPage appends unseen records without duplicating refreshed ids', () => {
+  const current = [
+    { id: 'a', preview: 'old a' },
+    { id: 'b', preview: 'old b' },
+  ];
+  const incoming = [
+    { id: 'b', preview: 'new b' },
+    { id: 'c', preview: 'new c' },
+  ];
+
+  assert.deepEqual(mergeHistoryPage(current, incoming), [
+    { id: 'a', preview: 'old a' },
+    { id: 'b', preview: 'old b' },
+    { id: 'c', preview: 'new c' },
+  ]);
+});
+
+test('shouldLoadNextHistoryPage only loads an available page near the bottom', () => {
+  const nearBottom = {
+    scrollTop: 700,
+    clientHeight: 300,
+    scrollHeight: 1100,
+    hasNextPage: true,
+    loading: false,
+    threshold: 120,
+  };
+
+  assert.equal(shouldLoadNextHistoryPage(nearBottom), true);
+  assert.equal(shouldLoadNextHistoryPage({ ...nearBottom, scrollTop: 500 }), false);
+  assert.equal(shouldLoadNextHistoryPage({ ...nearBottom, hasNextPage: false }), false);
+  assert.equal(shouldLoadNextHistoryPage({ ...nearBottom, loading: true }), false);
 });
